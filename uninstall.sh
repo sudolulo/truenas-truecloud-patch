@@ -76,6 +76,15 @@ if [ -n "$SITE_PKG" ] && [ -f "$SITE_PKG/sitecustomize.py" ]; then
 else
     echo "  Not found (already removed or install didn't place it here)."
 fi
+
+# Handle orphaned backup when sitecustomize.py was removed (e.g. by a TrueNAS
+# update) but the .pre-truecloud-patch file survived in the same directory.
+if [ -n "$SITE_PKG" ] && [ ! -f "$SITE_PKG/sitecustomize.py" ] && \
+   [ -f "$SITE_PKG/sitecustomize.py.pre-truecloud-patch" ]; then
+    mv "$SITE_PKG/sitecustomize.py.pre-truecloud-patch" \
+       "$SITE_PKG/sitecustomize.py"
+    echo "  Restored orphaned sitecustomize.py backup"
+fi
 echo ""
 
 # ── Restore UI bundle ─────────────────────────────────────────────────────────

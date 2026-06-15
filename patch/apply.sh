@@ -22,7 +22,9 @@ PATCH_DIR="/data/truecloud-patch"
 LOG="$PATCH_DIR/apply.log"
 
 # Rotate log at 512 KB to avoid unbounded growth on a system volume.
+# Keep one prior generation (.1) so the last two boots are always available.
 if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 524288 ]; then
+    [ -f "${LOG}.1" ] && mv "${LOG}.1" "${LOG}.2"
     mv "$LOG" "${LOG}.1"
 fi
 

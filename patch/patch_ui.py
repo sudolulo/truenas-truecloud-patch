@@ -50,7 +50,6 @@ def find_bundle():
     if webui is None:
         return None, None, None
 
-    matches = []
     for root, _dirs, names in os.walk(webui):
         for name in sorted(names):          # deterministic order
             if not name.endswith(".js"):
@@ -60,24 +59,11 @@ def find_bundle():
                 with open(path, encoding="utf-8", errors="replace") as fh:
                     content = fh.read()
                 if FIND.search(content):
-                    matches.append((path, content))
+                    return webui, path, content
             except OSError:
                 continue
 
-    if not matches:
-        return webui, None, None
-
-    if len(matches) > 1:
-        # Unexpected — log all matches so the operator can investigate.
-        print(
-            f"[truecloud-patch] WARNING: filterByProviders pattern found in "
-            f"{len(matches)} files; patching only the first."
-        )
-        for p, _ in matches:
-            print(f"[truecloud-patch]   {p}")
-
-    path, content = matches[0]
-    return webui, path, content
+    return webui, None, None
 
 
 def main():
