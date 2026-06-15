@@ -2,78 +2,113 @@
 TrueCloud provider patch — sitecustomize.py
 Installed into Python site-packages on every boot by apply.sh.
 
-Hooks the import of two middlewared modules and patches them in-place:
+Hooks two middlewared module imports using the find_spec / exec_module API
+(required for Python 3.12+, which ships with TrueNAS SCALE 25.x / Debian 13):
 
   middlewared.rclone.remote.b2
-      Adds get_restic_config() so the native B2 restic backend works.
-      Restic URL: b2:<bucket>/<folder>
-      Auth env:   B2_ACCOUNT_ID, B2_ACCOUNT_KEY
+      Adds get_restic_config() so the native restic B2 backend works.
+      Restic repo URL: b2:<bucket>/<folder>
+      Auth: B2_ACCOUNT_ID, B2_ACCOUNT_KEY
 
   middlewared.plugins.cloud_backup.restic
-      Fixes URL construction for providers that have no hostname component
-      (url == ""). Stock code builds "b2:/bucket/path" (broken double-slash);
-      patched code builds "b2:bucket/path".
+      Fixes the URL builder for providers with no hostname component.
+      Stock code: f"{rclone_type}:{url}/{remote_path}" → "b2:/bucket/path" (broken)
+      Patched:    "b2:bucket/path" when url == ""
 
-Safe for all Python processes on the system: if middlewared is absent the
-hook installs but never fires, and all errors are caught and logged to stderr.
+Both patches are no-ops if the module already provides the functionality
+(i.e. a future TrueNAS version adds native support). All errors are caught
+and written to stderr so middlewared always starts regardless of patch state.
 """
 
 import sys
 
 
-def _install():
-    _pending = {
+# ── Import hook ───────────────────────────────────────────────────────────────
+
+class _Finder:
+    """
+    find_spec-based meta path finder (Python 3.4+, required for 3.12+).
+    Intercepts specific module imports, loads them normally, then patches.
+    """
+
+    _targets = frozenset({
         "middlewared.rclone.remote.b2",
         "middlewared.plugins.cloud_backup.restic",
-    }
-    _loading = set()
+    })
 
-    class _Hook:
-        def find_module(self, fullname, path=None):  # noqa: ARG002
-            if fullname in _pending and fullname not in _loading:
-                return self
-            return None
+    def __init__(self):
+        self._loading = set()   # guards against re-entrant imports
+        self._done = set()      # modules already patched
 
-        def load_module(self, fullname):
-            if fullname in sys.modules:
-                module = sys.modules[fullname]
-            else:
-                _loading.add(fullname)
-                try:
-                    __import__(fullname)
-                finally:
-                    _loading.discard(fullname)
-                module = sys.modules[fullname]
+    def find_spec(self, fullname, path, target=None):  # noqa: ARG002
+        import importlib.machinery
+        if (
+            fullname in self._targets
+            and fullname not in self._done
+            and fullname not in self._loading
+        ):
+            return importlib.machinery.ModuleSpec(fullname, _Loader(self, fullname))
+        return None
 
-            _pending.discard(fullname)
-
+    def _mark_done(self, fullname):
+        self._done.add(fullname)
+        if self._done >= self._targets:
             try:
-                if fullname == "middlewared.rclone.remote.b2":
-                    _patch_b2(module)
-                elif fullname == "middlewared.plugins.cloud_backup.restic":
-                    _patch_restic(module)
-            except Exception as exc:
-                sys.stderr.write(f"[truecloud-patch] patch failed for {fullname}: {exc}\n")
+                sys.meta_path.remove(self)
+            except ValueError:
+                pass
 
-            if not _pending:
-                try:
-                    sys.meta_path.remove(hook)
-                except ValueError:
-                    pass
 
-            return module
+class _Loader:
+    def __init__(self, finder, fullname):
+        self._finder = finder
+        self._fullname = fullname
 
-    hook = _Hook()
-    sys.meta_path.append(hook)
+    def create_module(self, spec):  # noqa: ARG002
+        return None  # use Python's default module creation
 
+    def exec_module(self, module):
+        import importlib.util
+
+        fullname = self._fullname
+        self._finder._loading.add(fullname)
+        try:
+            # find_spec for the real file — our finder returns None while
+            # fullname is in _loading, so the normal finders handle this.
+            real_spec = importlib.util.find_spec(fullname)
+            if real_spec is None:
+                raise ImportError(f"No module named {fullname!r}")
+
+            real_spec.loader.exec_module(module)
+
+            # Fix module metadata so it looks like a normal import.
+            module.__spec__ = real_spec
+            module.__loader__ = real_spec.loader
+            if getattr(real_spec, "origin", None):
+                module.__file__ = real_spec.origin
+        finally:
+            self._finder._loading.discard(fullname)
+
+        self._finder._mark_done(fullname)
+
+        try:
+            _PATCHES[fullname](module)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[truecloud-patch] patch failed for {fullname}: {exc}\n"
+            )
+
+
+# ── Patch functions ───────────────────────────────────────────────────────────
 
 def _patch_b2(module):
     cls = module.B2RcloneRemote
 
     if hasattr(cls, "get_restic_config"):
-        return  # future TrueNAS version already added it
+        # A future TrueNAS version already added native B2 restic support.
+        return
 
-    def get_restic_config(self, task):
+    def get_restic_config(self, task):  # noqa: ARG001
         p = task["credentials"]["provider"]
         return "", {
             "B2_ACCOUNT_ID": p["account"],
@@ -90,15 +125,18 @@ def _patch_restic(module):
     if getattr(orig, "_truecloud_patched", False):
         return
 
-    # Capture module-level references; REMOTES is the same mutable dict
-    # object that remotes.setup() will populate later.
-    _REMOTES = module.REMOTES
-    _get_remote_path = module.get_remote_path
+    # ResticConfig is safe to capture now (it's a dataclass defined in the module).
+    # REMOTES and get_remote_path are imported lazily inside the function so that
+    # module layout changes in future middlewared versions fail at call time
+    # (during an actual backup job) rather than silently at patch time.
     _ResticConfig = module.ResticConfig
 
     def get_restic_config(cloud_backup):
-        remote = _REMOTES[cloud_backup["credentials"]["provider"]["type"]]
-        remote_path = _get_remote_path(remote, cloud_backup["attributes"])
+        from middlewared.plugins.cloud.path import get_remote_path
+        from middlewared.plugins.cloud.remotes import REMOTES
+
+        remote = REMOTES[cloud_backup["credentials"]["provider"]["type"]]
+        remote_path = get_remote_path(remote, cloud_backup["attributes"])
         url, env = remote.get_restic_config(cloud_backup)
 
         if cloud_backup["cache_path"]:
@@ -106,8 +144,7 @@ def _patch_restic(module):
         else:
             cache = ["--no-cache"]
 
-        # Fix: stock code does f"{rclone_type}:{url}/{remote_path}" which
-        # produces "b2:/bucket/path" when url is empty.
+        # Stock code produces "b2:/bucket/path" when url == "" (double-slash).
         repo = (
             f"{remote.rclone_type}:{url}/{remote_path}"
             if url
@@ -122,9 +159,22 @@ def _patch_restic(module):
     sys.stderr.write("[truecloud-patch] restic URL fix applied\n")
 
 
-try:
+_PATCHES = {
+    "middlewared.rclone.remote.b2": _patch_b2,
+    "middlewared.plugins.cloud_backup.restic": _patch_restic,
+}
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def _install():
     import importlib.util
-    if importlib.util.find_spec("middlewared") is not None:
-        _install()
+    if importlib.util.find_spec("middlewared") is None:
+        return  # not a middlewared Python process; nothing to do
+    sys.meta_path.append(_Finder())
+
+
+try:
+    _install()
 except Exception:
-    pass
+    pass  # never raise from sitecustomize.py — it would prevent Python from starting

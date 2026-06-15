@@ -1,27 +1,42 @@
 #!/bin/bash
-# install.sh — run once on the TrueNAS box to set up the patch.
+# install.sh — run once on the TrueNAS box to set up truecloud-patch.
+#
+# Prerequisites: run as root on TrueNAS SCALE with middlewared running.
 #
 # What this does:
-#   1. Copies patch files to /data/truecloud-patch/ (survives updates).
-#   2. Registers a PREINIT initshutdownscript so apply.sh runs on every boot
-#      before middlewared starts, re-applying patches to the refreshed /usr/.
-#   3. Applies the patches immediately without rebooting.
-#   4. Restarts middlewared so the backend patch takes effect now.
+#   1. Copies patch files to /data/truecloud-patch/ (survives OS updates).
+#   2. Registers a PREINIT initshutdownscript in the TrueNAS database so
+#      apply.sh re-applies the patches on every boot before middlewared starts.
+#   3. Applies the patches immediately (no reboot required).
+#   4. Restarts middlewared so the backend change takes effect now.
 
 set -euo pipefail
 
 PATCH_DIR="/data/truecloud-patch"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "=== TrueNAS TrueCloud Provider Patch ==="
+echo "=== TrueNAS TrueCloud Provider Patch — Install ==="
 echo ""
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: must be run as root." >&2
+    exit 1
+fi
 
 if ! command -v midclt &>/dev/null; then
     echo "ERROR: midclt not found. Run this script on TrueNAS SCALE." >&2
     exit 1
 fi
 
+if ! midclt call core.ping &>/dev/null; then
+    echo "ERROR: middlewared is not responding. Is TrueNAS fully booted?" >&2
+    exit 1
+fi
+
 # ── Copy files ────────────────────────────────────────────────────────────────
+
 echo "Copying patch files to $PATCH_DIR ..."
 mkdir -p "$PATCH_DIR"
 cp "$REPO_DIR/patch/sitecustomize.py" "$PATCH_DIR/"
@@ -33,7 +48,8 @@ echo "Done."
 echo ""
 
 # ── Register PREINIT script ───────────────────────────────────────────────────
-echo "Checking initshutdownscript registration ..."
+
+echo "Registering PREINIT boot hook ..."
 
 EXISTING_ID=$(midclt call initshutdownscript.query '[]' | \
     python3 -c "
@@ -52,22 +68,25 @@ else
     midclt call initshutdownscript.create \
         '{"type":"SCRIPT","script":"/data/truecloud-patch/apply.sh","when":"PREINIT","enabled":true,"comment":"TrueCloud provider patch (S3/B2)"}' \
         > /dev/null
-    echo "Registered PREINIT script."
+    echo "Registered."
 fi
 echo ""
 
 # ── Apply now ─────────────────────────────────────────────────────────────────
+
 echo "Applying patches ..."
 bash "$PATCH_DIR/apply.sh"
-cat "$PATCH_DIR/apply.log" | tail -20
+echo ""
+echo "Patch log ($PATCH_DIR/apply.log):"
+tail -30 "$PATCH_DIR/apply.log"
 echo ""
 
 # ── Restart middlewared ───────────────────────────────────────────────────────
-echo "Restarting middlewared (backend patch takes effect) ..."
+
+echo "Restarting middlewared so the backend patch takes effect ..."
 systemctl restart middlewared
 echo "Done."
 echo ""
-
 echo "Refresh your browser to pick up the UI change."
 echo ""
 echo "To create a TrueCloud Backup task with S3 or B2 credentials:"

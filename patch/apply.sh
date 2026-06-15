@@ -1,44 +1,104 @@
 #!/bin/bash
 # /data/truecloud-patch/apply.sh
 #
-# PREINIT script registered via TrueNAS initshutdownscript.
-# Runs on every boot before middlewared starts, re-applying patches that
-# TrueNAS updates wipe from /usr/.
+# Registered as a TrueNAS PREINIT initshutdownscript.
+# Runs on every boot BEFORE middlewared starts, so patches land before
+# the first Python process for middlewared is created.
 #
-# Two things are patched:
-#   1. sitecustomize.py  → monkey-patches B2 restic support + URL fix into
-#                          middlewared at Python startup time (backend)
-#   2. Angular JS bundle → adds S3 and B2 to the credential dropdown in
-#                          the TrueCloud Backup task form (UI)
-
-set -euo pipefail
+# TrueNAS updates replace /usr/ entirely; this script re-applies two patches:
+#
+#   1. sitecustomize.py  — Python executes this automatically at startup.
+#                          Monkey-patches B2 restic support and fixes the
+#                          URL builder for empty-host providers.
+#
+#   2. Angular JS bundle — Widens the TrueCloud Backup credential dropdown
+#                          from Storj-only to include S3 and B2.
+#
+# Design principle: every step is independently fail-safe.
+# A failed patch logs a warning and continues; middlewared always starts.
+# Never use `set -e` in a PREINIT script.
 
 PATCH_DIR="/data/truecloud-patch"
 LOG="$PATCH_DIR/apply.log"
 
-{
-    echo "=== $(date -Iseconds) ==="
+# Rotate log at 512 KB to avoid unbounded growth on a system volume.
+if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 524288 ]; then
+    mv "$LOG" "${LOG}.1"
+fi
 
-    # ── 1. Backend: install sitecustomize.py ─────────────────────────────
-    SITE_PKG=$(python3 -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || true)
+exec >> "$LOG" 2>&1
+echo "=== $(date -Iseconds) ==="
 
-    if [ -z "$SITE_PKG" ]; then
-        echo "WARNING: could not determine site-packages path, skipping backend patch"
-    else
-        # If an unrelated sitecustomize.py exists, back it up once.
-        if [ -f "$SITE_PKG/sitecustomize.py" ] && \
-           ! grep -q "truecloud-patch" "$SITE_PKG/sitecustomize.py" 2>/dev/null; then
-            cp "$SITE_PKG/sitecustomize.py" "$SITE_PKG/sitecustomize.py.pre-truecloud-patch"
-            echo "Backed up existing sitecustomize.py"
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+warn() { echo "WARNING: $*"; }
+ok()   { echo "OK: $*"; }
+
+# Find the Python interpreter that middlewared actually uses.
+# On TrueNAS SCALE, /usr/bin/middlewared is usually a Python entry-point script
+# with a shebang pointing at the right interpreter (system or venv).
+find_mw_python() {
+    local py="python3"
+    local shebang=""
+
+    if [ -x /usr/bin/middlewared ]; then
+        # Read the first line safely (max 256 bytes) — avoids reading a binary ELF
+        shebang=$(dd if=/usr/bin/middlewared bs=256 count=1 2>/dev/null | head -1 || true)
+
+        if [[ "$shebang" =~ ^'#!'(/[^[:space:]]+python[^[:space:]]*) ]]; then
+            py="${BASH_REMATCH[1]}"
+        elif [[ "$shebang" =~ ^'#!/usr/bin/env '(python[^[:space:]]*) ]]; then
+            py=$(command -v "${BASH_REMATCH[1]}" 2>/dev/null || echo "python3")
         fi
-
-        cp "$PATCH_DIR/sitecustomize.py" "$SITE_PKG/sitecustomize.py"
-        echo "Installed sitecustomize.py → $SITE_PKG/sitecustomize.py"
     fi
 
-    # ── 2. UI: patch Angular bundle ──────────────────────────────────────
-    python3 "$PATCH_DIR/patch_ui.py"
+    # Verify the chosen interpreter can actually import middlewared.
+    if ! "$py" -c "import middlewared" 2>/dev/null; then
+        warn "Detected Python '$py' cannot import middlewared; falling back to python3"
+        py="python3"
+    fi
 
-    echo "=== done ==="
+    echo "$py"
+}
 
-} >> "$LOG" 2>&1
+# ── Step 1: sitecustomize.py ──────────────────────────────────────────────────
+
+echo "--- backend patch ---"
+
+PYTHON=$(find_mw_python)
+echo "Using Python: $PYTHON"
+
+SITE_PKG=$("$PYTHON" -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || true)
+
+if [ -z "$SITE_PKG" ]; then
+    warn "Cannot determine site-packages directory; skipping backend patch."
+    warn "Verify that '$PYTHON -c \"import site; print(site.getsitepackages())\"' works."
+else
+    # Back up any pre-existing sitecustomize.py that isn't ours.
+    if [ -f "$SITE_PKG/sitecustomize.py" ] && \
+       ! grep -q "truecloud-patch" "$SITE_PKG/sitecustomize.py" 2>/dev/null; then
+        cp "$SITE_PKG/sitecustomize.py" \
+           "$SITE_PKG/sitecustomize.py.pre-truecloud-patch"
+        ok "Backed up existing sitecustomize.py"
+    fi
+
+    if cp "$PATCH_DIR/sitecustomize.py" "$SITE_PKG/sitecustomize.py" 2>/dev/null; then
+        ok "Installed sitecustomize.py → $SITE_PKG/sitecustomize.py"
+    else
+        warn "Failed to write $SITE_PKG/sitecustomize.py (permission error?)"
+    fi
+fi
+
+# ── Step 2: Angular bundle ────────────────────────────────────────────────────
+
+echo "--- UI patch ---"
+
+if "$PYTHON" "$PATCH_DIR/patch_ui.py"; then
+    : # patch_ui.py prints its own status
+else
+    warn "patch_ui.py exited non-zero; UI dropdown may still show Storj only."
+fi
+
+# ── Done ──────────────────────────────────────────────────────────────────────
+
+echo "=== done ==="
