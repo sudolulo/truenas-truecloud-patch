@@ -72,17 +72,20 @@ for s in json.load(sys.stdin):
 
 if [ -n "$EXISTING_ID" ]; then
     echo "Already registered (id=$EXISTING_ID). Updating path and enabling ..."
-    if ! midclt call initshutdownscript.update "$EXISTING_ID" \
-            "{\"enabled\": true, \"script\": \"$PATCH_DIR/patch/apply.sh\"}" > /dev/null; then
+    if ! _midclt_out=$(midclt call initshutdownscript.update "$EXISTING_ID" \
+            "{\"enabled\": true, \"script\": \"$PATCH_DIR/patch/apply.sh\"}" 2>&1); then
         echo "ERROR: Failed to update PREINIT hook (id=$EXISTING_ID)." >&2
-        echo "  midclt call initshutdownscript.query '[]'" >&2
+        [ -n "$_midclt_out" ] && echo "  midclt: $_midclt_out" >&2
+        echo "  To remove the stale entry and retry:" >&2
+        echo "    midclt call initshutdownscript.delete $EXISTING_ID" >&2
         exit 1
     fi
 else
-    if ! midclt call initshutdownscript.create \
+    if ! _midclt_out=$(midclt call initshutdownscript.create \
             "{\"type\":\"SCRIPT\",\"script\":\"$PATCH_DIR/patch/apply.sh\",\"when\":\"PREINIT\",\"enabled\":true,\"comment\":\"$_HOOK_COMMENT\"}" \
-            > /dev/null; then
+            2>&1); then
         echo "ERROR: Failed to register PREINIT hook." >&2
+        [ -n "$_midclt_out" ] && echo "  midclt: $_midclt_out" >&2
         exit 1
     fi
     echo "Registered."
