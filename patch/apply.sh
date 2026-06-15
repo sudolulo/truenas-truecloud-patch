@@ -29,6 +29,15 @@ fi
 exec >> "$LOG" 2>&1
 echo "=== $(date -Iseconds) ==="
 
+# Kill switch: if this file exists, skip all patching and exit cleanly.
+# Recovery: touch /data/truecloud-patch/disabled (then reboot or restart middlewared).
+if [ -f "$PATCH_DIR/disabled" ]; then
+    echo "Kill switch active ($PATCH_DIR/disabled exists) — patch not applied."
+    echo "To re-enable: rm $PATCH_DIR/disabled"
+    echo "=== done ==="
+    exit 0
+fi
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 warn() { echo "WARNING: $*"; }

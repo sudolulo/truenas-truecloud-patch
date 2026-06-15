@@ -183,6 +183,9 @@ _PATCHES = {
 
 def _install():
     import importlib.util
+    import os
+    if os.path.exists("/data/truecloud-patch/disabled"):
+        return  # kill switch: touch /data/truecloud-patch/disabled to bypass this hook
     if importlib.util.find_spec("middlewared") is None:
         return  # not a middlewared Python process; nothing to do
     sys.meta_path.append(_Finder())

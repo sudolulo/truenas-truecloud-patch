@@ -167,6 +167,36 @@ restart.
 
 ---
 
+## Emergency recovery
+
+If middlewared stops starting after installing this patch, run this from the
+TrueNAS shell (local console, SSH, or the debug shell in the UI):
+
+```bash
+bash /data/truecloud-patch/recover.sh
+```
+
+That creates a kill-switch file (`/data/truecloud-patch/disabled`) that
+`sitecustomize.py` checks at startup. With the switch set, the import hook is
+skipped entirely and middlewared starts clean. Your system returns to
+Storj-only TrueCloud Backup — nothing else is affected.
+
+If you cannot run a script and only have a bare shell prompt:
+
+```bash
+touch /data/truecloud-patch/disabled
+systemctl restart middlewared
+```
+
+To re-enable the patch after investigating:
+
+```bash
+rm /data/truecloud-patch/disabled
+bash /data/truecloud-patch/apply.sh
+```
+
+---
+
 ## Troubleshooting
 
 **Apply log** (check after each reboot or install):
