@@ -2,24 +2,29 @@
 # install.sh — run once on the TrueNAS box to set up truecloud-patch.
 #
 # Prerequisites: run as root on TrueNAS SCALE with middlewared running.
+# Clone this repository to a persistent ZFS pool first:
+#
+#   git clone https://github.com/sudolulo/truenas-truecloud-patch \
+#       /mnt/<pool>/truenas-truecloud-patch
+#   cd /mnt/<pool>/truenas-truecloud-patch && bash install.sh
 #
 # What this does:
-#   1. Copies patch files to /data/truecloud-patch/ (survives OS updates).
-#   2. Registers a PREINIT initshutdownscript in the TrueNAS database so
-#      apply.sh re-applies the patches on every boot before middlewared starts.
-#   3. Applies the patches immediately (no reboot required).
-#   4. Restarts middlewared so the backend change takes effect now.
+#   1. Registers a PREINIT initshutdownscript so patch/apply.sh re-runs on
+#      every boot before middlewared starts.
+#   2. Applies the patches immediately (no reboot required).
+#   3. Restarts middlewared so the backend change takes effect now.
 
 set -euo pipefail
 
-PATCH_DIR="/data/truecloud-patch"
-REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+# The directory containing install.sh is the permanent install location.
+PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-if [ ! -f "$REPO_DIR/patch/sitecustomize.py" ]; then
-    echo "ERROR: patch files not found at $REPO_DIR/patch/" >&2
-    echo "Run install.sh from the cloned repository, not via pipe:" >&2
-    echo "  git clone https://github.com/sudolulo/truenas-truecloud-patch" >&2
-    echo "  cd truenas-truecloud-patch && bash install.sh" >&2
+if [ ! -f "$PATCH_DIR/patch/sitecustomize.py" ]; then
+    echo "ERROR: patch files not found at $PATCH_DIR/patch/" >&2
+    echo "Run install.sh from a clone of the repository on a persistent pool:" >&2
+    echo "  git clone https://github.com/sudolulo/truenas-truecloud-patch \\" >&2
+    echo "      /mnt/<pool>/truenas-truecloud-patch" >&2
+    echo "  cd /mnt/<pool>/truenas-truecloud-patch && bash install.sh" >&2
     exit 1
 fi
 
@@ -43,17 +48,11 @@ if ! midclt call core.ping &>/dev/null; then
     exit 1
 fi
 
-# ── Copy files ────────────────────────────────────────────────────────────────
+# ── Set permissions ───────────────────────────────────────────────────────────
 
-echo "Copying patch files to $PATCH_DIR ..."
-mkdir -p "$PATCH_DIR"
-cp "$REPO_DIR/patch/sitecustomize.py" "$PATCH_DIR/"
-cp "$REPO_DIR/patch/patch_ui.py"      "$PATCH_DIR/"
-cp "$REPO_DIR/patch/apply.sh"         "$PATCH_DIR/"
-cp "$REPO_DIR/patch/create_task.py"   "$PATCH_DIR/"
-cp "$REPO_DIR/recover.sh"             "$PATCH_DIR/"
-cp "$REPO_DIR/uninstall.sh"           "$PATCH_DIR/"
-chmod +x "$PATCH_DIR/apply.sh" "$PATCH_DIR/create_task.py" "$PATCH_DIR/recover.sh" "$PATCH_DIR/uninstall.sh"
+echo "Setting permissions ..."
+chmod +x "$PATCH_DIR/patch/apply.sh" "$PATCH_DIR/patch/create_task.py" \
+          "$PATCH_DIR/recover.sh" "$PATCH_DIR/uninstall.sh"
 echo "Done."
 echo ""
 
@@ -65,7 +64,7 @@ EXISTING_ID=$(midclt call initshutdownscript.query '[]' | \
     python3 -c "
 import sys, json
 for s in json.load(sys.stdin):
-    if s.get('script') == '/data/truecloud-patch/apply.sh':
+    if s.get('script') == '$PATCH_DIR/patch/apply.sh':
         print(s['id'])
         break
 " 2>/dev/null || true)
@@ -76,7 +75,7 @@ if [ -n "$EXISTING_ID" ]; then
         '{"enabled": true}' > /dev/null
 else
     midclt call initshutdownscript.create \
-        '{"type":"SCRIPT","script":"/data/truecloud-patch/apply.sh","when":"PREINIT","enabled":true,"comment":"TrueCloud provider patch (S3/B2)"}' \
+        "{\"type\":\"SCRIPT\",\"script\":\"$PATCH_DIR/patch/apply.sh\",\"when\":\"PREINIT\",\"enabled\":true,\"comment\":\"TrueCloud provider patch (S3/B2)\"}" \
         > /dev/null
     echo "Registered."
 fi
@@ -94,7 +93,7 @@ fi
 
 echo "Applying patches ..."
 _log_start=$(wc -c < "$PATCH_DIR/apply.log" 2>/dev/null || echo 0)
-bash "$PATCH_DIR/apply.sh"
+bash "$PATCH_DIR/patch/apply.sh"
 echo ""
 echo "Patch log ($PATCH_DIR/apply.log):"
 tail -30 "$PATCH_DIR/apply.log"
@@ -121,9 +120,9 @@ fi
 echo "Done."
 echo ""
 echo "Verify the backend patch loaded correctly:"
-echo "  python3 $PATCH_DIR/create_task.py verify"
+echo "  python3 $PATCH_DIR/patch/create_task.py verify"
 echo ""
 echo "Refresh your browser to pick up the UI change."
 echo ""
 echo "To create a TrueCloud Backup task with S3 or B2 credentials:"
-echo "  python3 $PATCH_DIR/create_task.py --help"
+echo "  python3 $PATCH_DIR/patch/create_task.py --help"

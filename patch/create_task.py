@@ -48,7 +48,8 @@ import sys
 import urllib.error
 import urllib.request
 
-_STATUS_FILE = "/data/truecloud-patch/hook_status.json"
+_PATCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_STATUS_FILE = os.path.join(_PATCH_DIR, "hook_status.json")
 
 
 def make_client(host, api_key, insecure=False):
@@ -117,7 +118,7 @@ def cmd_verify():
         print("All patches installed. Run a test backup to confirm end-to-end.")
     else:
         print("One or more patches failed to apply.")
-        print("Check /data/truecloud-patch/apply.log and journalctl -u middlewared")
+        print(f"Check {os.path.join(_PATCH_DIR, 'apply.log')} and journalctl -u middlewared")
         sys.exit(1)
 
 def cmd_list_credentials(client, _args):

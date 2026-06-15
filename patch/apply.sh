@@ -1,7 +1,6 @@
 #!/bin/bash
-# /data/truecloud-patch/apply.sh
+# patch/apply.sh — registered as a TrueNAS PREINIT initshutdownscript.
 #
-# Registered as a TrueNAS PREINIT initshutdownscript.
 # Runs on every boot BEFORE middlewared starts, so patches land before
 # the first Python process for middlewared is created.
 #
@@ -18,7 +17,8 @@
 # A failed patch logs a warning and continues; middlewared always starts.
 # Never use `set -e` in a PREINIT script.
 
-PATCH_DIR="/data/truecloud-patch"
+# Derive PATCH_DIR from this script's location (parent of the patch/ directory).
+PATCH_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="$PATCH_DIR/apply.log"
 
 # Rotate log at 512 KB to avoid unbounded growth on a system volume.
@@ -32,7 +32,7 @@ exec >> "$LOG" 2>&1
 echo "=== $(date -Iseconds) ==="
 
 # Kill switch: if this file exists, skip all patching and exit cleanly.
-# Recovery: touch /data/truecloud-patch/disabled (then reboot or restart middlewared).
+# Recovery: touch "$PATCH_DIR/disabled" (then reboot or restart middlewared).
 if [ -f "$PATCH_DIR/disabled" ]; then
     echo "Kill switch active ($PATCH_DIR/disabled exists) — patch not applied."
     echo "To re-enable: rm $PATCH_DIR/disabled"
@@ -98,7 +98,11 @@ else
     fi
 
     if [ "$_can_install" = true ]; then
-        if cp "$PATCH_DIR/sitecustomize.py" "$SITE_PKG/sitecustomize.py"; then
+        # Substitute PATCH_DIR into the source so sitecustomize.py knows where
+        # to write hook_status.json and check the kill switch at runtime.
+        if sed "s|/data/truecloud-patch|$PATCH_DIR|g" \
+               "$PATCH_DIR/patch/sitecustomize.py" \
+               > "$SITE_PKG/sitecustomize.py"; then
             echo "OK: Installed sitecustomize.py → $SITE_PKG/sitecustomize.py"
         else
             echo "WARNING: Failed to write $SITE_PKG/sitecustomize.py (permission error?)"
@@ -110,7 +114,7 @@ fi
 
 echo "--- UI patch ---"
 
-"$PYTHON" "$PATCH_DIR/patch_ui.py" || echo "WARNING: patch_ui.py exited non-zero; UI dropdown may still show Storj only."
+"$PYTHON" "$PATCH_DIR/patch/patch_ui.py" || echo "WARNING: patch_ui.py exited non-zero; UI dropdown may still show Storj only."
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 

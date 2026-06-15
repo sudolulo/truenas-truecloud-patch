@@ -64,7 +64,7 @@ on every update) and are therefore re-applied automatically on every boot.
 
 Both changes are **fail-safe**: if a patch cannot be applied (e.g. TrueNAS
 restructured the relevant code), middlewared starts normally with Storj-only
-support and the reason is logged to `/data/truecloud-patch/apply.log`.
+support and the reason is logged to `apply.log` in your repo root.
 
 ## Supported providers after patching
 
@@ -76,12 +76,12 @@ support and the reason is logged to `/data/truecloud-patch/apply.log`.
 
 ## How persistence works
 
-TrueNAS SCALE updates replace `/usr/` entirely. The patch survives by storing
-all scripts in `/data/truecloud-patch/` (a persistent ZFS dataset) and
-registering a **PREINIT initshutdownscript** in the TrueNAS database. This
-causes `apply.sh` to run on every boot before `middlewared` starts, placing
-`sitecustomize.py` in the correct site-packages directory and re-patching the
-UI bundle.
+TrueNAS SCALE updates replace `/usr/` entirely. The patch survives by keeping
+this repository on a **persistent ZFS pool** (your data pool, not `/tmp` or a
+system path) and registering a **PREINIT initshutdownscript** in the TrueNAS
+database. On every boot, `patch/apply.sh` runs from the repo before
+`middlewared` starts, placing `sitecustomize.py` in the correct site-packages
+directory and re-patching the UI bundle.
 
 ## Python version compatibility
 
@@ -95,13 +95,19 @@ UI bundle.
 
 ## Install
 
-Run on your TrueNAS box as root, with the system fully booted:
+Clone the repository to a **persistent ZFS pool** so it survives OS updates,
+then run `install.sh` from there:
 
 ```bash
-git clone https://github.com/sudolulo/truenas-truecloud-patch.git
-cd truenas-truecloud-patch
+# Replace /mnt/tank with your pool name
+git clone https://github.com/sudolulo/truenas-truecloud-patch.git \
+    /mnt/tank/truenas-truecloud-patch
+cd /mnt/tank/truenas-truecloud-patch
 bash install.sh
 ```
+
+The directory you clone into becomes the permanent install location. The PREINIT
+boot hook points to it — **do not delete or move the repo after install.**
 
 Refresh your browser. S3 and B2 credentials now appear in the
 **Data Protection → TrueCloud Backup → Add** credential dropdown.
@@ -124,12 +130,14 @@ If the UI still shows only Storj after refreshing (e.g. the JS bundle pattern
 changed in a new TrueNAS version), create tasks directly via the REST API:
 
 ```bash
+# Replace /mnt/tank/truenas-truecloud-patch with your clone path
+
 # List your cloud credentials to find the right ID
-python3 /data/truecloud-patch/create_task.py \
+python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py \
     --host 192.168.1.1 --api-key <key> list-credentials
 
 # Create a task with a B2 credential (id=3)
-python3 /data/truecloud-patch/create_task.py \
+python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py \
     --host 192.168.1.1 --api-key <key> create \
     --name "tank-to-b2" \
     --path /mnt/tank/data \
@@ -147,12 +155,12 @@ Get an API key from **System → API Keys → Add**.
 ## Uninstall
 
 ```bash
-bash /data/truecloud-patch/uninstall.sh
+bash /mnt/tank/truenas-truecloud-patch/uninstall.sh
 ```
 
-Removes the PREINIT hook, `sitecustomize.py`, and restores the original UI
-bundle from backup. The backend changes vanish on the next `middlewared`
-restart.
+Replace the path with your clone location. Removes the PREINIT hook,
+`sitecustomize.py`, and restores the original UI bundle from backup. The
+backend changes vanish on the next `middlewared` restart.
 
 ---
 
@@ -252,7 +260,7 @@ restic -r "$REPO" ls latest
 
 ## After a TrueNAS update
 
-1. Check the log: `cat /data/truecloud-patch/apply.log | tail -30`
+1. Check the log: `cat /mnt/tank/truenas-truecloud-patch/apply.log | tail -30`
 2. If you see "WARNING: … pattern not found", the UI patch needs updating.
    [Open an issue](https://github.com/sudolulo/truenas-truecloud-patch/issues)
    with your TrueNAS version number.
@@ -269,18 +277,18 @@ Run this from the TrueNAS shell (local console, SSH, or the debug shell in
 the UI):
 
 ```bash
-bash /data/truecloud-patch/recover.sh
+bash /mnt/tank/truenas-truecloud-patch/recover.sh
 ```
 
-This creates a kill-switch file (`/data/truecloud-patch/disabled`).
-`sitecustomize.py` checks for it at Python startup; if present, the import
-hook is skipped entirely and middlewared starts clean with Storj-only support.
-Nothing else on your system is affected.
+Replace the path with your clone location. This creates a kill-switch file
+(`disabled`) in the repo root. `sitecustomize.py` checks for it at Python
+startup; if present, the import hook is skipped entirely and middlewared starts
+clean with Storj-only support. Nothing else on your system is affected.
 
 If you cannot run a script and only have a bare shell prompt:
 
 ```bash
-touch /data/truecloud-patch/disabled
+touch /mnt/tank/truenas-truecloud-patch/disabled
 systemctl restart middlewared
 ```
 
@@ -294,8 +302,8 @@ journalctl -u middlewared -n 50
 To re-enable the patch once you have investigated:
 
 ```bash
-rm /data/truecloud-patch/disabled
-bash /data/truecloud-patch/apply.sh
+rm /mnt/tank/truenas-truecloud-patch/disabled
+bash /mnt/tank/truenas-truecloud-patch/patch/apply.sh
 ```
 
 ---
@@ -317,22 +325,22 @@ mv /usr/share/truenas/webui/main.XXXXXXXX.js.pre-truecloud-patch \
 ```
 
 Refresh your browser. The UI will return to normal (Storj-only until the
-patch re-runs at next reboot, or you run `bash /data/truecloud-patch/apply.sh`
-manually).
+patch re-runs at next reboot, or you run
+`bash /mnt/tank/truenas-truecloud-patch/patch/apply.sh` manually).
 
 ---
 
 ### Backend verify shows FAIL
 
 ```bash
-python3 /data/truecloud-patch/create_task.py verify
+python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify
 ```
 
 If one or more entries show `[FAIL]`:
 
 1. **Check the apply log** for errors during the last boot:
    ```bash
-   cat /data/truecloud-patch/apply.log | tail -40
+   cat /mnt/tank/truenas-truecloud-patch/apply.log | tail -40
    ```
 2. **Check middlewared's own log** for Python tracebacks:
    ```bash
@@ -351,14 +359,14 @@ If one or more entries show `[FAIL]`:
 
 **Apply log** (check after each reboot or install):
 ```bash
-cat /data/truecloud-patch/apply.log
+cat /mnt/tank/truenas-truecloud-patch/apply.log
 ```
 
 **Verify backend patch is loaded** (while middlewared is running):
 ```bash
-python3 /data/truecloud-patch/create_task.py verify
+python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify
 ```
-This reads `/data/truecloud-patch/hook_status.json`, written by the import
+This reads `hook_status.json` in your repo root, written by the import
 hook once both target modules have been loaded by middlewared. If it reports
 "No hook status file found" immediately after install, restart middlewared
 and try again — the file is written when middlewared imports the relevant

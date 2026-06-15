@@ -3,19 +3,19 @@
 #
 # Run this from the TrueNAS shell (local console, SSH, or debug shell):
 #
-#   bash /data/truecloud-patch/recover.sh
+#   bash /mnt/tank/truenas-truecloud-patch/recover.sh
 #
 # What it does:
-#   1. Creates /data/truecloud-patch/disabled  — sitecustomize.py checks for this
-#      file at startup and skips the import hook entirely, so middlewared starts
-#      clean without any of our code running.
+#   1. Creates a "disabled" file in the repo root — sitecustomize.py checks for
+#      this file at startup and skips the import hook entirely, so middlewared
+#      starts clean without any of our code running.
 #   2. Restarts middlewared.
 #
 # To re-enable the patch after investigating:
-#   rm /data/truecloud-patch/disabled
-#   bash /data/truecloud-patch/apply.sh
+#   rm /mnt/tank/truenas-truecloud-patch/disabled
+#   bash /mnt/tank/truenas-truecloud-patch/patch/apply.sh
 
-PATCH_DIR="/data/truecloud-patch"
+PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "ERROR: must be run as root." >&2

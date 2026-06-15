@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-PATCH_DIR="/data/truecloud-patch"
+PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "=== TrueNAS TrueCloud Provider Patch — Uninstall ==="
 echo ""
@@ -26,7 +26,7 @@ IDS=$(midclt call initshutdownscript.query '[]' | \
     python3 -c "
 import sys, json
 for s in json.load(sys.stdin):
-    if s.get('script') == '/data/truecloud-patch/apply.sh':
+    if s.get('script') == '$PATCH_DIR/patch/apply.sh':
         print(s['id'])
 " 2>/dev/null || true)
 

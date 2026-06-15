@@ -1,0 +1,6 @@
+# Runtime files written to the repo root by apply.sh and sitecustomize.py
+/apply.log
+/apply.log.1
+/apply.log.2
+/hook_status.json
+/disabled
