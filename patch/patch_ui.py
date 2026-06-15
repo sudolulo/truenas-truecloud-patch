@@ -22,7 +22,6 @@ Exits 0 in all cases (warnings are printed to stdout and logged by apply.sh).
 import os
 import re
 import shutil
-import sys
 
 WEBUI_CANDIDATES = [
     "/usr/share/truenas/webui",
