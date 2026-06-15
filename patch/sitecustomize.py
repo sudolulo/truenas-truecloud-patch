@@ -188,14 +188,7 @@ def _patch_restic(module):
                     try:
                         return dataclasses.replace(result, cmd=cmd)
                     except TypeError:
-                        try:
-                            return result._replace(cmd=cmd)
-                        except AttributeError:
-                            sys.stderr.write(
-                                "[truecloud-patch] WARNING: cannot fix repo URL; "
-                                f"unexpected ResticConfig type {type(result).__name__!r}\n"
-                            )
-                            return result
+                        return result._replace(cmd=cmd)
                 break
             if i and cmd[i - 1] in ("-r", "--repo", "--repository"):
                 scheme, sep, rest = part.partition(":")
@@ -204,14 +197,7 @@ def _patch_restic(module):
                     try:
                         return dataclasses.replace(result, cmd=cmd)
                     except TypeError:
-                        try:
-                            return result._replace(cmd=cmd)
-                        except AttributeError:
-                            sys.stderr.write(
-                                "[truecloud-patch] WARNING: cannot fix repo URL; "
-                                f"unexpected ResticConfig type {type(result).__name__!r}\n"
-                            )
-                            return result
+                        return result._replace(cmd=cmd)
                 break
         return result
 
