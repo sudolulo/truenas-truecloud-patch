@@ -77,7 +77,7 @@ SITE_PKG=$("$PYTHON" -c "import site; print(site.getsitepackages()[0])" 2>/dev/n
 
 if [ -z "$SITE_PKG" ]; then
     echo "WARNING: Cannot determine site-packages directory; skipping backend patch."
-    echo "WARNING: Verify that '$PYTHON -c \"import site; print(site.getsitepackages())\"' works."
+    echo "  Run: $PYTHON -c \"import site; print(site.getsitepackages())\""
 else
     # Back up any pre-existing sitecustomize.py that isn't ours.
     if [ -f "$SITE_PKG/sitecustomize.py" ] && \

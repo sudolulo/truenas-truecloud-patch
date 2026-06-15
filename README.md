@@ -156,6 +156,100 @@ restart.
 
 ---
 
+## Restoring from a TrueCloud Backup
+
+TrueCloud Backup uses [restic](https://restic.net/) under the hood. Restores
+are done with the `restic` command directly — TrueNAS does not yet expose a
+restore UI for TrueCloud Backup tasks.
+
+### 1. Find the restic binary
+
+```bash
+which restic 2>/dev/null || find /usr -name restic -type f 2>/dev/null | head -1
+```
+
+Use that path in the commands below (referred to as `restic`).
+
+### 2. Gather your repository details
+
+You need three things from the task you created:
+
+| Detail | Where to find it |
+|---|---|
+| **Bucket** and **folder** | TrueNAS UI → Data Protection → TrueCloud Backup → edit the task → Attributes |
+| **Credentials** (key ID + secret) | TrueNAS UI → Credentials → Backup Credentials → edit the credential |
+| **Repository password** | The `--password` value you supplied when creating the task |
+
+### 3. Set environment variables
+
+**Backblaze B2:**
+```bash
+export B2_ACCOUNT_ID="your-key-id"
+export B2_ACCOUNT_KEY="your-application-key"
+export RESTIC_PASSWORD="your-repo-password"
+REPO="b2:your-bucket/your-folder"
+```
+
+**S3-compatible (AWS S3, Wasabi, Cloudflare R2, MinIO, etc.):**
+```bash
+export AWS_ACCESS_KEY_ID="your-access-key"
+export AWS_SECRET_ACCESS_KEY="your-secret-key"
+export RESTIC_PASSWORD="your-repo-password"
+# Use just the hostname as the endpoint — no https:// prefix:
+REPO="s3:s3.wasabisys.com/your-bucket/your-folder"   # Wasabi example
+# REPO="s3:s3.amazonaws.com/your-bucket/your-folder" # AWS S3
+# REPO="s3:<account>.r2.cloudflarestorage.com/your-bucket/your-folder" # R2
+```
+
+### 4. List snapshots
+
+```bash
+restic -r "$REPO" snapshots
+```
+
+Output example:
+```
+ID        Time                 Host        Tags  Paths
+──────────────────────────────────────────────────────────
+a1b2c3d4  2026-06-01 02:00:05  truenas           /mnt/tank/data
+e5f6a7b8  2026-06-08 02:00:07  truenas           /mnt/tank/data
+```
+
+### 5. Restore files
+
+**Restore everything from the latest snapshot to a temporary location:**
+```bash
+restic -r "$REPO" restore latest --target /mnt/tank/restore-tmp
+```
+
+**Restore a specific snapshot by ID:**
+```bash
+restic -r "$REPO" restore a1b2c3d4 --target /mnt/tank/restore-tmp
+```
+
+**Restore only specific paths from within a snapshot:**
+```bash
+restic -r "$REPO" restore latest \
+    --include /mnt/tank/data/important-dir \
+    --target /mnt/tank/restore-tmp
+```
+
+**Browse a snapshot without extracting (useful for finding the right file):**
+```bash
+restic -r "$REPO" ls latest
+```
+
+### 6. Notes
+
+- Restore to a **different path** first, then move files into place after
+  verifying. Restoring directly over a live dataset can cause data loss if
+  the snapshot is incomplete or from the wrong point in time.
+- If you created the task with `--snapshot` (ZFS snapshot before each run),
+  the restic snapshot captures the dataset at a consistent point in time.
+- Use `restic check -r "$REPO"` periodically to verify repository integrity.
+
+---
+
 ## After a TrueNAS update
 
 1. Check the log: `cat /data/truecloud-patch/apply.log | tail -30`
@@ -169,17 +263,19 @@ restart.
 
 ## Emergency recovery
 
-If middlewared stops starting after installing this patch, run this from the
-TrueNAS shell (local console, SSH, or the debug shell in the UI):
+### middlewared won't start
+
+Run this from the TrueNAS shell (local console, SSH, or the debug shell in
+the UI):
 
 ```bash
 bash /data/truecloud-patch/recover.sh
 ```
 
-That creates a kill-switch file (`/data/truecloud-patch/disabled`) that
-`sitecustomize.py` checks at startup. With the switch set, the import hook is
-skipped entirely and middlewared starts clean. Your system returns to
-Storj-only TrueCloud Backup — nothing else is affected.
+This creates a kill-switch file (`/data/truecloud-patch/disabled`).
+`sitecustomize.py` checks for it at Python startup; if present, the import
+hook is skipped entirely and middlewared starts clean with Storj-only support.
+Nothing else on your system is affected.
 
 If you cannot run a script and only have a bare shell prompt:
 
@@ -188,12 +284,66 @@ touch /data/truecloud-patch/disabled
 systemctl restart middlewared
 ```
 
-To re-enable the patch after investigating:
+If middlewared **still** won't start after the kill switch is set, the problem
+is unrelated to this patch. Check:
+
+```bash
+journalctl -u middlewared -n 50
+```
+
+To re-enable the patch once you have investigated:
 
 ```bash
 rm /data/truecloud-patch/disabled
 bash /data/truecloud-patch/apply.sh
 ```
+
+---
+
+### Web UI is blank or broken
+
+If the TrueNAS web interface loads blank or shows JavaScript errors, the
+Angular bundle may have been interrupted mid-write (e.g. power cut during
+boot). The original bundle is always backed up before patching, so recovery
+is straightforward:
+
+```bash
+# Find the backup (the path varies by TrueNAS version):
+find /usr/share/truenas /var/www/truenas -name "*.js.pre-truecloud-patch" 2>/dev/null
+
+# Restore it — substitute the actual path from the find output:
+mv /usr/share/truenas/webui/main.XXXXXXXX.js.pre-truecloud-patch \
+   /usr/share/truenas/webui/main.XXXXXXXX.js
+```
+
+Refresh your browser. The UI will return to normal (Storj-only until the
+patch re-runs at next reboot, or you run `bash /data/truecloud-patch/apply.sh`
+manually).
+
+---
+
+### Backend verify shows FAIL
+
+```bash
+python3 /data/truecloud-patch/create_task.py verify
+```
+
+If one or more entries show `[FAIL]`:
+
+1. **Check the apply log** for errors during the last boot:
+   ```bash
+   cat /data/truecloud-patch/apply.log | tail -40
+   ```
+2. **Check middlewared's own log** for Python tracebacks:
+   ```bash
+   journalctl -u middlewared -n 50
+   ```
+3. **A FAIL is non-fatal.** middlewared runs normally; the affected provider
+   falls back to Storj-only. Your existing backups are not at risk.
+4. **If the detail says the module doesn't exist**, a TrueNAS update renamed
+   or restructured the internal API.
+   [Open an issue](https://github.com/sudolulo/truenas-truecloud-patch/issues)
+   with your TrueNAS version number and the full verify output.
 
 ---
 
@@ -208,8 +358,11 @@ cat /data/truecloud-patch/apply.log
 ```bash
 python3 /data/truecloud-patch/create_task.py verify
 ```
-This reads `/data/truecloud-patch/hook_status.json`, written by the import hook
-at middlewared startup. It shows which patches applied and any failure details.
+This reads `/data/truecloud-patch/hook_status.json`, written by the import
+hook once both target modules have been loaded by middlewared. If it reports
+"No hook status file found" immediately after install, restart middlewared
+and try again — the file is written when middlewared imports the relevant
+modules, which happens at service start.
 Does not require `--host` or `--api-key`.
 
 **Verify the UI patch** (should print your TrueNAS version):

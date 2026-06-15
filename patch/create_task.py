@@ -188,7 +188,7 @@ def main():
     p = argparse.ArgumentParser(
         description="Manage TrueNAS TrueCloud Backup tasks (S3 / B2 / Storj)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__.split("Examples")[1] if "Examples" in __doc__ else "",
+        epilog=__doc__.split("Examples")[1] if __doc__ and "Examples" in __doc__ else "",
     )
     p.add_argument("--host", default=None, metavar="HOST",
                    help="TrueNAS hostname or IP address (required except for verify)")

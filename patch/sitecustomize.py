@@ -189,7 +189,7 @@ def _record_status(fullname: str, ok: bool, detail: str = "") -> None:
         return  # idempotent: first call wins
     _hook_status[fullname] = {"ok": ok, "detail": detail}
     if len(_hook_status) < len(_Finder._targets):
-        return  # wait until all patches have reported before writing
+        return  # wait for all patches; _Finder._targets is the canonical count
 
     payload = {
         "patched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

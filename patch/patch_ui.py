@@ -109,11 +109,17 @@ def main():
 
     patched, count = FIND.subn(REPLACE, content)
 
+    tmp = path + ".tmp"
     try:
-        with open(path, "w", encoding="utf-8") as fh:
+        with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(patched)
+        os.replace(tmp, path)
     except OSError as exc:
         print(f"[truecloud-patch] ERROR: Could not write {path}: {exc}")
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
         return
 
     print(f"[truecloud-patch] UI bundle patched ({count} replacement(s)): {path}")

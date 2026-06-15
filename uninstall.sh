@@ -106,6 +106,13 @@ fi
 echo ""
 
 echo "Restarting middlewared ..."
-systemctl restart middlewared
-echo ""
-echo "Uninstall complete. Refresh your browser to see the restored UI."
+if systemctl restart middlewared; then
+    echo ""
+    echo "Uninstall complete. Refresh your browser to see the restored UI."
+else
+    echo ""
+    echo "WARNING: middlewared did not start cleanly after uninstall."
+    echo "Check the system log for details:"
+    echo "  journalctl -u middlewared -n 50"
+    exit 1
+fi
