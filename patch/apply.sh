@@ -38,11 +38,6 @@ if [ -f "$PATCH_DIR/disabled" ]; then
     exit 0
 fi
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-warn() { echo "WARNING: $*"; }
-ok()   { echo "OK: $*"; }
-
 # Find the Python interpreter that middlewared actually uses.
 # On TrueNAS SCALE, /usr/bin/middlewared is usually a Python entry-point script
 # with a shebang pointing at the right interpreter (system or venv).
@@ -81,21 +76,21 @@ echo "Using Python: $PYTHON"
 SITE_PKG=$("$PYTHON" -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || true)
 
 if [ -z "$SITE_PKG" ]; then
-    warn "Cannot determine site-packages directory; skipping backend patch."
-    warn "Verify that '$PYTHON -c \"import site; print(site.getsitepackages())\"' works."
+    echo "WARNING: Cannot determine site-packages directory; skipping backend patch."
+    echo "WARNING: Verify that '$PYTHON -c \"import site; print(site.getsitepackages())\"' works."
 else
     # Back up any pre-existing sitecustomize.py that isn't ours.
     if [ -f "$SITE_PKG/sitecustomize.py" ] && \
        ! grep -q "truecloud-patch" "$SITE_PKG/sitecustomize.py" 2>/dev/null; then
         cp "$SITE_PKG/sitecustomize.py" \
            "$SITE_PKG/sitecustomize.py.pre-truecloud-patch"
-        ok "Backed up existing sitecustomize.py"
+        echo "OK: Backed up existing sitecustomize.py"
     fi
 
     if cp "$PATCH_DIR/sitecustomize.py" "$SITE_PKG/sitecustomize.py" 2>/dev/null; then
-        ok "Installed sitecustomize.py → $SITE_PKG/sitecustomize.py"
+        echo "OK: Installed sitecustomize.py → $SITE_PKG/sitecustomize.py"
     else
-        warn "Failed to write $SITE_PKG/sitecustomize.py (permission error?)"
+        echo "WARNING: Failed to write $SITE_PKG/sitecustomize.py (permission error?)"
     fi
 fi
 
@@ -103,11 +98,7 @@ fi
 
 echo "--- UI patch ---"
 
-if "$PYTHON" "$PATCH_DIR/patch_ui.py"; then
-    : # patch_ui.py prints its own status
-else
-    warn "patch_ui.py exited non-zero; UI dropdown may still show Storj only."
-fi
+"$PYTHON" "$PATCH_DIR/patch_ui.py" || echo "WARNING: patch_ui.py exited non-zero; UI dropdown may still show Storj only."
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 

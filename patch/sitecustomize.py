@@ -106,7 +106,10 @@ class _Loader:
 
         # exec_module succeeded — apply our patch.
         try:
-            _PATCHES[fullname](module)
+            if fullname == "middlewared.rclone.remote.b2":
+                _patch_b2(module)
+            elif fullname == "middlewared.plugins.cloud_backup.restic":
+                _patch_restic(module)
         except Exception as exc:
             sys.stderr.write(
                 f"[truecloud-patch] patch failed for {fullname}: {exc}\n"
@@ -125,15 +128,11 @@ def _patch_b2(module):
                        detail="native support present; patch not needed")
         return
 
-    @staticmethod
-    def get_restic_config(task):
+    def _b2_restic_config(task):
         p = task["credentials"]["provider"]
-        return "", {
-            "B2_ACCOUNT_ID": p["account"],
-            "B2_ACCOUNT_KEY": p["key"],
-        }
+        return "", {"B2_ACCOUNT_ID": p["account"], "B2_ACCOUNT_KEY": p["key"]}
 
-    cls.get_restic_config = get_restic_config
+    cls.get_restic_config = staticmethod(_b2_restic_config)
     cls.restic = True
     sys.stderr.write("[truecloud-patch] B2 restic support enabled\n")
     _record_status("middlewared.rclone.remote.b2", ok=True)
@@ -146,14 +145,8 @@ def _patch_restic(module):
         return
 
     import dataclasses
-    import re
 
     _orig = module.get_restic_config
-
-    # Matches "scheme:/path" — the broken form the stock URL builder produces
-    # when a provider has no hostname component (url == "").
-    # Does NOT match "scheme://path" (Storj and similar legitimately use ://).
-    _broken_url = re.compile(r'^(\w[\w+.-]*):/(?!/)(.+)$')
 
     def get_restic_config(cloud_backup):
         # Call the original — it handles transfer_setting, cache, RESTIC_PASSWORD,
@@ -161,33 +154,26 @@ def _patch_restic(module):
         result = _orig(cloud_backup)
 
         # Scan the built command for the -r <repo> argument and fix the URL if
-        # it contains a stray leading slash: "b2:/bucket/path" → "b2:bucket/path".
+        # it has a stray leading slash: "b2:/bucket/path" → "b2:bucket/path".
+        # "scheme://path" is intentional (Storj) and must not be touched.
         cmd = list(result.cmd)
         for i, part in enumerate(cmd):
             if i and cmd[i - 1] == "-r":
-                m = _broken_url.match(part)
-                if m:
-                    cmd[i] = f"{m.group(1)}:{m.group(2)}"
-                    # Prefer dataclasses.replace (passes unknown future fields
-                    # through automatically). Fall back to NamedTuple._replace
-                    # in case ResticConfig is refactored.
+                scheme, sep, rest = part.partition(":")
+                if sep and rest.startswith("/") and not rest.startswith("//"):
+                    cmd[i] = f"{scheme}:{rest[1:]}"
                     try:
                         return dataclasses.replace(result, cmd=cmd)
                     except TypeError:
                         return result._replace(cmd=cmd)
-                break  # -r arg present and already correct
-        return result  # URL was fine; return original unchanged
+                break
+        return result
 
     get_restic_config._truecloud_patched = True
     module.get_restic_config = get_restic_config
     sys.stderr.write("[truecloud-patch] restic URL fix applied\n")
     _record_status("middlewared.plugins.cloud_backup.restic", ok=True)
 
-
-_PATCHES = {
-    "middlewared.rclone.remote.b2": _patch_b2,
-    "middlewared.plugins.cloud_backup.restic": _patch_restic,
-}
 
 _STATUS_FILE = "/data/truecloud-patch/hook_status.json"
 _hook_status: dict = {}
@@ -201,8 +187,6 @@ def _record_status(fullname: str, ok: bool, detail: str = "") -> None:
     if fullname in _hook_status:
         return  # idempotent: first call wins
     _hook_status[fullname] = {"ok": ok, "detail": detail}
-    if len(_hook_status) < len(_PATCHES):
-        return  # wait until all patches have reported
 
     payload = {
         "patched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

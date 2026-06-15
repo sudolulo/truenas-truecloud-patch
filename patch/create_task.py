@@ -83,7 +83,7 @@ def make_client(host, api_key, insecure=False):
 
 # ── Sub-commands ──────────────────────────────────────────────────────────────
 
-def cmd_verify(_client, _args):
+def cmd_verify():
     """Print the hook status written by sitecustomize.py at middlewared startup."""
     if not os.path.exists(_STATUS_FILE):
         print("No hook status file found.")
@@ -233,19 +233,19 @@ def main():
     args = p.parse_args()
 
     if args.cmd == "verify":
-        cmd_verify(None, args)
+        cmd_verify()
         return
 
     if not args.host or not args.api_key:
         p.error("--host and --api-key are required for this command")
 
     client = make_client(args.host, args.api_key, args.insecure)
-    dispatch = {
-        "list-credentials": cmd_list_credentials,
-        "list-tasks":       cmd_list_tasks,
-        "create":           cmd_create,
-    }
-    dispatch[args.cmd](client, args)
+    if args.cmd == "list-credentials":
+        cmd_list_credentials(client, args)
+    elif args.cmd == "list-tasks":
+        cmd_list_tasks(client, args)
+    elif args.cmd == "create":
+        cmd_create(client, args)
 
 
 if __name__ == "__main__":
