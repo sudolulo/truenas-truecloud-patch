@@ -206,11 +206,11 @@ cat /data/truecloud-patch/apply.log
 
 **Verify backend patch is loaded** (while middlewared is running):
 ```bash
-python3 -c "
-from middlewared.rclone.remote.b2 import B2RcloneRemote
-print('B2 restic support:', hasattr(B2RcloneRemote, 'get_restic_config'))
-"
+python3 /data/truecloud-patch/create_task.py verify
 ```
+This reads `/data/truecloud-patch/hook_status.json`, written by the import hook
+at middlewared startup. It shows which patches applied and any failure details.
+Does not require `--host` or `--api-key`.
 
 **Verify the UI patch** (should print your TrueNAS version):
 ```bash

@@ -111,6 +111,7 @@ class _Loader:
             sys.stderr.write(
                 f"[truecloud-patch] patch failed for {fullname}: {exc}\n"
             )
+            _record_status(fullname, ok=False, detail=str(exc))
 
 
 # ── Patch functions ───────────────────────────────────────────────────────────
@@ -132,50 +133,78 @@ def _patch_b2(module):
     cls.get_restic_config = get_restic_config
     cls.restic = True
     sys.stderr.write("[truecloud-patch] B2 restic support enabled\n")
+    _record_status("middlewared.rclone.remote.b2", ok=True)
 
 
 def _patch_restic(module):
     if getattr(module.get_restic_config, "_truecloud_patched", False):
         return
 
-    # ResticConfig is safe to capture now (it's a dataclass defined in the module).
-    # REMOTES and get_remote_path are imported lazily inside the function so that
-    # module layout changes in future middlewared versions fail at call time
-    # (during an actual backup job) rather than silently at patch time.
-    _ResticConfig = module.ResticConfig
+    import dataclasses
+    import re
+
+    _orig = module.get_restic_config
+
+    # Matches "scheme:/path" — the broken form the stock URL builder produces
+    # when a provider has no hostname component (url == "").
+    # Does NOT match "scheme://path" (Storj and similar legitimately use ://).
+    _broken_url = re.compile(r'^(\w[\w+.-]*):/(?!/)(.+)$')
 
     def get_restic_config(cloud_backup):
-        from middlewared.plugins.cloud.path import get_remote_path
-        from middlewared.plugins.cloud.remotes import REMOTES
+        # Call the original — it handles transfer_setting, cache, RESTIC_PASSWORD,
+        # env construction, and everything else we don't own.
+        result = _orig(cloud_backup)
 
-        remote = REMOTES[cloud_backup["credentials"]["provider"]["type"]]
-        remote_path = get_remote_path(remote, cloud_backup["attributes"])
-        url, env = remote.get_restic_config(cloud_backup)
-
-        if cloud_backup["cache_path"]:
-            cache = ["--cache-dir", cloud_backup["cache_path"]]
-        else:
-            cache = ["--no-cache"]
-
-        # Stock code produces "b2:/bucket/path" when url == "" (double-slash).
-        repo = (
-            f"{remote.rclone_type}:{url}/{remote_path}"
-            if url
-            else f"{remote.rclone_type}:{remote_path}"
-        )
-        cmd = ["restic"] + cache + ["--json", "-r", repo]
-        env["RESTIC_PASSWORD"] = cloud_backup["password"]
-        return _ResticConfig(cmd, env)
+        # Scan the built command for the -r <repo> argument and fix the URL if
+        # it contains a stray leading slash: "b2:/bucket/path" → "b2:bucket/path".
+        cmd = list(result.cmd)
+        for i, part in enumerate(cmd):
+            if i and cmd[i - 1] == "-r":
+                m = _broken_url.match(part)
+                if m:
+                    cmd[i] = f"{m.group(1)}:{m.group(2)}"
+                    # dataclasses.replace passes all other fields through, so
+                    # new ResticConfig fields added in future TrueNAS versions
+                    # are preserved automatically.
+                    return dataclasses.replace(result, cmd=cmd)
+                break  # -r arg present and already correct
+        return result  # URL was fine; return original unchanged
 
     get_restic_config._truecloud_patched = True
     module.get_restic_config = get_restic_config
     sys.stderr.write("[truecloud-patch] restic URL fix applied\n")
+    _record_status("middlewared.plugins.cloud_backup.restic", ok=True)
 
 
 _PATCHES = {
     "middlewared.rclone.remote.b2": _patch_b2,
     "middlewared.plugins.cloud_backup.restic": _patch_restic,
 }
+
+_STATUS_FILE = "/data/truecloud-patch/hook_status.json"
+_hook_status: dict = {}
+
+
+def _record_status(fullname: str, ok: bool, detail: str = "") -> None:
+    import json
+    import os
+    import time
+
+    _hook_status[fullname] = {"ok": ok, "detail": detail}
+    if len(_hook_status) < len(_PATCHES):
+        return  # wait until all patches have reported
+
+    payload = {
+        "patched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "patches": _hook_status,
+    }
+    try:
+        tmp = _STATUS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+        os.replace(tmp, _STATUS_FILE)  # atomic on POSIX
+    except OSError:
+        pass  # non-fatal — status file is informational only
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

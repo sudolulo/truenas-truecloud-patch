@@ -42,10 +42,13 @@ List existing TrueCloud Backup tasks:
 
 import argparse
 import json
+import os
 import ssl
 import sys
 import urllib.error
 import urllib.request
+
+_STATUS_FILE = "/data/truecloud-patch/hook_status.json"
 
 
 def make_client(host, api_key, insecure=False):
@@ -79,6 +82,37 @@ def make_client(host, api_key, insecure=False):
 
 
 # ── Sub-commands ──────────────────────────────────────────────────────────────
+
+def cmd_verify(_client, _args):
+    """Print the hook status written by sitecustomize.py at middlewared startup."""
+    if not os.path.exists(_STATUS_FILE):
+        print("No hook status file found.")
+        print("Either the patch has never loaded (middlewared not yet restarted")
+        print("after install) or the status file was deleted.")
+        print(f"  Expected: {_STATUS_FILE}")
+        sys.exit(1)
+
+    with open(_STATUS_FILE, encoding="utf-8") as fh:
+        status = json.load(fh)
+
+    print(f"Hook status (recorded at {status.get('patched_at', 'unknown')})")
+    print()
+    all_ok = True
+    for module, info in status.get("patches", {}).items():
+        ok = info.get("ok", False)
+        label = "OK  " if ok else "FAIL"
+        detail = f"  — {info['detail']}" if info.get("detail") else ""
+        print(f"  [{label}] {module}{detail}")
+        if not ok:
+            all_ok = False
+
+    print()
+    if all_ok:
+        print("All patches active. B2 and S3 backups should work.")
+    else:
+        print("One or more patches failed to apply.")
+        print("Check /data/truecloud-patch/apply.log and journalctl -u middlewared")
+        sys.exit(1)
 
 def cmd_list_credentials(client, _args):
     creds = client("GET", "/cloudsync/credentials")
@@ -149,15 +183,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("Examples")[1] if "Examples" in __doc__ else "",
     )
-    p.add_argument("--host", required=True, metavar="HOST",
-                   help="TrueNAS hostname or IP address")
-    p.add_argument("--api-key", required=True, metavar="KEY",
-                   help="TrueNAS API key (System → API Keys)")
+    p.add_argument("--host", default=None, metavar="HOST",
+                   help="TrueNAS hostname or IP address (required except for verify)")
+    p.add_argument("--api-key", default=None, metavar="KEY",
+                   help="TrueNAS API key — System → API Keys (required except for verify)")
     p.add_argument("--insecure", action="store_true",
                    help="Skip TLS certificate verification (self-signed certs)")
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    sub.add_parser("verify",           help="Check that the backend hook loaded correctly")
     sub.add_parser("list-credentials", help="List configured cloud credentials")
     sub.add_parser("list-tasks",       help="List TrueCloud Backup tasks")
 
@@ -193,11 +228,19 @@ def main():
     client = make_client(args.host, args.api_key, args.insecure)
 
     dispatch = {
+        "verify":           cmd_verify,
         "list-credentials": cmd_list_credentials,
         "list-tasks":       cmd_list_tasks,
         "create":           cmd_create,
     }
-    dispatch[args.cmd](client, args)
+
+    if args.cmd == "verify":
+        cmd_verify(None, args)
+    else:
+        if not args.host or not args.api_key:
+            p.error("--host and --api-key are required for this command")
+        client = make_client(args.host, args.api_key, args.insecure)
+        dispatch[args.cmd](client, args)
 
 
 if __name__ == "__main__":
