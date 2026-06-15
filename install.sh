@@ -15,6 +15,14 @@ set -euo pipefail
 PATCH_DIR="/data/truecloud-patch"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+if [ ! -f "$REPO_DIR/patch/sitecustomize.py" ]; then
+    echo "ERROR: patch files not found at $REPO_DIR/patch/" >&2
+    echo "Run install.sh from the cloned repository, not via pipe:" >&2
+    echo "  git clone https://github.com/sudolulo/truenas-truecloud-patch" >&2
+    echo "  cd truenas-truecloud-patch && bash install.sh" >&2
+    exit 1
+fi
+
 echo "=== TrueNAS TrueCloud Provider Patch — Install ==="
 echo ""
 
