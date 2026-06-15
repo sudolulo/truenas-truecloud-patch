@@ -64,15 +64,15 @@ EXISTING_ID=$(midclt call initshutdownscript.query '[]' | \
     python3 -c "
 import sys, json
 for s in json.load(sys.stdin):
-    if s.get('script') == '$PATCH_DIR/patch/apply.sh':
+    if s.get('comment') == 'TrueCloud provider patch (S3/B2)':
         print(s['id'])
         break
 " 2>/dev/null || true)
 
 if [ -n "$EXISTING_ID" ]; then
-    echo "Already registered (id=$EXISTING_ID). Ensuring it is enabled ..."
+    echo "Already registered (id=$EXISTING_ID). Updating path and enabling ..."
     midclt call initshutdownscript.update "$EXISTING_ID" \
-        '{"enabled": true}' > /dev/null
+        "{\"enabled\": true, \"script\": \"$PATCH_DIR/patch/apply.sh\"}" > /dev/null
 else
     midclt call initshutdownscript.create \
         "{\"type\":\"SCRIPT\",\"script\":\"$PATCH_DIR/patch/apply.sh\",\"when\":\"PREINIT\",\"enabled\":true,\"comment\":\"TrueCloud provider patch (S3/B2)\"}" \

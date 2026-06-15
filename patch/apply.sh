@@ -100,11 +100,21 @@ else
     if [ "$_can_install" = true ]; then
         # Substitute PATCH_DIR into the source so sitecustomize.py knows where
         # to write hook_status.json and check the kill switch at runtime.
-        if sed "s|/data/truecloud-patch|$PATCH_DIR|g" \
-               "$PATCH_DIR/patch/sitecustomize.py" \
-               > "$SITE_PKG/sitecustomize.py"; then
+        # Pass PATCH_DIR via env var so arbitrary path characters don't break
+        # the substitution (sed metacharacters & and | are unsafe in shell-
+        # interpolated replacement strings).  Write to a temp file first so a
+        # failed substitution never truncates the existing sitecustomize.py.
+        _sc_tmp="$SITE_PKG/sitecustomize.py.truecloud-tmp"
+        if TRUECLOUD_PATCH_DIR="$PATCH_DIR" \
+               "$PYTHON" -c "
+import os, sys
+d = os.environ['TRUECLOUD_PATCH_DIR']
+with open(d + '/patch/sitecustomize.py', encoding='utf-8') as fh:
+    sys.stdout.write(fh.read().replace('/data/truecloud-patch', d))
+" > "$_sc_tmp" && mv "$_sc_tmp" "$SITE_PKG/sitecustomize.py"; then
             echo "OK: Installed sitecustomize.py → $SITE_PKG/sitecustomize.py"
         else
+            rm -f "$_sc_tmp"
             echo "WARNING: Failed to write $SITE_PKG/sitecustomize.py (permission error?)"
         fi
     fi

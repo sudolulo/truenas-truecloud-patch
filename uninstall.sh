@@ -26,7 +26,7 @@ IDS=$(midclt call initshutdownscript.query '[]' | \
     python3 -c "
 import sys, json
 for s in json.load(sys.stdin):
-    if s.get('script') == '$PATCH_DIR/patch/apply.sh':
+    if s.get('comment') == 'TrueCloud provider patch (S3/B2)':
         print(s['id'])
 " 2>/dev/null || true)
 

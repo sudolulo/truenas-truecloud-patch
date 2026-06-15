@@ -45,4 +45,4 @@ fi
 echo ""
 echo "To re-enable the patch once you have investigated:"
 echo "  rm $PATCH_DIR/disabled"
-echo "  bash $PATCH_DIR/apply.sh"
+echo "  bash $PATCH_DIR/patch/apply.sh"
