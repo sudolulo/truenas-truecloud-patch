@@ -30,10 +30,18 @@ fi
 touch "$PATCH_DIR/disabled"
 echo "Kill switch set: $PATCH_DIR/disabled created."
 echo "Restarting middlewared ..."
-systemctl restart middlewared
-echo ""
-echo "middlewared restarted without the truecloud-patch hook."
-echo "Your system should be back to normal (Storj-only TrueCloud Backup)."
+if systemctl restart middlewared; then
+    echo ""
+    echo "middlewared started successfully."
+    echo "Your system is back to normal (Storj-only TrueCloud Backup)."
+else
+    echo ""
+    echo "WARNING: middlewared did not start cleanly even with the patch disabled."
+    echo "The problem is unrelated to truecloud-patch."
+    echo "Check the system log for details:"
+    echo "  journalctl -u middlewared -n 50"
+    exit 1
+fi
 echo ""
 echo "To re-enable the patch once you have investigated:"
 echo "  rm $PATCH_DIR/disabled"
