@@ -58,7 +58,7 @@ def find_bundle():
             try:
                 with open(path, encoding="utf-8", errors="replace") as fh:
                     content = fh.read()
-                if FIND.search(content):
+                if FIND.search(content) or MARKER in content:
                     return webui, path, content
             except OSError:
                 continue

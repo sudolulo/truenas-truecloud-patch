@@ -84,11 +84,16 @@ fi
 # ── Apply now ─────────────────────────────────────────────────────────────────
 
 echo "Applying patches ..."
+_log_start=$(wc -c < "$PATCH_DIR/apply.log" 2>/dev/null || echo 0)
 bash "$PATCH_DIR/apply.sh"
 echo ""
 echo "Patch log ($PATCH_DIR/apply.log):"
 tail -30 "$PATCH_DIR/apply.log"
 echo ""
+if tail -c "+$((_log_start + 1))" "$PATCH_DIR/apply.log" 2>/dev/null | grep -q "WARNING:"; then
+    echo "WARNING: apply.sh reported one or more issues — see log above for details."
+    echo ""
+fi
 
 # ── Restart middlewared ───────────────────────────────────────────────────────
 

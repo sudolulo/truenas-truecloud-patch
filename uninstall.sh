@@ -58,6 +58,14 @@ if [ -x /usr/bin/middlewared ]; then
     fi
 fi
 
+if ! "$PYTHON" -c "import middlewared" 2>/dev/null; then
+    echo "  WARNING: '$PYTHON' cannot import middlewared; falling back to python3"
+    PYTHON="python3"
+    if ! "$PYTHON" -c "import middlewared" 2>/dev/null; then
+        echo "  WARNING: 'python3' also cannot import middlewared; sitecustomize.py may be removed from the wrong location."
+    fi
+fi
+
 SITE_PKG=$("$PYTHON" -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || true)
 
 if [ -n "$SITE_PKG" ] && [ -f "$SITE_PKG/sitecustomize.py" ]; then
