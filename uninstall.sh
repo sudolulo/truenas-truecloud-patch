@@ -4,6 +4,7 @@
 set -euo pipefail
 
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
+_HOOK_COMMENT='TrueCloud provider patch (S3/B2)'
 
 echo "=== TrueNAS TrueCloud Provider Patch — Uninstall ==="
 echo ""
@@ -26,7 +27,7 @@ IDS=$(midclt call initshutdownscript.query '[]' | \
     python3 -c "
 import sys, json
 for s in json.load(sys.stdin):
-    if s.get('comment') == 'TrueCloud provider patch (S3/B2)':
+    if s.get('comment') == '$_HOOK_COMMENT':
         print(s['id'])
 " 2>/dev/null || true)
 

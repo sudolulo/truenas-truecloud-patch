@@ -18,6 +18,7 @@ set -euo pipefail
 
 # The directory containing install.sh is the permanent install location.
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
+_HOOK_COMMENT='TrueCloud provider patch (S3/B2)'
 
 if [ ! -f "$PATCH_DIR/patch/sitecustomize.py" ]; then
     echo "ERROR: patch files not found at $PATCH_DIR/patch/" >&2
@@ -64,19 +65,26 @@ EXISTING_ID=$(midclt call initshutdownscript.query '[]' | \
     python3 -c "
 import sys, json
 for s in json.load(sys.stdin):
-    if s.get('comment') == 'TrueCloud provider patch (S3/B2)':
+    if s.get('comment') == '$_HOOK_COMMENT':
         print(s['id'])
         break
 " 2>/dev/null || true)
 
 if [ -n "$EXISTING_ID" ]; then
     echo "Already registered (id=$EXISTING_ID). Updating path and enabling ..."
-    midclt call initshutdownscript.update "$EXISTING_ID" \
-        "{\"enabled\": true, \"script\": \"$PATCH_DIR/patch/apply.sh\"}" > /dev/null
+    if ! midclt call initshutdownscript.update "$EXISTING_ID" \
+            "{\"enabled\": true, \"script\": \"$PATCH_DIR/patch/apply.sh\"}" > /dev/null; then
+        echo "ERROR: Failed to update PREINIT hook (id=$EXISTING_ID)." >&2
+        echo "  midclt call initshutdownscript.query '[]'" >&2
+        exit 1
+    fi
 else
-    midclt call initshutdownscript.create \
-        "{\"type\":\"SCRIPT\",\"script\":\"$PATCH_DIR/patch/apply.sh\",\"when\":\"PREINIT\",\"enabled\":true,\"comment\":\"TrueCloud provider patch (S3/B2)\"}" \
-        > /dev/null
+    if ! midclt call initshutdownscript.create \
+            "{\"type\":\"SCRIPT\",\"script\":\"$PATCH_DIR/patch/apply.sh\",\"when\":\"PREINIT\",\"enabled\":true,\"comment\":\"$_HOOK_COMMENT\"}" \
+            > /dev/null; then
+        echo "ERROR: Failed to register PREINIT hook." >&2
+        exit 1
+    fi
     echo "Registered."
 fi
 echo ""
