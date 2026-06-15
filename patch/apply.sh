@@ -22,7 +22,7 @@ PATCH_DIR="/data/truecloud-patch"
 LOG="$PATCH_DIR/apply.log"
 
 # Rotate log at 512 KB to avoid unbounded growth on a system volume.
-# Keep one prior generation (.1) so the last two boots are always available.
+# Keep two prior generations (.1 and .2) so the last three boots are always available.
 if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 524288 ]; then
     [ -f "${LOG}.1" ] && mv "${LOG}.1" "${LOG}.2"
     mv "$LOG" "${LOG}.1"
@@ -85,17 +85,24 @@ if [ -z "$SITE_PKG" ]; then
     echo "  Run: $PYTHON -c \"import site; print(site.getsitepackages())\""
 else
     # Back up any pre-existing sitecustomize.py that isn't ours.
+    _can_install=true
     if [ -f "$SITE_PKG/sitecustomize.py" ] && \
        ! grep -q "truecloud-patch" "$SITE_PKG/sitecustomize.py" 2>/dev/null; then
-        cp "$SITE_PKG/sitecustomize.py" \
-           "$SITE_PKG/sitecustomize.py.pre-truecloud-patch"
-        echo "OK: Backed up existing sitecustomize.py"
+        if cp "$SITE_PKG/sitecustomize.py" \
+              "$SITE_PKG/sitecustomize.py.pre-truecloud-patch"; then
+            echo "OK: Backed up existing sitecustomize.py"
+        else
+            echo "WARNING: Could not back up existing sitecustomize.py; skipping install to avoid data loss."
+            _can_install=false
+        fi
     fi
 
-    if cp "$PATCH_DIR/sitecustomize.py" "$SITE_PKG/sitecustomize.py" 2>/dev/null; then
-        echo "OK: Installed sitecustomize.py → $SITE_PKG/sitecustomize.py"
-    else
-        echo "WARNING: Failed to write $SITE_PKG/sitecustomize.py (permission error?)"
+    if $_can_install; then
+        if cp "$PATCH_DIR/sitecustomize.py" "$SITE_PKG/sitecustomize.py" 2>/dev/null; then
+            echo "OK: Installed sitecustomize.py → $SITE_PKG/sitecustomize.py"
+        else
+            echo "WARNING: Failed to write $SITE_PKG/sitecustomize.py (permission error?)"
+        fi
     fi
 fi
 

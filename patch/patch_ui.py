@@ -90,7 +90,11 @@ def main():
 
     backup = path + ".pre-truecloud-patch"
     if not os.path.exists(backup):
-        shutil.copy2(path, backup)
+        try:
+            shutil.copy2(path, backup)
+        except OSError as exc:
+            print(f"[truecloud-patch] ERROR: Could not create backup {backup}: {exc}")
+            return
 
     patched, count = FIND.subn(REPLACE, content)
     if count != 1:

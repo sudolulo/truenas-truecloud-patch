@@ -179,7 +179,10 @@ def cmd_create(client, args):
     }
 
     result = client("POST", "/cloud_backup", body)
-    print(f"Created task id={result['id']}  name={result['description']!r}")
+    try:
+        print(f"Created task id={result['id']}  name={result['description']!r}")
+    except (KeyError, TypeError):
+        print(f"Task created but response schema was unexpected: {result}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -195,7 +198,9 @@ def main():
     p.add_argument("--api-key", default=None, metavar="KEY",
                    help="TrueNAS API key — System → API Keys (required except for verify)")
     p.add_argument("--insecure", action="store_true",
-                   help="Skip TLS certificate verification (self-signed certs)")
+                   help="Skip TLS certificate verification (self-signed certs). "
+                        "WARNING: exposes your API key to network interception. "
+                        "Prefer adding your cert to the trust store instead.")
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
