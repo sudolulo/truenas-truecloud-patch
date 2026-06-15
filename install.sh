@@ -117,6 +117,9 @@ if ! systemctl restart middlewared; then
 fi
 echo "Done."
 echo ""
+echo "Verify the backend patch loaded correctly:"
+echo "  python3 $PATCH_DIR/create_task.py verify"
+echo ""
 echo "Refresh your browser to pick up the UI change."
 echo ""
 echo "To create a TrueCloud Backup task with S3 or B2 credentials:"

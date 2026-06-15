@@ -379,5 +379,11 @@ B2's native restic backend uses a different auth path than S3-compatible B2.
 **S3-compatible backup fails**
 S3 support already existed in the backend — the credential setup is the likely
 issue. Verify the endpoint URL, access key, secret key, and bucket name in
-the credential settings. Use `--insecure` in create_task.py only if you are
-using a self-signed certificate on your S3 endpoint.
+the credential settings.
+
+**`create_task.py` SSL error connecting to TrueNAS**
+`create_task.py` talks to the **TrueNAS API**, not your S3 endpoint, and
+verifies its TLS certificate. If your NAS uses a self-signed certificate,
+pass `--insecure` — but be aware this disables certificate verification for
+the API call that transmits your TrueNAS API key. Adding your NAS certificate
+to your system's trust store is safer.
