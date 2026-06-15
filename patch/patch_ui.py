@@ -40,19 +40,17 @@ REPLACE = r'\1["STORJ_IX","S3","B2"]'
 MARKER = '"STORJ_IX","S3","B2"'
 
 
-def find_webui():
-    for d in WEBUI_CANDIDATES:
-        if os.path.isdir(d):
-            return d
-    return None
-
-
-def find_bundle(webui):
+def find_bundle():
     """
-    Walk the webui directory looking for the JS file that contains the
-    filterByProviders binding. Returns (path, content) or (None, None).
-    Only .js files are read; binary files and permission errors are skipped.
+    Search WEBUI_CANDIDATES for the JS bundle containing the filterByProviders
+    binding. Returns (webui_dir, path, content). webui_dir is None if no
+    candidate directory exists; path is None if the directory exists but the
+    pattern is not found in any bundle.
     """
+    webui = next((d for d in WEBUI_CANDIDATES if os.path.isdir(d)), None)
+    if webui is None:
+        return None, None, None
+
     matches = []
     for root, _dirs, names in os.walk(webui):
         for name in sorted(names):          # deterministic order
@@ -68,7 +66,7 @@ def find_bundle(webui):
                 continue
 
     if not matches:
-        return None, None
+        return webui, None, None
 
     if len(matches) > 1:
         # Unexpected — log all matches so the operator can investigate.
@@ -79,19 +77,19 @@ def find_bundle(webui):
         for p, _ in matches:
             print(f"[truecloud-patch]   {p}")
 
-    return matches[0]
+    path, content = matches[0]
+    return webui, path, content
 
 
 def main():
-    webui = find_webui()
-    if not webui:
+    webui, path, content = find_bundle()
+    if webui is None:
         print(
             "[truecloud-patch] WARNING: webui directory not found; skipping UI patch.\n"
             "[truecloud-patch] Searched: " + ", ".join(WEBUI_CANDIDATES)
         )
         return
 
-    path, content = find_bundle(webui)
     if path is None:
         print(
             "[truecloud-patch] WARNING: filterByProviders pattern not found in any JS bundle.\n"

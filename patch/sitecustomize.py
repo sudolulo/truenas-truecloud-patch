@@ -105,6 +105,7 @@ class _Loader:
             self._finder._mark_done(fullname)
 
         # exec_module succeeded — apply our patch.
+        # Must stay in sync with _Finder._targets.
         try:
             if fullname == "middlewared.rclone.remote.b2":
                 _patch_b2(module)
@@ -187,6 +188,8 @@ def _record_status(fullname: str, ok: bool, detail: str = "") -> None:
     if fullname in _hook_status:
         return  # idempotent: first call wins
     _hook_status[fullname] = {"ok": ok, "detail": detail}
+    if len(_hook_status) < len(_Finder._targets):
+        return  # wait until all patches have reported before writing
 
     payload = {
         "patched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

@@ -53,6 +53,8 @@ if [ -x /usr/bin/middlewared ]; then
     shebang=$(dd if=/usr/bin/middlewared bs=256 count=1 2>/dev/null | head -1 || true)
     if [[ "$shebang" =~ ^'#!'(/[^[:space:]]+python[^[:space:]]*) ]]; then
         PYTHON="${BASH_REMATCH[1]}"
+    elif [[ "$shebang" =~ ^'#!/usr/bin/env '(python[^[:space:]]*) ]]; then
+        PYTHON=$(command -v "${BASH_REMATCH[1]}" 2>/dev/null || echo "python3")
     fi
 fi
 
@@ -81,13 +83,13 @@ echo ""
 echo "Restoring UI bundle backup ..."
 
 RESTORED=0
-for backup in $(find /usr/share/truenas /var/www/truenas \
-                    -name "*.js.pre-truecloud-patch" 2>/dev/null); do
+while IFS= read -r backup; do
     original="${backup%.pre-truecloud-patch}"
     mv "$backup" "$original"
     echo "  Restored: $original"
     RESTORED=1
-done
+done < <(find /usr/share/truenas /var/www/truenas \
+              -name "*.js.pre-truecloud-patch" 2>/dev/null)
 
 if [ "$RESTORED" -eq 0 ]; then
     echo "  No backup files found."
