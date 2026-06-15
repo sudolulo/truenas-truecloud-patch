@@ -98,7 +98,7 @@ echo ""
 echo "Patch log ($PATCH_DIR/apply.log):"
 tail -30 "$PATCH_DIR/apply.log"
 echo ""
-if tail -c "+$((_log_start + 1))" "$PATCH_DIR/apply.log" 2>/dev/null | grep -q "WARNING:"; then
+if tail -c "+$((_log_start + 1))" "$PATCH_DIR/apply.log" 2>/dev/null | grep -qE "WARNING:|ERROR:"; then
     echo "WARNING: apply.sh reported one or more issues — see log above for details."
     echo ""
 fi
@@ -108,8 +108,10 @@ fi
 echo "Restarting middlewared so the backend patch takes effect ..."
 if ! systemctl restart middlewared; then
     echo "" >&2
-    echo "ERROR: middlewared failed to restart. The patch files are installed but" >&2
-    echo "the hook is not yet active. Check the system log for the root cause:" >&2
+    echo "ERROR: middlewared failed to restart." >&2
+    echo "  The patch IS installed and will activate automatically on the next boot." >&2
+    echo "  To activate now, resolve the issue below and run: systemctl restart middlewared" >&2
+    echo "  Check the system log for the root cause:" >&2
     echo "  journalctl -u middlewared -n 50" >&2
     echo "If the problem is unrelated to this patch, recover with:" >&2
     echo "  bash $PATCH_DIR/recover.sh" >&2

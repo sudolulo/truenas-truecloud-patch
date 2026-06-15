@@ -102,6 +102,7 @@ echo ""
 echo "Restoring UI bundle backup ..."
 
 RESTORED=0
+_restore_failed=0
 while IFS= read -r backup; do
     original="${backup%.pre-truecloud-patch}"
     if mv "$backup" "$original"; then
@@ -109,10 +110,19 @@ while IFS= read -r backup; do
         RESTORED=1
     else
         echo "  WARNING: Could not restore $original — backup left at $backup"
+        _restore_failed=1
     fi
 # Keep these paths in sync with WEBUI_CANDIDATES in patch/patch_ui.py
 done < <(find /usr/share/truenas /usr/share/truenas-ui /var/www/truenas \
               -name "*.js.pre-truecloud-patch" 2>/dev/null)
+
+if [ "$_restore_failed" -eq 1 ]; then
+    echo ""
+    echo "ERROR: One or more UI bundle backups could not be restored." >&2
+    echo "  $PATCH_DIR has been left intact (recover.sh and patch files are safe)." >&2
+    echo "  Restore the backup(s) manually, then re-run uninstall.sh." >&2
+    exit 1
+fi
 
 if [ "$RESTORED" -eq 0 ]; then
     echo "  No backup files found."

@@ -97,8 +97,8 @@ else
         fi
     fi
 
-    if $_can_install; then
-        if cp "$PATCH_DIR/sitecustomize.py" "$SITE_PKG/sitecustomize.py" 2>/dev/null; then
+    if [ "$_can_install" = true ]; then
+        if cp "$PATCH_DIR/sitecustomize.py" "$SITE_PKG/sitecustomize.py"; then
             echo "OK: Installed sitecustomize.py → $SITE_PKG/sitecustomize.py"
         else
             echo "WARNING: Failed to write $SITE_PKG/sitecustomize.py (permission error?)"
