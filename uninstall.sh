@@ -62,13 +62,15 @@ SITE_PKG=$("$PYTHON" -c "import site; print(site.getsitepackages()[0])" 2>/dev/n
 
 if [ -n "$SITE_PKG" ] && [ -f "$SITE_PKG/sitecustomize.py" ]; then
     if grep -q "truecloud-patch" "$SITE_PKG/sitecustomize.py" 2>/dev/null; then
-        rm "$SITE_PKG/sitecustomize.py"
-        echo "  Removed $SITE_PKG/sitecustomize.py"
-
         if [ -f "$SITE_PKG/sitecustomize.py.pre-truecloud-patch" ]; then
+            # mv atomically overwrites our file with the vendor original —
+            # safer than rm-then-mv if /usr is transiently read-only.
             mv "$SITE_PKG/sitecustomize.py.pre-truecloud-patch" \
                "$SITE_PKG/sitecustomize.py"
             echo "  Restored previous sitecustomize.py"
+        else
+            rm "$SITE_PKG/sitecustomize.py"
+            echo "  Removed $SITE_PKG/sitecustomize.py"
         fi
     else
         echo "  $SITE_PKG/sitecustomize.py is not ours; leaving it alone."

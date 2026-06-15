@@ -60,7 +60,13 @@ class _Finder:
                 self._loading.discard(fullname)
 
             if real_spec is None:
-                return None  # module doesn't exist; don't intercept
+                # Module absent in this Python installation (e.g. removed in a
+                # TrueNAS update).  Record a FAIL so hook_status.json is still
+                # written and cmd_verify gives a diagnostic instead of "no file".
+                _record_status(fullname, ok=False,
+                               detail="module not found in this Python installation")
+                self._mark_done(fullname)
+                return None
 
             return importlib.machinery.ModuleSpec(
                 fullname,
@@ -185,6 +191,10 @@ def _patch_restic(module):
                         try:
                             return result._replace(cmd=cmd)
                         except AttributeError:
+                            sys.stderr.write(
+                                "[truecloud-patch] WARNING: cannot fix repo URL; "
+                                f"unexpected ResticConfig type {type(result).__name__!r}\n"
+                            )
                             return result
                 break
             if i and cmd[i - 1] in ("-r", "--repo", "--repository"):
@@ -197,6 +207,10 @@ def _patch_restic(module):
                         try:
                             return result._replace(cmd=cmd)
                         except AttributeError:
+                            sys.stderr.write(
+                                "[truecloud-patch] WARNING: cannot fix repo URL; "
+                                f"unexpected ResticConfig type {type(result).__name__!r}\n"
+                            )
                             return result
                 break
         return result

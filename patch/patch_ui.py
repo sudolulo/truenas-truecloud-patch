@@ -96,9 +96,11 @@ def main():
     if count != 1:
         print(
             f"[truecloud-patch] WARNING: {count} replacement(s) in {path}; "
-            f"expected exactly 1 — file an issue at "
+            f"expected exactly 1 — skipping write to avoid corrupting the bundle.\n"
+            f"[truecloud-patch] File an issue at "
             f"https://github.com/sudolulo/truenas-truecloud-patch"
         )
+        return
 
     tmp = path + ".tmp"
     try:

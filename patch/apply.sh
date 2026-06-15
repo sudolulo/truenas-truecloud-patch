@@ -63,6 +63,9 @@ find_mw_python() {
     if ! "$py" -c "import middlewared" 2>/dev/null; then
         echo "WARNING: '$py' cannot import middlewared; falling back to python3" >&2
         py="python3"
+        if ! "$py" -c "import middlewared" 2>/dev/null; then
+            echo "WARNING: 'python3' also cannot import middlewared; sitecustomize.py may be installed in the wrong location" >&2
+        fi
     fi
 
     echo "$py"

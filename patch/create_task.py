@@ -114,7 +114,7 @@ def cmd_verify():
 
     print()
     if all_ok:
-        print("All patches active. B2 and S3 backups should work.")
+        print("All patches installed. Run a test backup to confirm end-to-end.")
     else:
         print("One or more patches failed to apply.")
         print("Check /data/truecloud-patch/apply.log and journalctl -u middlewared")
