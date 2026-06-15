@@ -93,6 +93,12 @@ def main():
         shutil.copy2(path, backup)
 
     patched, count = FIND.subn(REPLACE, content)
+    if count != 1:
+        print(
+            f"[truecloud-patch] WARNING: {count} replacement(s) in {path}; "
+            f"expected exactly 1 — file an issue at "
+            f"https://github.com/sudolulo/truenas-truecloud-patch"
+        )
 
     tmp = path + ".tmp"
     try:

@@ -97,7 +97,7 @@ while IFS= read -r backup; do
     mv "$backup" "$original"
     echo "  Restored: $original"
     RESTORED=1
-done < <(find /usr/share/truenas /var/www/truenas \
+done < <(find /usr/share/truenas /usr/share/truenas-ui /var/www/truenas \
               -name "*.js.pre-truecloud-patch" 2>/dev/null)
 
 if [ "$RESTORED" -eq 0 ]; then

@@ -99,10 +99,15 @@ class _Loader:
             module.__loader__ = real_spec.loader
             if real_spec.origin:
                 module.__file__ = real_spec.origin
-        finally:
-            # Mark done even on failure so a broken module doesn't cause
-            # infinite retry loops on subsequent import attempts.
+        except Exception as exc:
+            # Mark done to prevent infinite retry loops, then surface the failure
+            # in hook_status.json so cmd_verify shows a diagnostic FAIL rather
+            # than "no status file found".
             self._finder._mark_done(fullname)
+            _record_status(fullname, ok=False,
+                           detail=f"module load failed: {exc}")
+            raise
+        self._finder._mark_done(fullname)
 
         # exec_module succeeded — apply our patch.
         # Must stay in sync with _Finder._targets.
@@ -142,7 +147,8 @@ def _patch_b2(module):
     cls.get_restic_config = staticmethod(_b2_restic_config)
     cls.restic = True
     sys.stderr.write("[truecloud-patch] B2 restic support enabled\n")
-    _record_status("middlewared.rclone.remote.b2", ok=True)
+    _record_status("middlewared.rclone.remote.b2", ok=True,
+                   detail="method attached; credential fields verified at first backup")
 
 
 def _patch_restic(module):
@@ -160,33 +166,38 @@ def _patch_restic(module):
         # env construction, and everything else we don't own.
         result = _orig(cloud_backup)
 
-        # Scan the built command for the repo argument and fix the URL if it
-        # has a stray leading slash: "b2:/bucket/path" → "b2:bucket/path".
-        # "scheme://path" is intentional (Storj) and must not be touched.
-        # Covers all three flag forms restic accepts:
-        #   -r <url>       (short, two-element)
-        #   --repo <url>   (long, two-element)
-        #   --repo=<url>   (long, single-element)
+        # Fix stray leading slash in repo URL: "b2:/bucket" → "b2:bucket".
+        # "scheme://path" (Storj) must not be touched.
+        # Covers all flag forms restic accepts (--repository is a documented synonym):
+        #   -r <url>  --repo <url>  --repo=<url>
+        #   --repository <url>  --repository=<url>
         cmd = list(result.cmd)
         for i, part in enumerate(cmd):
-            if part.startswith("--repo="):
-                url = part[len("--repo="):]
+            if part.startswith("--repo=") or part.startswith("--repository="):
+                prefix, _, url = part.partition("=")
+                prefix += "="
                 scheme, sep, rest = url.partition(":")
                 if sep and rest.startswith("/") and not rest.startswith("//"):
-                    cmd[i] = f"--repo={scheme}:{rest[1:]}"
+                    cmd[i] = f"{prefix}{scheme}:{rest[1:]}"
                     try:
                         return dataclasses.replace(result, cmd=cmd)
                     except TypeError:
-                        return result._replace(cmd=cmd)
+                        try:
+                            return result._replace(cmd=cmd)
+                        except AttributeError:
+                            return result
                 break
-            if i and cmd[i - 1] in ("-r", "--repo"):
+            if i and cmd[i - 1] in ("-r", "--repo", "--repository"):
                 scheme, sep, rest = part.partition(":")
                 if sep and rest.startswith("/") and not rest.startswith("//"):
                     cmd[i] = f"{scheme}:{rest[1:]}"
                     try:
                         return dataclasses.replace(result, cmd=cmd)
                     except TypeError:
-                        return result._replace(cmd=cmd)
+                        try:
+                            return result._replace(cmd=cmd)
+                        except AttributeError:
+                            return result
                 break
         return result
 
@@ -232,15 +243,21 @@ def _install():
         return  # kill switch
     # Scope to the middlewared service process only — not midclt, debug scripts,
     # or other tools that happen to share the same venv.
+    # Also covers python -m middlewared where argv[0] is the __main__.py path.
     _argv0 = (sys.argv or [""])[0]
-    if os.path.basename(_argv0) != "middlewared":
+    _base = os.path.basename(_argv0)
+    if not (
+        _base == "middlewared"
+        or (_base == "__main__.py"
+            and os.path.basename(os.path.dirname(_argv0)) == "middlewared")
+    ):
         return
     import importlib.util
     if importlib.util.find_spec("middlewared") is None:
         return
     # If apply.sh displaced an existing sitecustomize.py, exec it first so any
-    # iX-provided startup code (path additions, codec registrations, etc.) still
-    # runs.  We use a separate namespace so it cannot shadow our globals.
+    # vendor startup code (path additions, codec registrations, etc.) still runs.
+    # __file__ is absent in some embedded contexts; the empty fallback is safe.
     _self = globals().get("__file__", "")
     if _self:
         _pre = _self + ".pre-truecloud-patch"
@@ -248,6 +265,9 @@ def _install():
             try:
                 import builtins
                 with open(_pre, encoding="utf-8") as _fh:
+                    # Separate globals dict prevents the exec'd code from
+                    # shadowing our names; sys.path changes still take effect
+                    # via the shared sys module object.
                     exec(  # noqa: S102
                         compile(_fh.read(), _pre, "exec"),
                         {"__builtins__": builtins, "__file__": _pre,
