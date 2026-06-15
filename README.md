@@ -7,7 +7,7 @@ providers and native Backblaze B2, instead of Storj only.
 
 ## Why this exists
 
-In 2024, Storj raised the price of their TrueNAS-integrated storage tier from
+In 2026, Storj raised the price of their TrueNAS-integrated storage tier from
 **$5/month to $50/month** — a 10× increase. For many home lab and small-office
 users, the TrueCloud Backup feature became unaffordable overnight.
 
