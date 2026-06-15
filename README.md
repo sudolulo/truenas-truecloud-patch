@@ -147,7 +147,7 @@ Get an API key from **System → API Keys → Add**.
 ## Uninstall
 
 ```bash
-bash /path/to/truenas-truecloud-patch/uninstall.sh
+bash /data/truecloud-patch/uninstall.sh
 ```
 
 Removes the PREINIT hook, `sitecustomize.py`, and restores the original UI
