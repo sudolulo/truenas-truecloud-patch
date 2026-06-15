@@ -53,8 +53,9 @@ find_mw_python() {
     fi
 
     # Verify the chosen interpreter can actually import middlewared.
+    # Use >&2 so this message goes to stderr, not captured by $(...) substitution.
     if ! "$py" -c "import middlewared" 2>/dev/null; then
-        warn "Detected Python '$py' cannot import middlewared; falling back to python3"
+        echo "WARNING: '$py' cannot import middlewared; falling back to python3" >&2
         py="python3"
     fi
 

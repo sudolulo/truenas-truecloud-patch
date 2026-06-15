@@ -42,12 +42,32 @@ class _Finder:
 
     def find_spec(self, fullname, path, target=None):  # noqa: ARG002
         import importlib.machinery
+        import importlib.util
+
         if (
             fullname in self._targets
             and fullname not in self._done
             and fullname not in self._loading
         ):
-            return importlib.machinery.ModuleSpec(fullname, _Loader(self, fullname))
+            # Find the real file spec HERE, before Python adds the module to
+            # sys.modules.  If we deferred this to exec_module, find_spec would
+            # short-circuit via sys.modules[fullname].__spec__ (our own spec) and
+            # exec_module would call itself recursively forever.
+            self._loading.add(fullname)
+            try:
+                real_spec = importlib.util.find_spec(fullname)
+            finally:
+                self._loading.discard(fullname)
+
+            if real_spec is None:
+                return None  # module doesn't exist; don't intercept
+
+            return importlib.machinery.ModuleSpec(
+                fullname,
+                _Loader(self, fullname, real_spec),
+                origin=real_spec.origin,
+                is_package=real_spec.submodule_search_locations is not None,
+            )
         return None
 
     def _mark_done(self, fullname):
@@ -60,37 +80,31 @@ class _Finder:
 
 
 class _Loader:
-    def __init__(self, finder, fullname):
+    def __init__(self, finder, fullname, real_spec):
         self._finder = finder
         self._fullname = fullname
+        self._real_spec = real_spec
 
     def create_module(self, spec):  # noqa: ARG002
         return None  # use Python's default module creation
 
     def exec_module(self, module):
-        import importlib.util
-
         fullname = self._fullname
-        self._finder._loading.add(fullname)
+        real_spec = self._real_spec
+
         try:
-            # find_spec for the real file — our finder returns None while
-            # fullname is in _loading, so the normal finders handle this.
-            real_spec = importlib.util.find_spec(fullname)
-            if real_spec is None:
-                raise ImportError(f"No module named {fullname!r}")
-
             real_spec.loader.exec_module(module)
-
             # Fix module metadata so it looks like a normal import.
             module.__spec__ = real_spec
             module.__loader__ = real_spec.loader
-            if getattr(real_spec, "origin", None):
+            if real_spec.origin:
                 module.__file__ = real_spec.origin
         finally:
-            self._finder._loading.discard(fullname)
+            # Mark done even on failure so a broken module doesn't cause
+            # infinite retry loops on subsequent import attempts.
+            self._finder._mark_done(fullname)
 
-        self._finder._mark_done(fullname)
-
+        # exec_module succeeded — apply our patch.
         try:
             _PATCHES[fullname](module)
         except Exception as exc:
