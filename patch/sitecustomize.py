@@ -41,14 +41,14 @@ class _Finder:
         self._done = set()      # modules already patched
 
     def find_spec(self, fullname, path, target=None):  # noqa: ARG002
-        import importlib.machinery
-        import importlib.util
-
         if (
             fullname in self._targets
             and fullname not in self._done
             and fullname not in self._loading
         ):
+            import importlib.machinery
+            import importlib.util
+
             # Find the real file spec HERE, before Python adds the module to
             # sys.modules.  If we deferred this to exec_module, find_spec would
             # short-circuit via sys.modules[fullname].__spec__ (our own spec) and
@@ -135,8 +135,7 @@ def _patch_b2(module):
 
 
 def _patch_restic(module):
-    orig = module.get_restic_config
-    if getattr(orig, "_truecloud_patched", False):
+    if getattr(module.get_restic_config, "_truecloud_patched", False):
         return
 
     # ResticConfig is safe to capture now (it's a dataclass defined in the module).
@@ -182,10 +181,10 @@ _PATCHES = {
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def _install():
-    import importlib.util
     import os
     if os.path.exists("/data/truecloud-patch/disabled"):
         return  # kill switch: touch /data/truecloud-patch/disabled to bypass this hook
+    import importlib.util
     if importlib.util.find_spec("middlewared") is None:
         return  # not a middlewared Python process; nothing to do
     sys.meta_path.append(_Finder())

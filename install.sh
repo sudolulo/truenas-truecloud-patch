@@ -73,6 +73,14 @@ else
 fi
 echo ""
 
+# ── Clear kill switch if set ──────────────────────────────────────────────────
+
+if [ -f "$PATCH_DIR/disabled" ]; then
+    rm "$PATCH_DIR/disabled"
+    echo "Removed kill switch ($PATCH_DIR/disabled) left from a previous recovery."
+    echo ""
+fi
+
 # ── Apply now ─────────────────────────────────────────────────────────────────
 
 echo "Applying patches ..."

@@ -60,7 +60,7 @@ def find_bundle(webui):
                 continue
             path = os.path.join(root, name)
             try:
-                with open(path) as fh:
+                with open(path, encoding="utf-8", errors="replace") as fh:
                     content = fh.read()
                 if FIND.search(content):
                     matches.append((path, content))
@@ -112,7 +112,7 @@ def main():
     patched, count = FIND.subn(REPLACE, content)
 
     try:
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8") as fh:
             fh.write(patched)
     except OSError as exc:
         print(f"[truecloud-patch] ERROR: Could not write {path}: {exc}")

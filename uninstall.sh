@@ -32,8 +32,11 @@ for s in json.load(sys.stdin):
 
 if [ -n "$IDS" ]; then
     for id in $IDS; do
-        midclt call initshutdownscript.delete "$id" > /dev/null
-        echo "  Removed initshutdownscript id=$id"
+        if midclt call initshutdownscript.delete "$id" > /dev/null; then
+            echo "  Removed initshutdownscript id=$id"
+        else
+            echo "  WARNING: could not delete id=$id (already gone?)"
+        fi
     done
 else
     echo "  No entry found (already removed or never installed)."
