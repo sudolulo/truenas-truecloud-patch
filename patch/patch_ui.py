@@ -61,7 +61,7 @@ def find_bundle():
                     content = fh.read()
                 if FIND.search(content):
                     matches.append((path, content))
-            except (UnicodeDecodeError, PermissionError, OSError):
+            except OSError:
                 continue
 
     if not matches:

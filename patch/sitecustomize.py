@@ -131,6 +131,12 @@ def _patch_b2(module):
 
     def _b2_restic_config(task):
         p = task["credentials"]["provider"]
+        missing = [f for f in ("account", "key") if f not in p]
+        if missing:
+            raise KeyError(
+                f"truecloud-patch: B2 provider missing field(s) {missing!r}; "
+                f"schema may have changed. Present: {sorted(p)!r}"
+            )
         return "", {"B2_ACCOUNT_ID": p["account"], "B2_ACCOUNT_KEY": p["key"]}
 
     cls.get_restic_config = staticmethod(_b2_restic_config)
@@ -154,12 +160,26 @@ def _patch_restic(module):
         # env construction, and everything else we don't own.
         result = _orig(cloud_backup)
 
-        # Scan the built command for the -r <repo> argument and fix the URL if
-        # it has a stray leading slash: "b2:/bucket/path" → "b2:bucket/path".
+        # Scan the built command for the repo argument and fix the URL if it
+        # has a stray leading slash: "b2:/bucket/path" → "b2:bucket/path".
         # "scheme://path" is intentional (Storj) and must not be touched.
+        # Covers all three flag forms restic accepts:
+        #   -r <url>       (short, two-element)
+        #   --repo <url>   (long, two-element)
+        #   --repo=<url>   (long, single-element)
         cmd = list(result.cmd)
         for i, part in enumerate(cmd):
-            if i and cmd[i - 1] == "-r":
+            if part.startswith("--repo="):
+                url = part[len("--repo="):]
+                scheme, sep, rest = url.partition(":")
+                if sep and rest.startswith("/") and not rest.startswith("//"):
+                    cmd[i] = f"--repo={scheme}:{rest[1:]}"
+                    try:
+                        return dataclasses.replace(result, cmd=cmd)
+                    except TypeError:
+                        return result._replace(cmd=cmd)
+                break
+            if i and cmd[i - 1] in ("-r", "--repo"):
                 scheme, sep, rest = part.partition(":")
                 if sep and rest.startswith("/") and not rest.startswith("//"):
                     cmd[i] = f"{scheme}:{rest[1:]}"
@@ -209,10 +229,32 @@ def _record_status(fullname: str, ok: bool, detail: str = "") -> None:
 def _install():
     import os
     if os.path.exists("/data/truecloud-patch/disabled"):
-        return  # kill switch: touch /data/truecloud-patch/disabled to bypass this hook
+        return  # kill switch
+    # Scope to the middlewared service process only — not midclt, debug scripts,
+    # or other tools that happen to share the same venv.
+    _argv0 = (sys.argv or [""])[0]
+    if os.path.basename(_argv0) != "middlewared":
+        return
     import importlib.util
     if importlib.util.find_spec("middlewared") is None:
-        return  # not a middlewared Python process; nothing to do
+        return
+    # If apply.sh displaced an existing sitecustomize.py, exec it first so any
+    # iX-provided startup code (path additions, codec registrations, etc.) still
+    # runs.  We use a separate namespace so it cannot shadow our globals.
+    _self = globals().get("__file__", "")
+    if _self:
+        _pre = _self + ".pre-truecloud-patch"
+        if os.path.isfile(_pre):
+            try:
+                import builtins
+                with open(_pre, encoding="utf-8") as _fh:
+                    exec(  # noqa: S102
+                        compile(_fh.read(), _pre, "exec"),
+                        {"__builtins__": builtins, "__file__": _pre,
+                         "__name__": "sitecustomize"},
+                    )
+            except Exception:
+                pass
     sys.meta_path.append(_Finder())
 
 
