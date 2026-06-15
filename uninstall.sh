@@ -107,6 +107,7 @@ while IFS= read -r backup; do
     mv "$backup" "$original"
     echo "  Restored: $original"
     RESTORED=1
+# Keep these paths in sync with WEBUI_CANDIDATES in patch/patch_ui.py
 done < <(find /usr/share/truenas /usr/share/truenas-ui /var/www/truenas \
               -name "*.js.pre-truecloud-patch" 2>/dev/null)
 
