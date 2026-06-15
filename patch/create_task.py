@@ -179,7 +179,10 @@ def cmd_create(client, args):
     }
 
     result = client("POST", "/cloud_backup", body)
-    print(f"Created task id={result['id']}  name={result['description']!r}")
+    try:
+        print(f"Created task id={result['id']}  name={result['description']!r}")
+    except (KeyError, TypeError):
+        print(f"Task created but response schema was unexpected: {result}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
