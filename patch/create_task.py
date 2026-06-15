@@ -92,8 +92,14 @@ def cmd_verify(_client, _args):
         print(f"  Expected: {_STATUS_FILE}")
         sys.exit(1)
 
-    with open(_STATUS_FILE, encoding="utf-8") as fh:
-        status = json.load(fh)
+    try:
+        with open(_STATUS_FILE, encoding="utf-8") as fh:
+            status = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Could not read status file: {exc}")
+        print(f"  Path: {_STATUS_FILE}")
+        print("Try restarting middlewared to regenerate it.")
+        sys.exit(1)
 
     print(f"Hook status (recorded at {status.get('patched_at', 'unknown')})")
     print()
@@ -225,22 +231,21 @@ def main():
                    help="Create the task in a disabled state")
 
     args = p.parse_args()
-    client = make_client(args.host, args.api_key, args.insecure)
 
+    if args.cmd == "verify":
+        cmd_verify(None, args)
+        return
+
+    if not args.host or not args.api_key:
+        p.error("--host and --api-key are required for this command")
+
+    client = make_client(args.host, args.api_key, args.insecure)
     dispatch = {
-        "verify":           cmd_verify,
         "list-credentials": cmd_list_credentials,
         "list-tasks":       cmd_list_tasks,
         "create":           cmd_create,
     }
-
-    if args.cmd == "verify":
-        cmd_verify(None, args)
-    else:
-        if not args.host or not args.api_key:
-            p.error("--host and --api-key are required for this command")
-        client = make_client(args.host, args.api_key, args.insecure)
-        dispatch[args.cmd](client, args)
+    dispatch[args.cmd](client, args)
 
 
 if __name__ == "__main__":

@@ -121,9 +121,12 @@ def _patch_b2(module):
 
     if hasattr(cls, "get_restic_config"):
         # A future TrueNAS version already added native B2 restic support.
+        _record_status("middlewared.rclone.remote.b2", ok=True,
+                       detail="native support present; patch not needed")
         return
 
-    def get_restic_config(self, task):  # noqa: ARG001
+    @staticmethod
+    def get_restic_config(task):
         p = task["credentials"]["provider"]
         return "", {
             "B2_ACCOUNT_ID": p["account"],
@@ -138,6 +141,8 @@ def _patch_b2(module):
 
 def _patch_restic(module):
     if getattr(module.get_restic_config, "_truecloud_patched", False):
+        _record_status("middlewared.plugins.cloud_backup.restic", ok=True,
+                       detail="already patched in this process")
         return
 
     import dataclasses
@@ -163,10 +168,13 @@ def _patch_restic(module):
                 m = _broken_url.match(part)
                 if m:
                     cmd[i] = f"{m.group(1)}:{m.group(2)}"
-                    # dataclasses.replace passes all other fields through, so
-                    # new ResticConfig fields added in future TrueNAS versions
-                    # are preserved automatically.
-                    return dataclasses.replace(result, cmd=cmd)
+                    # Prefer dataclasses.replace (passes unknown future fields
+                    # through automatically). Fall back to NamedTuple._replace
+                    # in case ResticConfig is refactored.
+                    try:
+                        return dataclasses.replace(result, cmd=cmd)
+                    except TypeError:
+                        return result._replace(cmd=cmd)
                 break  # -r arg present and already correct
         return result  # URL was fine; return original unchanged
 
@@ -190,6 +198,8 @@ def _record_status(fullname: str, ok: bool, detail: str = "") -> None:
     import os
     import time
 
+    if fullname in _hook_status:
+        return  # idempotent: first call wins
     _hook_status[fullname] = {"ok": ok, "detail": detail}
     if len(_hook_status) < len(_PATCHES):
         return  # wait until all patches have reported
