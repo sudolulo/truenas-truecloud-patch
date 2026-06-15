@@ -106,7 +106,15 @@ fi
 # ── Restart middlewared ───────────────────────────────────────────────────────
 
 echo "Restarting middlewared so the backend patch takes effect ..."
-systemctl restart middlewared
+if ! systemctl restart middlewared; then
+    echo "" >&2
+    echo "ERROR: middlewared failed to restart. The patch files are installed but" >&2
+    echo "the hook is not yet active. Check the system log for the root cause:" >&2
+    echo "  journalctl -u middlewared -n 50" >&2
+    echo "If the problem is unrelated to this patch, recover with:" >&2
+    echo "  bash $PATCH_DIR/recover.sh" >&2
+    exit 1
+fi
 echo "Done."
 echo ""
 echo "Refresh your browser to pick up the UI change."

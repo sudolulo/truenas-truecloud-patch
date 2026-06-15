@@ -195,7 +195,9 @@ def main():
     p.add_argument("--api-key", default=None, metavar="KEY",
                    help="TrueNAS API key — System → API Keys (required except for verify)")
     p.add_argument("--insecure", action="store_true",
-                   help="Skip TLS certificate verification (self-signed certs)")
+                   help="Skip TLS certificate verification (self-signed certs). "
+                        "WARNING: exposes your API key to network interception. "
+                        "Prefer adding your cert to the trust store instead.")
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
