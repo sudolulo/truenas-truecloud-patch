@@ -132,6 +132,39 @@ class _Loader:
 
 # ── Patch functions ───────────────────────────────────────────────────────────
 
+def _tc_fix_restic_cmd(result, dataclasses):
+    """Fix the restic repo URL: b2:/bucket/path → b2:bucket:path (restic 0.16.x)."""
+    cmd = list(result.cmd)
+    for i, part in enumerate(cmd):
+        if part.startswith("--repo=") or part.startswith("--repository="):
+            pfx, _, url = part.partition("=")
+            pfx += "="
+        elif i and cmd[i - 1] in ("-r", "--repo", "--repository"):
+            pfx = None
+            url = part
+        else:
+            continue
+        scheme, sep, rest = url.partition(":")
+        if not sep:
+            break
+        changed = False
+        if rest.startswith("/") and not rest.startswith("//"):
+            rest = rest[1:]
+            changed = True
+        if scheme == "b2" and "/" in rest:
+            rest = rest.replace("/", ":", 1)
+            changed = True
+        if changed:
+            new_url = scheme + ":" + rest
+            cmd[i] = pfx + new_url if pfx is not None else new_url
+            try:
+                return dataclasses.replace(result, cmd=cmd)
+            except TypeError:
+                return result._replace(cmd=cmd)
+        break
+    return result
+
+
 def _patch_b2(module):
     cls = module.B2RcloneRemote
 
@@ -169,42 +202,7 @@ def _patch_restic(module):
     _orig = module.get_restic_config
 
     def get_restic_config(cloud_backup):
-        # Call the original — it handles cache, RESTIC_PASSWORD, env, etc.
-        result = _orig(cloud_backup)
-
-        # Fix the repo URL in the restic command.
-        # Stock middlewared builds: b2:/bucket/path
-        # restic 0.16.x B2 expects: b2:bucket:path  (colon separator, no leading slash)
-        # "scheme://path" (Storj) must not be touched.
-        cmd = list(result.cmd)
-        for i, part in enumerate(cmd):
-            if part.startswith("--repo=") or part.startswith("--repository="):
-                pfx, _, url = part.partition("=")
-                pfx += "="
-            elif i and cmd[i - 1] in ("-r", "--repo", "--repository"):
-                pfx = None
-                url = part
-            else:
-                continue
-            scheme, sep, rest = url.partition(":")
-            if not sep:
-                break
-            changed = False
-            if rest.startswith("/") and not rest.startswith("//"):
-                rest = rest[1:]
-                changed = True
-            if scheme == "b2" and "/" in rest:
-                rest = rest.replace("/", ":", 1)
-                changed = True
-            if changed:
-                new_url = scheme + ":" + rest
-                cmd[i] = pfx + new_url if pfx is not None else new_url
-                try:
-                    return dataclasses.replace(result, cmd=cmd)
-                except TypeError:
-                    return result._replace(cmd=cmd)
-            break
-        return result
+        return _tc_fix_restic_cmd(_orig(cloud_backup), dataclasses)
 
     get_restic_config._truecloud_patched = True
     module.get_restic_config = get_restic_config

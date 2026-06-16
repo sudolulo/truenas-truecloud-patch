@@ -46,8 +46,8 @@ By installing this patch you accept the following:
 
 - **No warranty.** This software is provided as-is. See the LICENSE file.
 
-If TrueNAS ever adds native support for additional providers in TrueCloud
-Backup, uninstall this patch immediately.
+If TrueNAS adds native B2 or S3 support to TrueCloud Backup, the patch
+detects it and degrades gracefully — see [Native support](#if-truenas-adds-native-support) below.
 
 ---
 
@@ -59,7 +59,7 @@ on every update) and are therefore re-applied automatically on every boot.
 
 | Layer | What changes | Technique |
 |---|---|---|
-| **Backend** | `B2RcloneRemote` gains `get_restic_config()`. `restic.py` URL builder is fixed: strips the stray leading slash and converts the slash separator to a colon (`b2:bucket:path`), which is the format restic 0.16.x expects. | Direct file patch in the overlay (primary) + `sitecustomize.py` import hook (belt-and-suspenders) |
+| **Backend** | `B2RcloneRemote` gains `get_restic_config()` — skipped automatically if TrueNAS already provides one on the class. `restic.py` URL builder is fixed: strips the stray leading slash and converts the slash separator to a colon (`b2:bucket:path`), which is the format restic 0.16.x expects. URL wrapper is a no-op if the URL is already correctly formed. | Direct file patch in the overlay (primary, delegates URL logic to `sitecustomize.py`) + `sitecustomize.py` import hook (belt-and-suspenders) |
 | **UI** | The Angular bundle's `filterByProviders` binding is widened from `["STORJ_IX"]` to `["STORJ_IX","S3","B2"]` | In-place text replacement in the compiled JS chunk; original is backed up |
 
 Both changes are **fail-safe**: if a patch cannot be applied (e.g. TrueNAS
@@ -262,6 +262,27 @@ restic -r "$REPO" ls latest
 - If you created the task with `--snapshot` (ZFS snapshot before each run),
   the restic snapshot captures the dataset at a consistent point in time.
 - Use `restic check -r "$REPO"` periodically to verify repository integrity.
+
+---
+
+## If TrueNAS adds native support
+
+When a TrueNAS update ships native B2 or S3 support in TrueCloud Backup, the
+patch handles each component as follows:
+
+| Component | What happens | Action needed |
+|---|---|---|
+| **B2 `get_restic_config`** added directly to `B2RcloneRemote` | `__dict__` guard detects it; our method is **not attached** | None — native version used automatically |
+| **restic.py URL builder** fixed to emit `b2:bucket:path` directly | Our wrapper sees no `/` to fix; it becomes a **no-op** | None — correct URL passes through unchanged |
+| **`get_restic_config` moved** out of `restic.py` entirely | `NameError` guard in the patched file catches it; wrapper silently does nothing | None — but run `verify` to confirm state |
+| **B2 credential schema changed** (e.g. `provider["account"]` renamed) | Our B2 config function raises `KeyError`; backup task fails | Uninstall or update the patch |
+| **B2 `get_restic_config`** added to a **base class** (not `B2RcloneRemote`) | `__dict__` check misses it; our method is attached and **shadows** the native one | Uninstall the patch |
+
+**Recommended check after any TrueNAS update that adds TrueCloud provider
+support**: run `python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify`
+and attempt a B2 backup. If both pass, the patch is coexisting correctly. If
+the backup fails with a credential or URL error that worked before the update,
+uninstall the patch — TrueNAS has shipped a conflicting implementation.
 
 ---
 

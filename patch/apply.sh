@@ -231,46 +231,24 @@ import sys
 
 BLOCK = """
 # TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
-_tc_orig_get_restic_config = get_restic_config
+# URL fix logic lives in sitecustomize._tc_fix_restic_cmd (single source of truth).
+try:
+    _tc_orig_get_restic_config = get_restic_config
+except NameError:
+    pass  # get_restic_config not in this module; TrueNAS restructured restic.py
+else:
+    def get_restic_config(cloud_backup):
+        import dataclasses as _dc
+        result = _tc_orig_get_restic_config(cloud_backup)
+        try:
+            import sitecustomize as _sc
+            return _sc._tc_fix_restic_cmd(result, _dc)
+        except Exception as _e:
+            import sys as _sys
+            _sys.stderr.write(f"[truecloud-patch] restic URL fix failed: {_e}\n")
+            return result
 
-def get_restic_config(cloud_backup):
-    import dataclasses as _dc
-    result = _tc_orig_get_restic_config(cloud_backup)
-    cmd = list(result.cmd)
-    for i, part in enumerate(cmd):
-        if part.startswith("--repo=") or part.startswith("--repository="):
-            pfx, _, url = part.partition("=")
-            pfx += "="
-        elif i and cmd[i - 1] in ("-r", "--repo", "--repository"):
-            pfx = None
-            url = part
-        else:
-            continue
-        scheme, sep, rest = url.partition(":")
-        if not sep:
-            break
-        changed = False
-        # Strip stray leading slash: b2:/bucket -> b2:bucket
-        if rest.startswith("/") and not rest.startswith("//"):
-            rest = rest[1:]
-            changed = True
-        # restic 0.16.x B2 uses colon to separate bucket from path:
-        #   b2:bucket:prefix  (not b2:bucket/prefix)
-        # middlewared builds the slash form; fix the separator.
-        if scheme == "b2" and "/" in rest:
-            rest = rest.replace("/", ":", 1)
-            changed = True
-        if changed:
-            new_url = scheme + ":" + rest
-            cmd[i] = pfx + new_url if pfx is not None else new_url
-            try:
-                return _dc.replace(result, cmd=cmd)
-            except TypeError:
-                return result._replace(cmd=cmd)
-        break
-    return result
-
-get_restic_config._truecloud_patched = True
+    get_restic_config._truecloud_patched = True
 """
 
 path = sys.argv[1]
