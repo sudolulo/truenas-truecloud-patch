@@ -55,13 +55,19 @@ see [Native support](#if-truenas-adds-native-support) below.
 ## What is actually patched
 
 **Nothing in TrueNAS's persistent database or configuration is modified.**
-The patch operates on two files that live in `/usr/` (which TrueNAS replaces
-on every update) and are therefore re-applied automatically on every boot.
+On every boot, `patch/apply.sh` runs as a PREINIT script before middlewared
+starts. It mounts a writable
+[overlayfs](https://docs.kernel.org/filesystems/overlayfs.html) over the
+relevant directories in `/usr/` (upper layer in `/run` tmpfs), then patches
+`b2.py` and `restic.py` inside that overlay. The overlay is volatile — it
+exists only for the current boot — but the PREINIT script recreates it
+automatically on every subsequent boot. Nothing in `/usr/` is written to
+directly.
 
 | Layer | What changes | Technique |
 |---|---|---|
-| **Backend** | `B2RcloneRemote` gains `get_restic_config()` — skipped automatically if TrueNAS already provides one on the class. `restic.py` URL builder is fixed: strips the stray leading slash and converts the slash separator to a colon (`b2:bucket:path`), which is the format restic 0.16.x expects. URL wrapper is a no-op if the URL is already correctly formed. | Direct file patch in the overlay |
-| **UI** | The Angular bundle's `filterByProviders` binding is widened from `["STORJ_IX"]` to `["STORJ_IX","S3","B2"]` | In-place text replacement in the compiled JS chunk; original is backed up |
+| **Backend** | `B2RcloneRemote` gains `get_restic_config()` — skipped automatically if TrueNAS already provides one on the class. `restic.py` URL builder is fixed: strips the stray leading slash and converts the slash separator to a colon (`b2:bucket:path`), which is the format restic 0.16.x expects. URL wrapper is a no-op if the URL is already correctly formed. | File patch applied inside the overlayfs upper layer |
+| **UI** | The Angular bundle's `filterByProviders` binding is widened from `["STORJ_IX"]` to `["STORJ_IX","S3","B2"]` | In-place text replacement in the compiled JS chunk; original is backed up before patching |
 
 Both changes are **fail-safe**: if a patch cannot be applied (e.g. TrueNAS
 restructured the relevant code), middlewared starts normally with Storj-only
