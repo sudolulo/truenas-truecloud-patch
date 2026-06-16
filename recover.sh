@@ -6,10 +6,11 @@
 #   bash /mnt/tank/truenas-truecloud-patch/recover.sh
 #
 # What it does:
-#   1. Creates a "disabled" file in the repo root — sitecustomize.py checks for
-#      this file at startup and skips the import hook entirely, so middlewared
-#      starts clean without any of our code running.
-#   2. Restarts middlewared.
+#   1. Creates a "disabled" file in the repo root — apply.sh checks for this
+#      file at boot and skips all patching, so the next boot is always clean.
+#   2. Unmounts any active truecloud overlays so the original /usr files are
+#      visible immediately (no reboot required).
+#   3. Restarts middlewared against the unpatched files.
 #
 # To re-enable the patch after investigating:
 #   rm /mnt/tank/truenas-truecloud-patch/disabled
@@ -29,6 +30,22 @@ fi
 
 touch "$PATCH_DIR/disabled"
 echo "Kill switch set: $PATCH_DIR/disabled created."
+
+echo "Unmounting truecloud overlays ..."
+_any=0
+for _tag in mw ui; do
+    if mount | grep -qF "truecloud-${_tag} on "; then
+        _mnt=$(mount | grep "truecloud-${_tag} on " | awk '{print $3}' | head -1)
+        if umount "$_mnt" 2>/dev/null; then
+            echo "  Unmounted: $_mnt"
+            _any=1
+        else
+            echo "  WARNING: Could not unmount $_mnt — a reboot will restore original files."
+        fi
+    fi
+done
+[ "$_any" -eq 0 ] && echo "  No overlays active."
+
 echo "Restarting middlewared ..."
 if systemctl restart middlewared; then
     echo ""

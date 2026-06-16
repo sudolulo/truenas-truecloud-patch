@@ -44,68 +44,6 @@ else
 fi
 echo ""
 
-# ── Remove sitecustomize.py ───────────────────────────────────────────────────
-
-echo "Removing sitecustomize.py ..."
-
-# Use the same Python detection logic as apply.sh
-PYTHON="python3"
-if [ -x /usr/bin/middlewared ]; then
-    shebang=$(dd if=/usr/bin/middlewared bs=256 count=1 2>/dev/null | head -1 || true)
-    if [[ "$shebang" =~ ^'#!'(/[^[:space:]]+python[^[:space:]]*) ]]; then
-        PYTHON="${BASH_REMATCH[1]}"
-    elif [[ "$shebang" =~ ^'#!/usr/bin/env '(python[^[:space:]]*) ]]; then
-        PYTHON=$(command -v "${BASH_REMATCH[1]}" 2>/dev/null || echo "python3")
-    fi
-fi
-
-if ! "$PYTHON" -c "import middlewared" 2>/dev/null; then
-    echo "  WARNING: '$PYTHON' cannot import middlewared; falling back to python3"
-    PYTHON="python3"
-    if ! "$PYTHON" -c "import middlewared" 2>/dev/null; then
-        echo "  WARNING: 'python3' also cannot import middlewared; sitecustomize.py may be removed from the wrong location."
-    fi
-fi
-
-SITE_PKG=$("$PYTHON" -c "
-import os
-try:
-    import middlewared
-    print(os.path.dirname(os.path.dirname(os.path.abspath(middlewared.__file__))))
-except ImportError:
-    import site
-    print(site.getsitepackages()[0])
-" 2>/dev/null || true)
-
-if [ -n "$SITE_PKG" ] && [ -f "$SITE_PKG/sitecustomize.py" ]; then
-    if grep -q "truecloud-patch" "$SITE_PKG/sitecustomize.py" 2>/dev/null; then
-        if [ -f "$SITE_PKG/sitecustomize.py.pre-truecloud-patch" ]; then
-            # mv atomically overwrites our file with the vendor original —
-            # safer than rm-then-mv if /usr is transiently read-only.
-            mv "$SITE_PKG/sitecustomize.py.pre-truecloud-patch" \
-               "$SITE_PKG/sitecustomize.py"
-            echo "  Restored previous sitecustomize.py"
-        else
-            rm "$SITE_PKG/sitecustomize.py"
-            echo "  Removed $SITE_PKG/sitecustomize.py"
-        fi
-    else
-        echo "  $SITE_PKG/sitecustomize.py is not ours; leaving it alone."
-    fi
-else
-    echo "  Not found (already removed or install didn't place it here)."
-fi
-
-# Handle orphaned backup when sitecustomize.py was removed (e.g. by a TrueNAS
-# update) but the .pre-truecloud-patch file survived in the same directory.
-if [ -n "$SITE_PKG" ] && [ ! -f "$SITE_PKG/sitecustomize.py" ] && \
-   [ -f "$SITE_PKG/sitecustomize.py.pre-truecloud-patch" ]; then
-    mv "$SITE_PKG/sitecustomize.py.pre-truecloud-patch" \
-       "$SITE_PKG/sitecustomize.py"
-    echo "  Restored orphaned sitecustomize.py backup"
-fi
-echo ""
-
 # ── Restore UI bundle ─────────────────────────────────────────────────────────
 
 echo "Restoring UI bundle backup ..."
@@ -131,11 +69,11 @@ if [ "$RESTORED" -eq 0 ]; then
 fi
 echo ""
 
-# ── Unmount overlays (TrueNAS 25.x immutable OS) ─────────────────────────────
+# ── Unmount overlays ──────────────────────────────────────────────────────────
 
 echo "Unmounting truecloud overlays (if any) ..."
 _ov_found=0
-for _tag in sc ui; do
+for _tag in mw ui; do
     if mount | grep -qF "truecloud-${_tag} on "; then
         _ov_mnt=$(mount | grep "truecloud-${_tag} on " | awk '{print $3}' | head -1)
         if umount "$_ov_mnt" 2>/dev/null; then

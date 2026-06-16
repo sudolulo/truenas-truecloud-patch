@@ -20,7 +20,7 @@ set -euo pipefail
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 _HOOK_COMMENT='TrueCloud provider patch (S3/B2)'
 
-if [ ! -f "$PATCH_DIR/patch/sitecustomize.py" ]; then
+if [ ! -f "$PATCH_DIR/patch/apply.sh" ]; then
     echo "ERROR: patch files not found at $PATCH_DIR/patch/" >&2
     echo "Run install.sh from a clone of the repository on a persistent pool:" >&2
     echo "  git clone https://github.com/sudolulo/truenas-truecloud-patch \\" >&2

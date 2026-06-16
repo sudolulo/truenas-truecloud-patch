@@ -59,7 +59,7 @@ on every update) and are therefore re-applied automatically on every boot.
 
 | Layer | What changes | Technique |
 |---|---|---|
-| **Backend** | `B2RcloneRemote` gains `get_restic_config()` — skipped automatically if TrueNAS already provides one on the class. `restic.py` URL builder is fixed: strips the stray leading slash and converts the slash separator to a colon (`b2:bucket:path`), which is the format restic 0.16.x expects. URL wrapper is a no-op if the URL is already correctly formed. | Direct file patch in the overlay (primary, delegates URL logic to `sitecustomize.py`) + `sitecustomize.py` import hook (belt-and-suspenders) |
+| **Backend** | `B2RcloneRemote` gains `get_restic_config()` — skipped automatically if TrueNAS already provides one on the class. `restic.py` URL builder is fixed: strips the stray leading slash and converts the slash separator to a colon (`b2:bucket:path`), which is the format restic 0.16.x expects. URL wrapper is a no-op if the URL is already correctly formed. | Direct file patch in the overlay |
 | **UI** | The Angular bundle's `filterByProviders` binding is widened from `["STORJ_IX"]` to `["STORJ_IX","S3","B2"]` | In-place text replacement in the compiled JS chunk; original is backed up |
 
 Both changes are **fail-safe**: if a patch cannot be applied (e.g. TrueNAS
@@ -80,19 +80,13 @@ TrueNAS SCALE updates replace `/usr/` entirely. The patch survives by keeping
 this repository on a **persistent ZFS pool** (your data pool, not `/tmp` or a
 system path) and registering a **PREINIT initshutdownscript** in the TrueNAS
 database. On every boot, `patch/apply.sh` runs from the repo before
-`middlewared` starts, placing `sitecustomize.py` in the correct site-packages
-directory and re-patching the UI bundle.
+`middlewared` starts, patching `b2.py` and `restic.py` directly in the overlay
+and re-patching the UI bundle.
 
 If `/usr` is a read-only filesystem, `apply.sh` handles this automatically by
 mounting a writable [overlayfs](https://docs.kernel.org/filesystems/overlayfs.html)
 on top of the relevant directories. The overlay lives in `/run` (tmpfs) and is
 recreated on every boot. No extra configuration is needed.
-
-## Python version compatibility
-
-`sitecustomize.py` uses the `find_spec` / `exec_module` import hook API
-(Python 3.4+; the older `load_module` form was removed in Python 3.12).
-Compatible with all Python versions shipped by TrueNAS SCALE.
 
 ---
 
@@ -162,8 +156,8 @@ bash /mnt/tank/truenas-truecloud-patch/uninstall.sh
 ```
 
 Replace the path with your clone location. Removes the PREINIT hook,
-`sitecustomize.py`, and restores the original UI bundle from backup. The
-backend changes vanish on the next `middlewared` restart.
+unmounts the overlay (restoring the original backend files immediately),
+and restores the original UI bundle from backup.
 
 ---
 
@@ -305,9 +299,8 @@ bash /mnt/tank/truenas-truecloud-patch/recover.sh
 ```
 
 Replace the path with your clone location. This creates a kill-switch file
-(`disabled`) in the repo root. `sitecustomize.py` checks for it at Python
-startup; if present, the import hook is skipped entirely and middlewared starts
-clean with Storj-only support. Nothing else on your system is affected.
+(`disabled`) in the repo root, unmounts the overlay so the original files are
+visible immediately, then restarts middlewared. No reboot required.
 
 If you cannot run a script and only have a bare shell prompt:
 
@@ -407,10 +400,9 @@ cat /mnt/tank/truenas-truecloud-patch/apply.log
 ```bash
 python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify
 ```
-This reads `hook_status.json` in your repo root. The file is written by
-`apply.sh` at install/boot time and reflects whether the direct file patches
-to `b2.py` and `restic.py` were applied successfully. Does not require
-`--host` or `--api-key`.
+Reads `hook_status.json` written by `apply.sh` at boot. Reflects whether the
+overlay patches to `b2.py` and `restic.py` were applied successfully. Does not
+require `--host` or `--api-key`.
 
 **Middlewared log:**
 ```bash
