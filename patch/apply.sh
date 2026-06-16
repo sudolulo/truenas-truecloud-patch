@@ -177,10 +177,10 @@ with open(d + '/patch/sitecustomize.py', encoding='utf-8') as fh:
     fi
 
     # ── Direct file patching ──────────────────────────────────────────────────
-    # Append a marker block to b2.py and restic.py in the overlay (primary
-    # approach).  This is simpler than the sitecustomize.py import hook and
-    # works regardless of how Python's site initialisation is configured.
-    # apply.sh re-patches on every boot; the overlay is volatile (tmpfs).
+    # Patch b2.py and restic.py directly in the overlay (primary approach).
+    # Each run strips any existing TRUECLOUD_PATCH block and rewrites it fresh,
+    # so a bugfix in the block takes effect immediately on the next apply.sh run
+    # without needing to manually clear the overlay.
 
     if [ -n "$_MW_DIR" ] && [ "$_can_install" = true ]; then
         _B2_PY="$_MW_DIR/rclone/remote/b2.py"
@@ -188,27 +188,37 @@ with open(d + '/patch/sitecustomize.py', encoding='utf-8') as fh:
 
         # ── b2.py ─────────────────────────────────────────────────────────────
         if [ -f "$_B2_PY" ]; then
-            if grep -q "TRUECLOUD_PATCH" "$_B2_PY" 2>/dev/null; then
-                echo "OK: b2.py already patched"
-                _b2_ok=1
-            else
-                cat >> "$_B2_PY" << 'B2_PATCH'
+            if "$PYTHON" - "$_B2_PY" << 'PYEOF'
+import sys
 
+BLOCK = """
 # TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
 def _tc_get_restic_config(task):
     p = task["credentials"]["provider"]
     return "", {"B2_ACCOUNT_ID": p["account"], "B2_ACCOUNT_KEY": p["key"]}
 
-if not hasattr(B2RcloneRemote, "get_restic_config"):
+if "get_restic_config" not in B2RcloneRemote.__dict__:
     B2RcloneRemote.get_restic_config = staticmethod(_tc_get_restic_config)
     B2RcloneRemote.restic = True
-B2_PATCH
-                if [ $? -eq 0 ]; then
-                    echo "OK: Patched b2.py → $_B2_PY"
-                    _b2_ok=1
-                else
-                    echo "WARNING: Failed to write to b2.py (overlay not writable?)"
-                fi
+"""
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    content = fh.read()
+
+marker = "\n# TRUECLOUD_PATCH"
+idx = content.find(marker)
+base = content[:idx] if idx != -1 else content
+patched = base.rstrip("\n") + "\n" + BLOCK
+
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(patched)
+PYEOF
+            then
+                echo "OK: Patched b2.py → $_B2_PY"
+                _b2_ok=1
+            else
+                echo "WARNING: Failed to patch b2.py"
             fi
         else
             echo "WARNING: b2.py not found at $_B2_PY"
@@ -216,12 +226,10 @@ B2_PATCH
 
         # ── restic.py ─────────────────────────────────────────────────────────
         if [ -f "$_RESTIC_PY" ]; then
-            if grep -q "TRUECLOUD_PATCH" "$_RESTIC_PY" 2>/dev/null; then
-                echo "OK: restic.py already patched"
-                _restic_ok=1
-            else
-                cat >> "$_RESTIC_PY" << 'RESTIC_PATCH'
+            if "$PYTHON" - "$_RESTIC_PY" << 'PYEOF'
+import sys
 
+BLOCK = """
 # TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
 _tc_orig_get_restic_config = get_restic_config
 
@@ -253,13 +261,25 @@ def get_restic_config(cloud_backup):
     return result
 
 get_restic_config._truecloud_patched = True
-RESTIC_PATCH
-                if [ $? -eq 0 ]; then
-                    echo "OK: Patched restic.py → $_RESTIC_PY"
-                    _restic_ok=1
-                else
-                    echo "WARNING: Failed to write to restic.py (overlay not writable?)"
-                fi
+"""
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    content = fh.read()
+
+marker = "\n# TRUECLOUD_PATCH"
+idx = content.find(marker)
+base = content[:idx] if idx != -1 else content
+patched = base.rstrip("\n") + "\n" + BLOCK
+
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(patched)
+PYEOF
+            then
+                echo "OK: Patched restic.py → $_RESTIC_PY"
+                _restic_ok=1
+            else
+                echo "WARNING: Failed to patch restic.py"
             fi
         else
             echo "WARNING: restic.py not found at $_RESTIC_PY"
