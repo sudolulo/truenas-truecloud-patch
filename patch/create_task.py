@@ -141,7 +141,7 @@ def cmd_list_tasks(client, _args):
     print("─" * 60)
     for t in sorted(tasks, key=lambda x: x["id"]):
         creds = t.get("credentials") or {}
-        ptype = creds.get("provider", {}).get("type", "?")
+        ptype = (creds.get("provider") or {}).get("type", "?")
         enabled = "yes" if t.get("enabled") else "no"
         print(f"{t['id']:>4}  {enabled:<8}  {ptype:<14}  {t.get('description', '')}")
 

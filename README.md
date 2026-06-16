@@ -292,6 +292,22 @@ touch /mnt/tank/truenas-truecloud-patch/disabled
 systemctl restart middlewared
 ```
 
+If you don't remember where you cloned the repo (midclt won't work while middlewared is
+down), find the path two ways:
+
+```bash
+# Option 1 — search the filesystem:
+find /mnt -name "recover.sh" -path "*/truenas-truecloud-patch/*" 2>/dev/null
+
+# Option 2 — query the TrueNAS database directly:
+sqlite3 /data/freenas-v1.db \
+    "SELECT script FROM initshutdownscript WHERE comment = 'TrueCloud provider patch (S3/B2)';"
+```
+
+The `script` column shows the full path to `patch/apply.sh`; your clone root is one
+level up (strip `/patch/apply.sh` from the end). Then run the `touch` command above
+with that path.
+
 If middlewared **still** won't start after the kill switch is set, the problem
 is unrelated to this patch. Check:
 
