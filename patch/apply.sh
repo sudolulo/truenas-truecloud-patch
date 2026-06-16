@@ -239,25 +239,35 @@ def get_restic_config(cloud_backup):
     cmd = list(result.cmd)
     for i, part in enumerate(cmd):
         if part.startswith("--repo=") or part.startswith("--repository="):
-            prefix, _, url = part.partition("=")
-            prefix += "="
-            scheme, sep, rest = url.partition(":")
-            if sep and rest.startswith("/") and not rest.startswith("//"):
-                cmd[i] = f"{prefix}{scheme}:{rest[1:]}"
-                try:
-                    return _dc.replace(result, cmd=cmd)
-                except TypeError:
-                    return result._replace(cmd=cmd)
+            pfx, _, url = part.partition("=")
+            pfx += "="
+        elif i and cmd[i - 1] in ("-r", "--repo", "--repository"):
+            pfx = None
+            url = part
+        else:
+            continue
+        scheme, sep, rest = url.partition(":")
+        if not sep:
             break
-        if i and cmd[i - 1] in ("-r", "--repo", "--repository"):
-            scheme, sep, rest = part.partition(":")
-            if sep and rest.startswith("/") and not rest.startswith("//"):
-                cmd[i] = f"{scheme}:{rest[1:]}"
-                try:
-                    return _dc.replace(result, cmd=cmd)
-                except TypeError:
-                    return result._replace(cmd=cmd)
-            break
+        changed = False
+        # Strip stray leading slash: b2:/bucket -> b2:bucket
+        if rest.startswith("/") and not rest.startswith("//"):
+            rest = rest[1:]
+            changed = True
+        # restic 0.16.x B2 uses colon to separate bucket from path:
+        #   b2:bucket:prefix  (not b2:bucket/prefix)
+        # middlewared builds the slash form; fix the separator.
+        if scheme == "b2" and "/" in rest:
+            rest = rest.replace("/", ":", 1)
+            changed = True
+        if changed:
+            new_url = scheme + ":" + rest
+            cmd[i] = pfx + new_url if pfx is not None else new_url
+            try:
+                return _dc.replace(result, cmd=cmd)
+            except TypeError:
+                return result._replace(cmd=cmd)
+        break
     return result
 
 get_restic_config._truecloud_patched = True

@@ -59,7 +59,7 @@ on every update) and are therefore re-applied automatically on every boot.
 
 | Layer | What changes | Technique |
 |---|---|---|
-| **Backend** | `B2RcloneRemote` gains `get_restic_config()`. `restic.py` URL builder is fixed for providers with no hostname component (`b2:bucket/path` vs the broken `b2:/bucket/path`). | `sitecustomize.py` — Python's standard startup hook; no middleware files are modified on disk |
+| **Backend** | `B2RcloneRemote` gains `get_restic_config()`. `restic.py` URL builder is fixed: strips the stray leading slash and converts the slash separator to a colon (`b2:bucket:path`), which is the format restic 0.16.x expects. | Direct file patch in the overlay (primary) + `sitecustomize.py` import hook (belt-and-suspenders) |
 | **UI** | The Angular bundle's `filterByProviders` binding is widened from `["STORJ_IX"]` to `["STORJ_IX","S3","B2"]` | In-place text replacement in the compiled JS chunk; original is backed up |
 
 Both changes are **fail-safe**: if a patch cannot be applied (e.g. TrueNAS
@@ -202,7 +202,7 @@ You need three things from the task you created:
 export B2_ACCOUNT_ID="your-key-id"
 export B2_ACCOUNT_KEY="your-application-key"
 export RESTIC_PASSWORD="your-repo-password"
-REPO="b2:your-bucket/your-folder"
+REPO="b2:your-bucket:your-folder"   # restic 0.16.x uses colon, not slash
 ```
 
 **S3-compatible (AWS S3, Wasabi, Cloudflare R2, MinIO, etc.):**

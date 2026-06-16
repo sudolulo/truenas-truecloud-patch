@@ -7,13 +7,14 @@ Hooks two middlewared module imports using the find_spec / exec_module API
 
   middlewared.rclone.remote.b2
       Adds get_restic_config() so the native restic B2 backend works.
-      Restic repo URL: b2:<bucket>/<folder>
+      Restic repo URL: b2:<bucket>:<folder>   (colon separator, restic 0.16.x)
       Auth: B2_ACCOUNT_ID, B2_ACCOUNT_KEY
 
   middlewared.plugins.cloud_backup.restic
-      Fixes the URL builder for providers with no hostname component.
-      Stock code: f"{rclone_type}:{url}/{remote_path}" → "b2:/bucket/path" (broken)
-      Patched:    "b2:bucket/path" when url == ""
+      Fixes the URL builder for providers with no hostname component, and
+      converts the slash separator to a colon for B2 (restic 0.16.x format):
+      Stock code: f"{rclone_type}:{url}/{remote_path}" → "b2:/bucket/path"
+      Patched:    "b2:bucket:path" (leading slash stripped, / → : for B2)
 
 Both patches are no-ops if the module already provides the functionality
 (i.e. a future TrueNAS version adds native support). All errors are caught
@@ -134,7 +135,7 @@ class _Loader:
 def _patch_b2(module):
     cls = module.B2RcloneRemote
 
-    if hasattr(cls, "get_restic_config"):
+    if "get_restic_config" in cls.__dict__:
         # A future TrueNAS version already added native B2 restic support.
         _record_status("middlewared.rclone.remote.b2", ok=True,
                        detail="native support present; patch not needed")
@@ -168,42 +169,46 @@ def _patch_restic(module):
     _orig = module.get_restic_config
 
     def get_restic_config(cloud_backup):
-        # Call the original — it handles transfer_setting, cache, RESTIC_PASSWORD,
-        # env construction, and everything else we don't own.
+        # Call the original — it handles cache, RESTIC_PASSWORD, env, etc.
         result = _orig(cloud_backup)
 
-        # Fix stray leading slash in repo URL: "b2:/bucket" → "b2:bucket".
+        # Fix the repo URL in the restic command.
+        # Stock middlewared builds: b2:/bucket/path
+        # restic 0.16.x B2 expects: b2:bucket:path  (colon separator, no leading slash)
         # "scheme://path" (Storj) must not be touched.
-        # Covers all flag forms restic accepts (--repository is a documented synonym):
-        #   -r <url>  --repo <url>  --repo=<url>
-        #   --repository <url>  --repository=<url>
         cmd = list(result.cmd)
         for i, part in enumerate(cmd):
             if part.startswith("--repo=") or part.startswith("--repository="):
-                prefix, _, url = part.partition("=")
-                prefix += "="
-                scheme, sep, rest = url.partition(":")
-                if sep and rest.startswith("/") and not rest.startswith("//"):
-                    cmd[i] = f"{prefix}{scheme}:{rest[1:]}"
-                    try:
-                        return dataclasses.replace(result, cmd=cmd)
-                    except TypeError:
-                        return result._replace(cmd=cmd)
+                pfx, _, url = part.partition("=")
+                pfx += "="
+            elif i and cmd[i - 1] in ("-r", "--repo", "--repository"):
+                pfx = None
+                url = part
+            else:
+                continue
+            scheme, sep, rest = url.partition(":")
+            if not sep:
                 break
-            if i and cmd[i - 1] in ("-r", "--repo", "--repository"):
-                scheme, sep, rest = part.partition(":")
-                if sep and rest.startswith("/") and not rest.startswith("//"):
-                    cmd[i] = f"{scheme}:{rest[1:]}"
-                    try:
-                        return dataclasses.replace(result, cmd=cmd)
-                    except TypeError:
-                        return result._replace(cmd=cmd)
-                break
+            changed = False
+            if rest.startswith("/") and not rest.startswith("//"):
+                rest = rest[1:]
+                changed = True
+            if scheme == "b2" and "/" in rest:
+                rest = rest.replace("/", ":", 1)
+                changed = True
+            if changed:
+                new_url = scheme + ":" + rest
+                cmd[i] = pfx + new_url if pfx is not None else new_url
+                try:
+                    return dataclasses.replace(result, cmd=cmd)
+                except TypeError:
+                    return result._replace(cmd=cmd)
+            break
         return result
 
     get_restic_config._truecloud_patched = True
     module.get_restic_config = get_restic_config
-    sys.stderr.write("[truecloud-patch] restic URL fix applied\n")
+    sys.stderr.write("[truecloud-patch] restic B2 URL fix applied (b2:bucket:path)\n")
     _record_status("middlewared.plugins.cloud_backup.restic", ok=True)
 
 
