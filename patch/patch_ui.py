@@ -3,17 +3,17 @@
 Patches the TrueNAS webui Angular bundle to show S3 and B2 credentials
 in the TrueCloud Backup task form, instead of Storj only.
 
-Angular's Ivy compiler inlines TypeScript string enum values as literals in
-the compiled bundle, so the template binding:
+The template binding [filterByProviders]="[CloudSyncProviderName.Storj]" appears
+in the minified JS in one of two forms depending on TrueNAS / Angular version:
 
-    [filterByProviders]="[CloudSyncProviderName.Storj]"
+  TrueNAS 24.x (static inline array):
+      "filterByProviders",["STORJ_IX"]
 
-appears verbatim in the minified JS as:
+  TrueNAS 25.x+ (Angular pureFunction binding):
+      "filterByProviders",pe(115,Rn,i.CloudSyncProviderName.Storj)
 
-    "filterByProviders",["STORJ_IX"]
-
-We replace that array to include S3 and B2. The file is backed up before
-modification so uninstall.sh can restore it.
+Both are replaced so the dropdown includes S3 and B2. The file is backed up
+before modification so uninstall.sh can restore it.
 
 Safe to run multiple times — a marker string detects an already-patched file.
 Exits 0 in all cases (warnings are printed to stdout and logged by apply.sh).
@@ -29,22 +29,37 @@ WEBUI_CANDIDATES = [
     "/var/www/truenas",
 ]
 
-# Angular's Ivy template compiler serialises the Storj-only filter as this
-# exact substring in every production build we've observed.
-FIND = re.compile(r'("filterByProviders",)\["STORJ_IX"\]')
-REPLACE = r'\1["STORJ_IX","S3","B2"]'
+# Patterns tried in order; the first match wins.
+# Each entry is (compiled_regex, replacement_string).
+_PATTERNS = [
+    # TrueNAS 25.x+: Angular emits a pureFunction call instead of a literal array.
+    # pe / slot-index / factory-var / component-var are all minified and change
+    # across builds; CloudSyncProviderName.Storj is stable (TypeScript enum name).
+    (re.compile(r'("filterByProviders",)\w+\(\d+,\w+,\w+\.CloudSyncProviderName\.Storj\)'),
+     r'\1["STORJ_IX","S3","B2"]'),
+    # TrueNAS 24.x and earlier: static inline array.
+    (re.compile(r'("filterByProviders",)\["STORJ_IX"\]'),
+     r'\1["STORJ_IX","S3","B2"]'),
+]
 
-# A patched file contains both "S3" and "B2" next to "STORJ_IX" in this form.
-# This string is specific enough not to appear elsewhere in the bundle.
+# Present in any patched file. Specific enough not to appear elsewhere.
 MARKER = '"STORJ_IX","S3","B2"'
+
+
+def _match_pattern(content):
+    """Return (regex, replacement) for the first pattern found in content, or (None, None)."""
+    for find, replace in _PATTERNS:
+        if find.search(content):
+            return find, replace
+    return None, None
 
 
 def find_bundle():
     """
-    Search WEBUI_CANDIDATES for the JS bundle containing the filterByProviders
+    Search WEBUI_CANDIDATES for the JS chunk containing the filterByProviders
     binding. Returns (webui_dir, path, content). webui_dir is None if no
     candidate directory exists; path is None if the directory exists but the
-    pattern is not found in any bundle.
+    pattern is not found in any file.
     """
     webui = next((d for d in WEBUI_CANDIDATES if os.path.isdir(d)), None)
     if webui is None:
@@ -58,7 +73,8 @@ def find_bundle():
             try:
                 with open(path, encoding="utf-8", errors="replace") as fh:
                     content = fh.read()
-                if FIND.search(content) or MARKER in content:
+                find, _ = _match_pattern(content)
+                if find is not None or MARKER in content:
                     return webui, path, content
             except OSError:
                 continue
@@ -88,6 +104,8 @@ def main():
         print(f"[truecloud-patch] UI already patched: {path}")
         return
 
+    find, replace = _match_pattern(content)
+
     backup = path + ".pre-truecloud-patch"
     if not os.path.exists(backup):
         try:
@@ -96,7 +114,7 @@ def main():
             print(f"[truecloud-patch] ERROR: Could not create backup {backup}: {exc}")
             return
 
-    patched, count = FIND.subn(REPLACE, content)
+    patched, count = find.subn(replace, content)
     if count != 1:
         print(
             f"[truecloud-patch] WARNING: {count} replacement(s) in {path}; "
