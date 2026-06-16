@@ -117,6 +117,32 @@ while IFS= read -r backup; do
 done < <(find /usr/share/truenas /usr/share/truenas-ui /var/www/truenas \
               -name "*.js.pre-truecloud-patch" 2>/dev/null)
 
+if [ "$RESTORED" -eq 0 ]; then
+    echo "  No backup files found."
+    echo "  On an immutable OS the UI patch is volatile and already gone after reboot."
+fi
+echo ""
+
+# ── Unmount overlays (TrueNAS 25.x immutable OS) ─────────────────────────────
+
+echo "Unmounting truecloud overlays (if any) ..."
+_ov_found=0
+for _tag in sc ui; do
+    if mount | grep -qF "truecloud-${_tag} on "; then
+        _ov_mnt=$(mount | grep "truecloud-${_tag} on " | awk '{print $3}' | head -1)
+        if umount "$_ov_mnt" 2>/dev/null; then
+            echo "  Unmounted: $_ov_mnt"
+        else
+            echo "  WARNING: Could not unmount overlay on $_ov_mnt"
+        fi
+        _ov_found=1
+    fi
+done
+if [ "$_ov_found" -eq 0 ]; then
+    echo "  None active."
+fi
+echo ""
+
 if [ "$_restore_failed" -eq 1 ]; then
     echo ""
     echo "ERROR: One or more UI bundle backups could not be restored." >&2
@@ -124,12 +150,6 @@ if [ "$_restore_failed" -eq 1 ]; then
     echo "  Restore the backup(s) manually, then re-run uninstall.sh." >&2
     exit 1
 fi
-
-if [ "$RESTORED" -eq 0 ]; then
-    echo "  No backup files found."
-    echo "  The UI patch will be undone automatically by the next TrueNAS update."
-fi
-echo ""
 
 # ── Remove patch directory ────────────────────────────────────────────────────
 

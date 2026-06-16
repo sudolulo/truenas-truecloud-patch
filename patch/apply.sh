@@ -40,6 +40,33 @@ if [ -f "$PATCH_DIR/disabled" ]; then
     exit 0
 fi
 
+# On TrueNAS 25.x+, /usr is an immutable read-only filesystem.
+# This function mounts a writable overlayfs on $1 using /run (tmpfs) for the
+# upper/work dirs.  The overlay is volatile per boot; this PREINIT script
+# recreates it on every boot before middlewared starts.
+# Returns 0 if the directory is now writable, 1 if it could not be made so.
+_ensure_writable() {
+    local dir="$1" tag="$2"
+    # Already writable?
+    if touch "$dir/.truecloud-probe" 2>/dev/null; then
+        rm -f "$dir/.truecloud-probe"
+        return 0
+    fi
+    # Already our overlay from an earlier run this boot?
+    if mount | grep -qF "truecloud-${tag} on "; then
+        return 0
+    fi
+    local upper="/run/truecloud-${tag}-upper" work="/run/truecloud-${tag}-work"
+    mkdir -p "$upper" "$work"
+    if mount -t overlay "truecloud-${tag}" \
+           -o "lowerdir=$dir,upperdir=$upper,workdir=$work" "$dir" 2>/dev/null; then
+        echo "OK: Mounted writable overlay on $dir (immutable filesystem)"
+        return 0
+    fi
+    echo "WARNING: $dir is read-only and overlay mount failed."
+    return 1
+}
+
 # Find the Python interpreter that middlewared actually uses.
 # On TrueNAS SCALE, /usr/bin/middlewared is usually a Python entry-point script
 # with a shebang pointing at the right interpreter (system or venv).
@@ -84,9 +111,16 @@ if [ -z "$SITE_PKG" ]; then
     echo "WARNING: Cannot determine site-packages directory; skipping backend patch."
     echo "  Run: $PYTHON -c \"import site; print(site.getsitepackages())\""
 else
-    # Back up any pre-existing sitecustomize.py that isn't ours.
     _can_install=true
-    if [ -f "$SITE_PKG/sitecustomize.py" ] && \
+    # On immutable OS, ensure site-packages is writable via overlay before
+    # attempting any writes (backup, tmp file, mv).
+    if ! _ensure_writable "$SITE_PKG" "sc"; then
+        _can_install=false
+    fi
+
+    # Back up any pre-existing sitecustomize.py that isn't ours.
+    if [ "$_can_install" = true ] && \
+       [ -f "$SITE_PKG/sitecustomize.py" ] && \
        ! grep -q "truecloud-patch" "$SITE_PKG/sitecustomize.py" 2>/dev/null; then
         if cp "$SITE_PKG/sitecustomize.py" \
               "$SITE_PKG/sitecustomize.py.pre-truecloud-patch"; then
@@ -123,6 +157,19 @@ fi
 # ── Step 2: Angular bundle ────────────────────────────────────────────────────
 
 echo "--- UI patch ---"
+
+# Ensure the webui directory is writable before patch_ui.py tries to create a
+# backup and write the patched bundle.  On immutable OS we mount an overlay.
+_webui_dir=""
+for _d in /usr/share/truenas/webui /usr/share/truenas-ui /var/www/truenas; do
+    if [ -d "$_d" ]; then
+        _webui_dir="$_d"
+        break
+    fi
+done
+if [ -n "$_webui_dir" ]; then
+    _ensure_writable "$_webui_dir" "ui" || true   # non-fatal; patch_ui.py reports the error
+fi
 
 "$PYTHON" "$PATCH_DIR/patch/patch_ui.py" || echo "WARNING: patch_ui.py exited non-zero; UI dropdown may still show Storj only."
 
