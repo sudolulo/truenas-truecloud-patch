@@ -101,8 +101,15 @@ cd /mnt/tank/truenas-truecloud-patch
 bash install.sh
 ```
 
-The directory you clone into becomes the permanent install location. The PREINIT
-boot hook points to it — **do not delete or move the repo after install.**
+The directory you clone into becomes the **permanent install location**. The
+PREINIT boot hook is registered with the exact path you chose, and TrueNAS will
+call that path on every boot.
+
+> **Do not delete or move the repository after install.**
+> If you need to relocate it, run `bash uninstall.sh` first, move the directory,
+> then run `bash install.sh` again from the new location. Deleting the repo
+> without uninstalling leaves a dangling PREINIT hook in the TrueNAS database —
+> if that happens, see [Emergency recovery](#emergency-recovery) below.
 
 Refresh your browser. S3 and B2 credentials now appear in the
 **Data Protection → TrueCloud Backup → Add** credential dropdown.
