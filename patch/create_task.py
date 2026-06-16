@@ -85,7 +85,7 @@ def make_client(host, api_key, insecure=False):
 # ── Sub-commands ──────────────────────────────────────────────────────────────
 
 def cmd_verify():
-    """Print the hook status written by sitecustomize.py at middlewared startup."""
+    """Print the hook status written by apply.sh at boot."""
     if not os.path.exists(_STATUS_FILE):
         print("No hook status file found.")
         print("Either the patch has never loaded (middlewared not yet restarted")

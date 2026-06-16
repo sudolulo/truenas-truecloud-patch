@@ -95,8 +95,6 @@ find_mw_python() {
     echo "$py"
 }
 
-# ── Step 1: backend patch ─────────────────────────────────────────────────────
-
 PYTHON=$(find_mw_python)
 echo "Using Python: $PYTHON"
 
