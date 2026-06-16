@@ -47,7 +47,8 @@ By installing this patch you accept the following:
 - **No warranty.** This software is provided as-is. See the LICENSE file.
 
 If TrueNAS adds native B2 or S3 support to TrueCloud Backup, the patch
-detects it and degrades gracefully — see [Native support](#if-truenas-adds-native-support) below.
+detects it at boot, disables itself, and tells you to run `uninstall.sh` —
+see [Native support](#if-truenas-adds-native-support) below.
 
 ---
 
@@ -79,14 +80,11 @@ support and the reason is logged to `apply.log` in your repo root.
 TrueNAS SCALE updates replace `/usr/` entirely. The patch survives by keeping
 this repository on a **persistent ZFS pool** (your data pool, not `/tmp` or a
 system path) and registering a **PREINIT initshutdownscript** in the TrueNAS
-database. On every boot, `patch/apply.sh` runs from the repo before
-`middlewared` starts, patching `b2.py` and `restic.py` directly in the overlay
-and re-patching the UI bundle.
-
-If `/usr` is a read-only filesystem, `apply.sh` handles this automatically by
-mounting a writable [overlayfs](https://docs.kernel.org/filesystems/overlayfs.html)
-on top of the relevant directories. The overlay lives in `/run` (tmpfs) and is
-recreated on every boot. No extra configuration is needed.
+database. On every boot, `patch/apply.sh` runs before `middlewared` starts. It
+mounts a writable [overlayfs](https://docs.kernel.org/filesystems/overlayfs.html)
+over the relevant directories (upper layer in `/run`, recreated each boot), then
+patches `b2.py` and `restic.py` directly in that overlay and re-patches the UI
+bundle. No extra configuration is needed.
 
 ---
 
@@ -257,22 +255,32 @@ restic -r "$REPO" ls latest
 
 ## If TrueNAS adds native support
 
-When a TrueNAS update ships native B2 or S3 support in TrueCloud Backup, the
-patch handles each component as follows:
+`apply.sh` checks at every boot whether TrueNAS has shipped native B2 restic
+support (by inspecting `B2RcloneRemote.__dict__`). If it has:
 
-| Component | What happens | Action needed |
+1. The kill switch (`disabled` file) is set — no patching on any future boot.
+2. Any active overlays are unmounted immediately.
+3. The following message is written to `apply.log`:
+
+```
+NOTICE: TrueNAS now provides native B2 restic support — truecloud-patch is no longer needed.
+NOTICE: Setting kill switch; patching will be skipped on all future boots.
+NOTICE: Run the following to fully remove the patch:
+NOTICE:   bash /mnt/tank/truenas-truecloud-patch/uninstall.sh
+```
+
+Check the log after any TrueNAS update:
+```bash
+cat /mnt/tank/truenas-truecloud-patch/apply.log | tail -20
+```
+
+**Scenarios where the auto-detect may not fire** (manual check needed):
+
+| Scenario | What happens | Action |
 |---|---|---|
-| **B2 `get_restic_config`** added directly to `B2RcloneRemote` | `__dict__` guard detects it; our method is **not attached** | None — native version used automatically |
-| **restic.py URL builder** fixed to emit `b2:bucket:path` directly | Our wrapper sees no `/` to fix; it becomes a **no-op** | None — correct URL passes through unchanged |
-| **`get_restic_config` moved** out of `restic.py` entirely | `NameError` guard in the patched file catches it; wrapper silently does nothing | None — but run `verify` to confirm state |
-| **B2 credential schema changed** (e.g. `provider["account"]` renamed) | Our B2 config function raises `KeyError`; backup task fails | Uninstall or update the patch |
-| **B2 `get_restic_config`** added to a **base class** (not `B2RcloneRemote`) | `__dict__` check misses it; our method is attached and **shadows** the native one | Uninstall the patch |
-
-**Recommended check after any TrueNAS update that adds TrueCloud provider
-support**: run `python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify`
-and attempt a B2 backup. If both pass, the patch is coexisting correctly. If
-the backup fails with a credential or URL error that worked before the update,
-uninstall the patch — TrueNAS has shipped a conflicting implementation.
+| B2 support added to a **base class** (not `B2RcloneRemote` directly) | `__dict__` check misses it; our method shadows native | Uninstall manually |
+| B2 **credential schema changed** (e.g. `provider["account"]` renamed) | `KeyError` on first backup | Uninstall or update the patch |
+| **URL builder** fixed but B2 class unchanged | URL wrapper becomes a no-op; no harm, but patch is dead weight | Uninstall at your convenience |
 
 ---
 

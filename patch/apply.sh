@@ -57,10 +57,10 @@ _ensure_writable() {
     mkdir -p "$upper" "$work"
     if mount -t overlay "truecloud-${tag}" \
            -o "lowerdir=$dir,upperdir=$upper,workdir=$work" "$dir" 2>/dev/null; then
-        echo "OK: Mounted writable overlay on $dir (immutable filesystem)"
+        echo "OK: Mounted writable overlay on $dir"
         return 0
     fi
-    echo "WARNING: $dir is read-only and overlay mount failed."
+    echo "WARNING: overlay mount failed on $dir — backend patch will be skipped."
     return 1
 }
 
@@ -97,10 +97,40 @@ find_mw_python() {
 
 # ── Step 1: backend patch ─────────────────────────────────────────────────────
 
-echo "--- backend patch ---"
-
 PYTHON=$(find_mw_python)
 echo "Using Python: $PYTHON"
+
+# ── Native support check ──────────────────────────────────────────────────────
+# If TrueNAS has shipped native B2 restic support, this patch is no longer
+# needed. Set the kill switch and instruct the user to uninstall cleanly.
+
+_tc_native=$("$PYTHON" -c "
+try:
+    from middlewared.rclone.remote.b2 import B2RcloneRemote
+    print('yes' if 'get_restic_config' in B2RcloneRemote.__dict__ else 'no')
+except Exception:
+    print('no')
+" 2>/dev/null || echo "no")
+
+if [ "$_tc_native" = "yes" ]; then
+    echo "NOTICE: TrueNAS now provides native B2 restic support — truecloud-patch is no longer needed."
+    echo "NOTICE: Setting kill switch; patching will be skipped on all future boots."
+    echo "NOTICE: Run the following to fully remove the patch:"
+    echo "NOTICE:   bash $PATCH_DIR/uninstall.sh"
+    touch "$PATCH_DIR/disabled"
+    for _tag in mw ui; do
+        if mount | grep -qF "truecloud-${_tag} on "; then
+            _mnt=$(mount | grep "truecloud-${_tag} on " | awk '{print $3}' | head -1)
+            umount "$_mnt" 2>/dev/null && echo "NOTICE: Unmounted overlay on $_mnt" || true
+        fi
+    done
+    echo "=== done ==="
+    exit 0
+fi
+
+# ── Step 1: backend patch ─────────────────────────────────────────────────────
+
+echo "--- backend patch ---"
 
 # Derive site-packages from where middlewared actually lives.
 # getsitepackages()[0] may return the wrong directory; using middlewared.__file__
@@ -109,8 +139,6 @@ SITE_PKG=$("$PYTHON" -c "
 import os
 try:
     import middlewared
-    # e.g. /usr/lib/python3/dist-packages/middlewared/__init__.py
-    #   -> /usr/lib/python3/dist-packages/
     print(os.path.dirname(os.path.dirname(os.path.abspath(middlewared.__file__))))
 except ImportError:
     import site
