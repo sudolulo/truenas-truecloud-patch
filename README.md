@@ -60,7 +60,7 @@ on every update) and are therefore re-applied automatically on every boot.
 | Layer | What changes | Technique |
 |---|---|---|
 | **Backend** | `B2RcloneRemote` gains `get_restic_config()`. `restic.py` URL builder is fixed for providers with no hostname component (`b2:bucket/path` vs the broken `b2:/bucket/path`). | `sitecustomize.py` — Python's standard startup hook; no middleware files are modified on disk |
-| **UI** | The Angular bundle's `filterByProviders` binding is widened from `["STORJ_IX"]` to `["STORJ_IX","S3","B2"]` | In-place text replacement in the compiled JS bundle; original is backed up |
+| **UI** | The Angular bundle's `filterByProviders` binding is widened from `["STORJ_IX"]` to `["STORJ_IX","S3","B2"]` | In-place text replacement in the compiled JS chunk; original is backed up |
 
 Both changes are **fail-safe**: if a patch cannot be applied (e.g. TrueNAS
 restructured the relevant code), middlewared starts normally with Storj-only
@@ -83,13 +83,20 @@ database. On every boot, `patch/apply.sh` runs from the repo before
 `middlewared` starts, placing `sitecustomize.py` in the correct site-packages
 directory and re-patching the UI bundle.
 
+**TrueNAS 25.x — immutable `/usr`:** Starting with TrueNAS 25.x, `/usr` is a
+read-only filesystem. `apply.sh` handles this automatically by mounting a
+writable [overlayfs](https://docs.kernel.org/filesystems/overlayfs.html) on
+top of the relevant directories before writing to them. The overlay lives in
+`/run` (tmpfs) and is recreated on every boot. No extra configuration is
+needed.
+
 ## Python version compatibility
 
 `sitecustomize.py` uses the `find_spec` / `exec_module` import hook API
 (introduced in Python 3.4, required from Python 3.12 onwards). This covers:
 
 - TrueNAS SCALE 24.x — Debian 12, Python 3.11 ✓
-- TrueNAS SCALE 25.x — Debian 13, Python 3.12 ✓
+- TrueNAS SCALE 25.x — Debian 13, Python 3.11 ✓ (immutable `/usr` handled via overlayfs)
 
 ---
 
@@ -360,6 +367,9 @@ If one or more entries show `[FAIL]`:
    ```
 2. **Check middlewared's own log** for Python tracebacks:
    ```bash
+   # TrueNAS 25.x (logs to file):
+   grep -i "truecloud\|traceback\|error" /var/log/middlewared/middlewared.log 2>/dev/null | tail -30
+   # Older TrueNAS (logs to journal):
    journalctl -u middlewared -n 50
    ```
 3. **A FAIL is non-fatal.** middlewared runs normally; the affected provider
@@ -382,12 +392,25 @@ cat /mnt/tank/truenas-truecloud-patch/apply.log
 ```bash
 python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify
 ```
-This reads `hook_status.json` in your repo root, written by the import
-hook once both target modules have been loaded by middlewared. If it reports
-"No hook status file found" immediately after install, restart middlewared
-and try again — the file is written when middlewared imports the relevant
-modules, which happens at service start.
+This reads `hook_status.json` in your repo root. The file is written by the
+import hook the first time middlewared imports each patched module. These
+modules are loaded lazily — they are not imported at service start, only when
+a TrueCloud Backup operation runs (task creation, credential listing, backup
+execution). If `verify` reports "No hook status file found" immediately after
+install, that is normal: navigate to **Data Protection → TrueCloud Backup** in
+the UI or run a backup task to trigger the import, then run `verify` again.
 Does not require `--host` or `--api-key`.
+
+**Middlewared log** (TrueNAS 25.x — middlewared logs to a file, not the journal):
+```bash
+find /var/log/middlewared -name "*.log" 2>/dev/null | head -3
+# then:
+grep truecloud-patch /var/log/middlewared/middlewared.log 2>/dev/null | tail -20
+```
+On older TrueNAS versions that log to the journal:
+```bash
+journalctl -u middlewared -n 100 | grep truecloud-patch
+```
 
 **Verify the UI patch** (should print your TrueNAS version):
 ```bash
