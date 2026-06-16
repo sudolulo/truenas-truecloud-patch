@@ -6,9 +6,8 @@
 #
 # TrueNAS updates replace /usr/ entirely; this script re-applies two patches:
 #
-#   1. sitecustomize.py  — Python executes this automatically at startup.
-#                          Monkey-patches B2 restic support and fixes the
-#                          URL builder for empty-host providers.
+#   1. Backend — b2.py and restic.py are patched directly in the overlay.
+#      sitecustomize.py is also installed as belt-and-suspenders.
 #
 #   2. Angular JS bundle — Widens the TrueCloud Backup credential dropdown
 #                          from Storj-only to include S3 and B2.
@@ -52,8 +51,8 @@ _ensure_writable() {
         rm -f "$dir/.truecloud-probe"
         return 0
     fi
-    # Already our overlay from an earlier run this boot?
-    if mount | grep -qF "truecloud-${tag} on "; then
+    # Already our overlay on this exact directory from an earlier run this boot?
+    if mount | grep -qF "truecloud-${tag} on ${dir} "; then
         return 0
     fi
     local upper="/run/truecloud-${tag}-upper" work="/run/truecloud-${tag}-work"
@@ -98,14 +97,42 @@ find_mw_python() {
     echo "$py"
 }
 
-# ── Step 1: sitecustomize.py ──────────────────────────────────────────────────
+# ── Step 1: backend patch ─────────────────────────────────────────────────────
 
 echo "--- backend patch ---"
 
 PYTHON=$(find_mw_python)
 echo "Using Python: $PYTHON"
 
-SITE_PKG=$("$PYTHON" -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || true)
+# Derive site-packages from where middlewared actually lives.
+# On TrueNAS 25.x, middlewared is in /usr/lib/python3/dist-packages/, while
+# getsitepackages()[0] typically returns /usr/local/lib/python3.11/dist-packages/
+# — the wrong directory.  Using middlewared.__file__ ensures we install
+# sitecustomize.py and patch files in the directory Python will actually read.
+SITE_PKG=$("$PYTHON" -c "
+import os
+try:
+    import middlewared
+    # e.g. /usr/lib/python3/dist-packages/middlewared/__init__.py
+    #   -> /usr/lib/python3/dist-packages/
+    print(os.path.dirname(os.path.dirname(os.path.abspath(middlewared.__file__))))
+except ImportError:
+    import site
+    print(site.getsitepackages()[0])
+" 2>/dev/null || true)
+
+# MW_DIR is the middlewared package directory itself (one level below SITE_PKG).
+_MW_DIR=$("$PYTHON" -c "
+import os
+try:
+    import middlewared
+    print(os.path.dirname(os.path.abspath(middlewared.__file__)))
+except ImportError:
+    pass
+" 2>/dev/null || true)
+
+_b2_ok=0
+_restic_ok=0
 
 if [ -z "$SITE_PKG" ]; then
     echo "WARNING: Cannot determine site-packages directory; skipping backend patch."
@@ -113,7 +140,7 @@ if [ -z "$SITE_PKG" ]; then
 else
     _can_install=true
     # On immutable OS, ensure site-packages is writable via overlay before
-    # attempting any writes (backup, tmp file, mv).
+    # attempting any writes.
     if ! _ensure_writable "$SITE_PKG" "sc"; then
         _can_install=false
     fi
@@ -134,10 +161,6 @@ else
     if [ "$_can_install" = true ]; then
         # Substitute PATCH_DIR into the source so sitecustomize.py knows where
         # to write hook_status.json and check the kill switch at runtime.
-        # Pass PATCH_DIR via env var so arbitrary path characters don't break
-        # the substitution (sed metacharacters & and | are unsafe in shell-
-        # interpolated replacement strings).  Write to a temp file first so a
-        # failed substitution never truncates the existing sitecustomize.py.
         _sc_tmp="$SITE_PKG/sitecustomize.py.truecloud-tmp"
         if TRUECLOUD_PATCH_DIR="$PATCH_DIR" \
                "$PYTHON" -c "
@@ -152,6 +175,129 @@ with open(d + '/patch/sitecustomize.py', encoding='utf-8') as fh:
             echo "WARNING: Failed to write $SITE_PKG/sitecustomize.py (permission error?)"
         fi
     fi
+
+    # ── Direct file patching ──────────────────────────────────────────────────
+    # Append a marker block to b2.py and restic.py in the overlay (primary
+    # approach).  This is simpler than the sitecustomize.py import hook and
+    # works regardless of how Python's site initialisation is configured.
+    # apply.sh re-patches on every boot; the overlay is volatile (tmpfs).
+
+    if [ -n "$_MW_DIR" ] && [ "$_can_install" = true ]; then
+        _B2_PY="$_MW_DIR/rclone/remote/b2.py"
+        _RESTIC_PY="$_MW_DIR/plugins/cloud_backup/restic.py"
+
+        # ── b2.py ─────────────────────────────────────────────────────────────
+        if [ -f "$_B2_PY" ]; then
+            if grep -q "TRUECLOUD_PATCH" "$_B2_PY" 2>/dev/null; then
+                echo "OK: b2.py already patched"
+                _b2_ok=1
+            else
+                cat >> "$_B2_PY" << 'B2_PATCH'
+
+# TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
+def _tc_get_restic_config(task):
+    p = task["credentials"]["provider"]
+    return "", {"B2_ACCOUNT_ID": p["account"], "B2_ACCOUNT_KEY": p["key"]}
+
+if not hasattr(B2RcloneRemote, "get_restic_config"):
+    B2RcloneRemote.get_restic_config = staticmethod(_tc_get_restic_config)
+    B2RcloneRemote.restic = True
+B2_PATCH
+                if [ $? -eq 0 ]; then
+                    echo "OK: Patched b2.py → $_B2_PY"
+                    _b2_ok=1
+                else
+                    echo "WARNING: Failed to write to b2.py (overlay not writable?)"
+                fi
+            fi
+        else
+            echo "WARNING: b2.py not found at $_B2_PY"
+        fi
+
+        # ── restic.py ─────────────────────────────────────────────────────────
+        if [ -f "$_RESTIC_PY" ]; then
+            if grep -q "TRUECLOUD_PATCH" "$_RESTIC_PY" 2>/dev/null; then
+                echo "OK: restic.py already patched"
+                _restic_ok=1
+            else
+                cat >> "$_RESTIC_PY" << 'RESTIC_PATCH'
+
+# TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
+_tc_orig_get_restic_config = get_restic_config
+
+def get_restic_config(cloud_backup):
+    import dataclasses as _dc
+    result = _tc_orig_get_restic_config(cloud_backup)
+    cmd = list(result.cmd)
+    for i, part in enumerate(cmd):
+        if part.startswith("--repo=") or part.startswith("--repository="):
+            prefix, _, url = part.partition("=")
+            prefix += "="
+            scheme, sep, rest = url.partition(":")
+            if sep and rest.startswith("/") and not rest.startswith("//"):
+                cmd[i] = f"{prefix}{scheme}:{rest[1:]}"
+                try:
+                    return _dc.replace(result, cmd=cmd)
+                except TypeError:
+                    return result._replace(cmd=cmd)
+            break
+        if i and cmd[i - 1] in ("-r", "--repo", "--repository"):
+            scheme, sep, rest = part.partition(":")
+            if sep and rest.startswith("/") and not rest.startswith("//"):
+                cmd[i] = f"{scheme}:{rest[1:]}"
+                try:
+                    return _dc.replace(result, cmd=cmd)
+                except TypeError:
+                    return result._replace(cmd=cmd)
+            break
+    return result
+
+get_restic_config._truecloud_patched = True
+RESTIC_PATCH
+                if [ $? -eq 0 ]; then
+                    echo "OK: Patched restic.py → $_RESTIC_PY"
+                    _restic_ok=1
+                else
+                    echo "WARNING: Failed to write to restic.py (overlay not writable?)"
+                fi
+            fi
+        else
+            echo "WARNING: restic.py not found at $_RESTIC_PY"
+        fi
+    elif [ -z "$_MW_DIR" ]; then
+        echo "WARNING: Cannot determine middlewared directory; skipping direct file patch."
+    fi
+
+    # Write hook_status.json so 'verify' reflects the current patch state
+    # without requiring a backup run to trigger the import hook.
+    "$PYTHON" -c "
+import json, os, sys, time
+b2_ok = sys.argv[1] == '1'
+restic_ok = sys.argv[2] == '1'
+patches = {
+    'middlewared.rclone.remote.b2': {
+        'ok': b2_ok,
+        'detail': ('patched on disk in overlay at boot' if b2_ok
+                   else 'b2.py not found or write failed'),
+    },
+    'middlewared.plugins.cloud_backup.restic': {
+        'ok': restic_ok,
+        'detail': ('patched on disk in overlay at boot' if restic_ok
+                   else 'restic.py not found or write failed'),
+    },
+}
+payload = {'patched_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+           'patches': patches}
+sf = sys.argv[3]
+tmp = sf + '.tmp'
+try:
+    with open(tmp, 'w') as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, sf)
+    print('OK: Wrote hook_status.json')
+except OSError as e:
+    print(f'WARNING: Could not write hook_status.json: {e}')
+" "$_b2_ok" "$_restic_ok" "$PATCH_DIR/hook_status.json" || true
 fi
 
 # ── Step 2: Angular bundle ────────────────────────────────────────────────────

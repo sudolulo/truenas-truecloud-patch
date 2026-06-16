@@ -67,7 +67,15 @@ if ! "$PYTHON" -c "import middlewared" 2>/dev/null; then
     fi
 fi
 
-SITE_PKG=$("$PYTHON" -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || true)
+SITE_PKG=$("$PYTHON" -c "
+import os
+try:
+    import middlewared
+    print(os.path.dirname(os.path.dirname(os.path.abspath(middlewared.__file__))))
+except ImportError:
+    import site
+    print(site.getsitepackages()[0])
+" 2>/dev/null || true)
 
 if [ -n "$SITE_PKG" ] && [ -f "$SITE_PKG/sitecustomize.py" ]; then
     if grep -q "truecloud-patch" "$SITE_PKG/sitecustomize.py" 2>/dev/null; then

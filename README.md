@@ -368,7 +368,7 @@ If one or more entries show `[FAIL]`:
 2. **Check middlewared's own log** for Python tracebacks:
    ```bash
    # TrueNAS 25.x (logs to file):
-   grep -i "truecloud\|traceback\|error" /var/log/middlewared/middlewared.log 2>/dev/null | tail -30
+   grep -i "truecloud\|traceback\|error" /var/log/middlewared.log 2>/dev/null | tail -30
    # Older TrueNAS (logs to journal):
    journalctl -u middlewared -n 50
    ```
@@ -392,20 +392,14 @@ cat /mnt/tank/truenas-truecloud-patch/apply.log
 ```bash
 python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify
 ```
-This reads `hook_status.json` in your repo root. The file is written by the
-import hook the first time middlewared imports each patched module. These
-modules are loaded lazily — they are not imported at service start, only when
-a TrueCloud Backup operation runs (task creation, credential listing, backup
-execution). If `verify` reports "No hook status file found" immediately after
-install, that is normal: navigate to **Data Protection → TrueCloud Backup** in
-the UI or run a backup task to trigger the import, then run `verify` again.
-Does not require `--host` or `--api-key`.
+This reads `hook_status.json` in your repo root. The file is written by
+`apply.sh` at install/boot time and reflects whether the direct file patches
+to `b2.py` and `restic.py` were applied successfully. Does not require
+`--host` or `--api-key`.
 
 **Middlewared log** (TrueNAS 25.x — middlewared logs to a file, not the journal):
 ```bash
-find /var/log/middlewared -name "*.log" 2>/dev/null | head -3
-# then:
-grep truecloud-patch /var/log/middlewared/middlewared.log 2>/dev/null | tail -20
+grep truecloud-patch /var/log/middlewared.log 2>/dev/null | tail -20
 ```
 On older TrueNAS versions that log to the journal:
 ```bash
