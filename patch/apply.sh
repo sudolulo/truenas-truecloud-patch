@@ -104,8 +104,14 @@ echo "Using Python: $PYTHON"
 
 _tc_native=$("$PYTHON" -c "
 try:
+    import inspect
+    import middlewared.rclone.remote.b2 as _b2_mod
     from middlewared.rclone.remote.b2 import B2RcloneRemote
-    print('yes' if 'get_restic_config' in B2RcloneRemote.__dict__ else 'no')
+    if 'get_restic_config' not in B2RcloneRemote.__dict__:
+        print('no')
+    else:
+        src = open(inspect.getfile(_b2_mod), encoding='utf-8', errors='replace').read()
+        print('no' if 'TRUECLOUD_PATCH' in src else 'yes')
 except Exception:
     print('no')
 " 2>/dev/null || echo "no")
