@@ -83,20 +83,16 @@ database. On every boot, `patch/apply.sh` runs from the repo before
 `middlewared` starts, placing `sitecustomize.py` in the correct site-packages
 directory and re-patching the UI bundle.
 
-**TrueNAS 25.x — immutable `/usr`:** Starting with TrueNAS 25.x, `/usr` is a
-read-only filesystem. `apply.sh` handles this automatically by mounting a
-writable [overlayfs](https://docs.kernel.org/filesystems/overlayfs.html) on
-top of the relevant directories before writing to them. The overlay lives in
-`/run` (tmpfs) and is recreated on every boot. No extra configuration is
-needed.
+If `/usr` is a read-only filesystem, `apply.sh` handles this automatically by
+mounting a writable [overlayfs](https://docs.kernel.org/filesystems/overlayfs.html)
+on top of the relevant directories. The overlay lives in `/run` (tmpfs) and is
+recreated on every boot. No extra configuration is needed.
 
 ## Python version compatibility
 
 `sitecustomize.py` uses the `find_spec` / `exec_module` import hook API
-(introduced in Python 3.4, required from Python 3.12 onwards). This covers:
-
-- TrueNAS SCALE 24.x — Debian 12, Python 3.11 ✓
-- TrueNAS SCALE 25.x — Debian 13, Python 3.11 ✓ (immutable `/usr` handled via overlayfs)
+(Python 3.4+; the older `load_module` form was removed in Python 3.12).
+Compatible with all Python versions shipped by TrueNAS SCALE.
 
 ---
 
@@ -361,7 +357,7 @@ is straightforward:
 
 ```bash
 # Find the backup (the path varies by TrueNAS version):
-find /usr/share/truenas /var/www/truenas -name "*.js.pre-truecloud-patch" 2>/dev/null
+find /usr/share/truenas /usr/share/truenas-ui /var/www/truenas -name "*.js.pre-truecloud-patch" 2>/dev/null
 
 # Restore it — substitute the actual path from the find output:
 mv /usr/share/truenas/webui/main.XXXXXXXX.js.pre-truecloud-patch \
@@ -388,9 +384,7 @@ If one or more entries show `[FAIL]`:
    ```
 2. **Check middlewared's own log** for Python tracebacks:
    ```bash
-   # TrueNAS 25.x (logs to file):
    grep -i "truecloud\|traceback\|error" /var/log/middlewared.log 2>/dev/null | tail -30
-   # Older TrueNAS (logs to journal):
    journalctl -u middlewared -n 50
    ```
 3. **A FAIL is non-fatal.** middlewared runs normally; the affected provider
@@ -418,13 +412,10 @@ This reads `hook_status.json` in your repo root. The file is written by
 to `b2.py` and `restic.py` were applied successfully. Does not require
 `--host` or `--api-key`.
 
-**Middlewared log** (TrueNAS 25.x — middlewared logs to a file, not the journal):
+**Middlewared log:**
 ```bash
 grep truecloud-patch /var/log/middlewared.log 2>/dev/null | tail -20
-```
-On older TrueNAS versions that log to the journal:
-```bash
-journalctl -u middlewared -n 100 | grep truecloud-patch
+journalctl -u middlewared -n 100 2>/dev/null | grep truecloud-patch
 ```
 
 **Verify the UI patch** (should print your TrueNAS version):
