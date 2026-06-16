@@ -107,18 +107,6 @@ boot hook points to it — **do not delete or move the repo after install.**
 Refresh your browser. S3 and B2 credentials now appear in the
 **Data Protection → TrueCloud Backup → Add** credential dropdown.
 
-## Creating a credential
-
-Before creating a backup task, add a credential in the TrueNAS UI:
-
-**Data Protection → TrueCloud Backup → Add → (create new credential)**
-
-Or use **Credentials → Backup Credentials → Cloud Credentials → Add** and
-select B2 or Amazon S3.
-
-For S3-compatible providers, select **Amazon S3**, then set a custom endpoint
-in the credential's advanced settings (e.g. `https://s3.wasabisys.com`).
-
 ## Creating a task via CLI
 
 If the UI still shows only Storj after refreshing (e.g. the JS bundle pattern
@@ -156,100 +144,6 @@ bash /mnt/tank/truenas-truecloud-patch/uninstall.sh
 Replace the path with your clone location. Removes the PREINIT hook,
 unmounts the overlay (restoring the original backend files immediately),
 and restores the original UI bundle from backup.
-
----
-
-## Restoring from a TrueCloud Backup
-
-TrueCloud Backup uses [restic](https://restic.net/) under the hood. Restores
-are done with the `restic` command directly — TrueNAS does not yet expose a
-restore UI for TrueCloud Backup tasks.
-
-### 1. Find the restic binary
-
-```bash
-which restic 2>/dev/null || find /usr -name restic -type f 2>/dev/null | head -1
-```
-
-Use that path in the commands below (referred to as `restic`).
-
-### 2. Gather your repository details
-
-You need three things from the task you created:
-
-| Detail | Where to find it |
-|---|---|
-| **Bucket** and **folder** | TrueNAS UI → Data Protection → TrueCloud Backup → edit the task → Attributes |
-| **Credentials** (key ID + secret) | TrueNAS UI → Credentials → Backup Credentials → edit the credential |
-| **Repository password** | The `--password` value you supplied when creating the task |
-
-### 3. Set environment variables
-
-**Backblaze B2:**
-```bash
-export B2_ACCOUNT_ID="your-key-id"
-export B2_ACCOUNT_KEY="your-application-key"
-export RESTIC_PASSWORD="your-repo-password"
-REPO="b2:your-bucket:your-folder"   # restic 0.16.x uses colon, not slash
-```
-
-**S3-compatible (AWS S3, Wasabi, Cloudflare R2, MinIO, etc.):**
-```bash
-export AWS_ACCESS_KEY_ID="your-access-key"
-export AWS_SECRET_ACCESS_KEY="your-secret-key"
-export RESTIC_PASSWORD="your-repo-password"
-# Use just the hostname as the endpoint — no https:// prefix:
-REPO="s3:s3.wasabisys.com/your-bucket/your-folder"   # Wasabi example
-# REPO="s3:s3.amazonaws.com/your-bucket/your-folder" # AWS S3
-# REPO="s3:<account>.r2.cloudflarestorage.com/your-bucket/your-folder" # R2
-```
-
-### 4. List snapshots
-
-```bash
-restic -r "$REPO" snapshots
-```
-
-Output example:
-```
-ID        Time                 Host        Tags  Paths
-──────────────────────────────────────────────────────────
-a1b2c3d4  2026-06-01 02:00:05  truenas           /mnt/tank/data
-e5f6a7b8  2026-06-08 02:00:07  truenas           /mnt/tank/data
-```
-
-### 5. Restore files
-
-**Restore everything from the latest snapshot to a temporary location:**
-```bash
-restic -r "$REPO" restore latest --target /mnt/tank/restore-tmp
-```
-
-**Restore a specific snapshot by ID:**
-```bash
-restic -r "$REPO" restore a1b2c3d4 --target /mnt/tank/restore-tmp
-```
-
-**Restore only specific paths from within a snapshot:**
-```bash
-restic -r "$REPO" restore latest \
-    --include /mnt/tank/data/important-dir \
-    --target /mnt/tank/restore-tmp
-```
-
-**Browse a snapshot without extracting (useful for finding the right file):**
-```bash
-restic -r "$REPO" ls latest
-```
-
-### 6. Notes
-
-- Restore to a **different path** first, then move files into place after
-  verifying. Restoring directly over a live dataset can cause data loss if
-  the snapshot is incomplete or from the wrong point in time.
-- If you created the task with `--snapshot` (ZFS snapshot before each run),
-  the restic snapshot captures the dataset at a consistent point in time.
-- Use `restic check -r "$REPO"` periodically to verify repository integrity.
 
 ---
 
@@ -424,15 +318,6 @@ grep -c 'STORJ_IX.*S3.*B2' \
     $(find /usr/share/truenas -name '*.js' 2>/dev/null) 2>/dev/null \
     | grep -v ':0'
 ```
-
-**B2 backup fails with credential error**
-Confirm the credential type is exactly `B2` (not `S3` with a B2 endpoint).
-B2's native restic backend uses a different auth path than S3-compatible B2.
-
-**S3-compatible backup fails**
-S3 support already existed in the backend — the credential setup is the likely
-issue. Verify the endpoint URL, access key, secret key, and bucket name in
-the credential settings.
 
 **`create_task.py` SSL error connecting to TrueNAS**
 `create_task.py` talks to the **TrueNAS API**, not your S3 endpoint, and
