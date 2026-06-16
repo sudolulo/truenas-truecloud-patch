@@ -106,8 +106,8 @@ echo "Applying patches ..."
 _log_start=$(wc -c < "$PATCH_DIR/apply.log" 2>/dev/null || echo 0)
 bash "$PATCH_DIR/patch/apply.sh"
 echo ""
-echo "Patch log ($PATCH_DIR/apply.log):"
-tail -30 "$PATCH_DIR/apply.log"
+echo "Patch log (this run):"
+tail -c "+$((_log_start + 1))" "$PATCH_DIR/apply.log" 2>/dev/null || true
 echo ""
 if tail -c "+$((_log_start + 1))" "$PATCH_DIR/apply.log" 2>/dev/null | grep -qE "WARNING:|ERROR:"; then
     echo "WARNING: apply.sh reported one or more issues — see log above for details."
