@@ -103,7 +103,8 @@ fi
 # ── Apply now ─────────────────────────────────────────────────────────────────
 
 echo "Applying patches ..."
-_log_start=$(wc -c < "$PATCH_DIR/apply.log" 2>/dev/null || echo 0)
+_log_start=0
+[ -f "$PATCH_DIR/apply.log" ] && _log_start=$(wc -c < "$PATCH_DIR/apply.log")
 bash "$PATCH_DIR/patch/apply.sh"
 echo ""
 echo "Patch log (this run):"

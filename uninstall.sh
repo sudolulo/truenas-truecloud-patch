@@ -97,14 +97,6 @@ if [ "$_restore_failed" -eq 1 ]; then
     exit 1
 fi
 
-# ── Remove patch directory ────────────────────────────────────────────────────
-
-if [ -d "$PATCH_DIR" ]; then
-    rm -rf "$PATCH_DIR"
-    echo "Removed $PATCH_DIR"
-fi
-echo ""
-
 echo "Restarting middlewared ..."
 if systemctl restart middlewared; then
     echo ""
