@@ -18,6 +18,7 @@
 # Derive PATCH_DIR from this script's location (parent of the patch/ directory).
 PATCH_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="$PATCH_DIR/apply.log"
+VERSION="0.0.2"
 
 # Rotate log at 512 KB to avoid unbounded growth on a system volume.
 # Keep two prior generations (.1 and .2) so the last three boots are always available.
@@ -27,7 +28,7 @@ if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 524288 ]; then
 fi
 
 exec >> "$LOG" 2>&1
-echo "=== $(date -Iseconds) ==="
+echo "=== $(date -Iseconds) [v${VERSION}] ==="
 
 # Kill switch: if this file exists, skip all patching and exit cleanly.
 # Recovery: touch "$PATCH_DIR/disabled" (then reboot or restart middlewared).

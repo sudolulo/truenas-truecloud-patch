@@ -120,6 +120,30 @@ call that path on every boot.
 Refresh your browser. S3 and B2 credentials now appear in the
 **Data Protection → TrueCloud Backup → Add** credential dropdown.
 
+## Updating
+
+To update to a new version of the patch:
+
+```bash
+cd /mnt/tank/truenas-truecloud-patch
+
+# If install.sh was previously run as root, the .git directory may be owned
+# by root. Fix it first, or just pull as root:
+sudo git pull          # easiest option
+# — or —
+sudo chown -R $(whoami) .git && git pull
+
+bash install.sh
+```
+
+`install.sh` clears any stale kill switch, re-applies the updated patches,
+and restarts middlewared. Run `python3 patch/create_task.py verify` afterwards
+to confirm the patches loaded successfully.
+
+Check [CHANGELOG.md](CHANGELOG.md) to see what changed between versions.
+
+---
+
 ## Creating a task via CLI
 
 If the UI still shows only Storj after refreshing (e.g. the JS bundle pattern

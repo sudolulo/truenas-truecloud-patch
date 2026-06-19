@@ -16,7 +16,12 @@
 #   rm /mnt/tank/truenas-truecloud-patch/disabled
 #   bash /mnt/tank/truenas-truecloud-patch/patch/apply.sh
 
+VERSION="0.0.2"
+
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+echo "=== TrueNAS TrueCloud Provider Patch v${VERSION} — Recover ==="
+echo ""
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "ERROR: must be run as root." >&2

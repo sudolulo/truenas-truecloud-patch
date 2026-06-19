@@ -16,6 +16,8 @@
 
 set -euo pipefail
 
+VERSION="0.0.2"
+
 # The directory containing install.sh is the permanent install location.
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 _HOOK_COMMENT='TrueCloud provider patch (S3/B2)'
@@ -29,7 +31,7 @@ if [ ! -f "$PATCH_DIR/patch/apply.sh" ]; then
     exit 1
 fi
 
-echo "=== TrueNAS TrueCloud Provider Patch — Install ==="
+echo "=== TrueNAS TrueCloud Provider Patch v${VERSION} — Install ==="
 echo ""
 
 # ── Preflight ─────────────────────────────────────────────────────────────────

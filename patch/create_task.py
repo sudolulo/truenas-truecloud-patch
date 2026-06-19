@@ -48,6 +48,8 @@ import sys
 import urllib.error
 import urllib.request
 
+__version__ = "0.0.2"
+
 _PATCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _STATUS_FILE = os.path.join(_PATCH_DIR, "hook_status.json")
 
@@ -194,6 +196,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("Examples")[1] if __doc__ and "Examples" in __doc__ else "",
     )
+    p.add_argument("--version", "-V", action="version", version=f"truecloud-patch {__version__}")
     p.add_argument("--host", default=None, metavar="HOST",
                    help="TrueNAS hostname or IP address (required except for verify)")
     p.add_argument("--api-key", default=None, metavar="KEY",

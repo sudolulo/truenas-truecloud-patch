@@ -3,10 +3,12 @@
 
 set -euo pipefail
 
+VERSION="0.0.2"
+
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 _HOOK_COMMENT='TrueCloud provider patch (S3/B2)'
 
-echo "=== TrueNAS TrueCloud Provider Patch — Uninstall ==="
+echo "=== TrueNAS TrueCloud Provider Patch v${VERSION} — Uninstall ==="
 echo ""
 
 if [ "$(id -u)" -ne 0 ]; then
