@@ -111,7 +111,15 @@ try:
         print('no')
     else:
         src = open(inspect.getfile(_b2_mod), encoding='utf-8', errors='replace').read()
-        print('no' if 'TRUECLOUD_PATCH' in src else 'yes')
+        if 'TRUECLOUD_PATCH' in src:
+            print('no')
+        else:
+            # Distinguish a real implementation from a stub that raises NotImplementedError.
+            try:
+                method_src = inspect.getsource(B2RcloneRemote.get_restic_config)
+            except (OSError, TypeError):
+                method_src = ''
+            print('no' if 'NotImplementedError' in method_src else 'yes')
 except Exception:
     print('no')
 " 2>/dev/null || echo "no")
@@ -184,9 +192,8 @@ def _tc_get_restic_config(task):
     p = task["credentials"]["provider"]
     return "", {"B2_ACCOUNT_ID": p["account"], "B2_ACCOUNT_KEY": p["key"]}
 
-if "get_restic_config" not in B2RcloneRemote.__dict__:
-    B2RcloneRemote.get_restic_config = staticmethod(_tc_get_restic_config)
-    B2RcloneRemote.restic = True
+B2RcloneRemote.get_restic_config = staticmethod(_tc_get_restic_config)
+B2RcloneRemote.restic = True
 """
 
 path = sys.argv[1]
