@@ -18,7 +18,7 @@
 # Derive PATCH_DIR from this script's location (parent of the patch/ directory).
 PATCH_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="$PATCH_DIR/apply.log"
-VERSION="0.0.2"
+VERSION="0.0.3"
 
 # Rotate log at 512 KB to avoid unbounded growth on a system volume.
 # Keep two prior generations (.1 and .2) so the last three boots are always available.
@@ -68,6 +68,8 @@ _ensure_writable() {
 # Find the Python interpreter that middlewared actually uses.
 # On TrueNAS SCALE, /usr/bin/middlewared is usually a Python entry-point script
 # with a shebang pointing at the right interpreter (system or venv).
+# The shebang is read with dd (no Python startup cost); import verification is
+# deferred to the combined subprocess below which handles failure gracefully.
 find_mw_python() {
     local py="python3"
     local shebang=""
@@ -83,47 +85,56 @@ find_mw_python() {
         fi
     fi
 
-    # Verify the chosen interpreter can actually import middlewared.
-    # Use >&2 so this message goes to stderr, not captured by $(...) substitution.
-    if ! "$py" -c "import middlewared" 2>/dev/null; then
-        echo "WARNING: '$py' cannot import middlewared; falling back to python3" >&2
-        py="python3"
-        if ! "$py" -c "import middlewared" 2>/dev/null; then
-            echo "WARNING: 'python3' also cannot import middlewared; backend patch will be skipped" >&2
-        fi
-    fi
-
     echo "$py"
 }
 
 PYTHON=$(find_mw_python)
 echo "Using Python: $PYTHON"
 
-# ── Native support check ──────────────────────────────────────────────────────
-# If TrueNAS has shipped native B2 restic support, this patch is no longer
-# needed. Set the kill switch and instruct the user to uninstall cleanly.
+# ── Discover paths + native support check (single Python subprocess) ──────────
+# Combines what were previously four separate Python invocations into one to
+# avoid repeated interpreter startup overhead under the PREINIT timeout budget.
 
-_tc_native=$("$PYTHON" -c "
+_tc_info=$("$PYTHON" -c "
+import inspect, os, sys
+
+result = {'native': 'no', 'site_pkg': '', 'mw_dir': ''}
+
 try:
-    import inspect
+    import middlewared
+    mw_file = os.path.abspath(middlewared.__file__)
+    result['mw_dir']   = os.path.dirname(mw_file)
+    result['site_pkg'] = os.path.dirname(os.path.dirname(mw_file))
+except ImportError:
+    try:
+        import site
+        result['site_pkg'] = site.getsitepackages()[0]
+    except Exception:
+        pass
+
+try:
     import middlewared.rclone.remote.b2 as _b2_mod
     from middlewared.rclone.remote.b2 import B2RcloneRemote
-    if 'get_restic_config' not in B2RcloneRemote.__dict__:
-        print('no')
-    else:
+    if 'get_restic_config' in B2RcloneRemote.__dict__:
         src = open(inspect.getfile(_b2_mod), encoding='utf-8', errors='replace').read()
-        if 'TRUECLOUD_PATCH' in src:
-            print('no')
-        else:
-            # Distinguish a real implementation from a stub that raises NotImplementedError.
+        if 'TRUECLOUD_PATCH' not in src:
             try:
                 method_src = inspect.getsource(B2RcloneRemote.get_restic_config)
             except (OSError, TypeError):
                 method_src = ''
-            print('no' if 'NotImplementedError' in method_src else 'yes')
+            if 'NotImplementedError' not in method_src:
+                result['native'] = 'yes'
 except Exception:
-    print('no')
-" 2>/dev/null || echo "no")
+    pass
+
+print(result['native'])
+print(result['site_pkg'])
+print(result['mw_dir'])
+" 2>/dev/null || printf 'no\n\n\n')
+
+_tc_native=$(printf '%s' "$_tc_info" | sed -n '1p')
+SITE_PKG=$(printf '%s' "$_tc_info"  | sed -n '2p')
+_MW_DIR=$(printf '%s' "$_tc_info"   | sed -n '3p')
 
 if [ "$_tc_native" = "yes" ]; then
     echo "NOTICE: TrueNAS now provides native B2 restic support — truecloud-patch is no longer needed."
@@ -145,29 +156,6 @@ fi
 
 echo "--- backend patch ---"
 
-# Derive site-packages from where middlewared actually lives.
-# getsitepackages()[0] may return the wrong directory; using middlewared.__file__
-# ensures we patch files in the directory Python will actually read.
-SITE_PKG=$("$PYTHON" -c "
-import os
-try:
-    import middlewared
-    print(os.path.dirname(os.path.dirname(os.path.abspath(middlewared.__file__))))
-except ImportError:
-    import site
-    print(site.getsitepackages()[0])
-" 2>/dev/null || true)
-
-# MW_DIR is the middlewared package directory itself (one level below SITE_PKG).
-_MW_DIR=$("$PYTHON" -c "
-import os
-try:
-    import middlewared
-    print(os.path.dirname(os.path.abspath(middlewared.__file__)))
-except ImportError:
-    pass
-" 2>/dev/null || true)
-
 _b2_ok=0
 _restic_ok=0
 
@@ -182,12 +170,13 @@ else
     _B2_PY="$_MW_DIR/rclone/remote/b2.py"
     _RESTIC_PY="$_MW_DIR/plugins/cloud_backup/restic.py"
 
-        # ── b2.py ─────────────────────────────────────────────────────────────
-        if [ -f "$_B2_PY" ]; then
-            if "$PYTHON" - "$_B2_PY" << 'PYEOF'
-import sys
+        # ── patch b2.py + restic.py + hook_status.json (single subprocess) ──────
+        if "$PYTHON" - "$_B2_PY" "$_RESTIC_PY" "$PATCH_DIR/hook_status.json" << 'PYEOF'
+import json, os, sys, time
 
-BLOCK = """
+b2_path, restic_path, status_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+B2_BLOCK = """
 # TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
 def _tc_get_restic_config(task):
     p = task["credentials"]["provider"]
@@ -197,34 +186,7 @@ B2RcloneRemote.get_restic_config = staticmethod(_tc_get_restic_config)
 B2RcloneRemote.restic = True
 """
 
-path = sys.argv[1]
-with open(path, encoding="utf-8") as fh:
-    content = fh.read()
-
-marker = "\n# TRUECLOUD_PATCH"
-idx = content.find(marker)
-base = content[:idx] if idx != -1 else content
-patched = base.rstrip("\n") + "\n" + BLOCK
-
-with open(path, "w", encoding="utf-8") as fh:
-    fh.write(patched)
-PYEOF
-            then
-                echo "OK: Patched b2.py → $_B2_PY"
-                _b2_ok=1
-            else
-                echo "WARNING: Failed to patch b2.py"
-            fi
-        else
-            echo "WARNING: b2.py not found at $_B2_PY"
-        fi
-
-        # ── restic.py ─────────────────────────────────────────────────────────
-        if [ -f "$_RESTIC_PY" ]; then
-            if "$PYTHON" - "$_RESTIC_PY" << 'PYEOF'
-import sys
-
-BLOCK = """
+RESTIC_BLOCK = """
 # TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
 try:
     _tc_orig_get_restic_config = get_restic_config
@@ -267,56 +229,66 @@ else:
     get_restic_config._truecloud_patched = True
 """
 
-path = sys.argv[1]
-with open(path, encoding="utf-8") as fh:
-    content = fh.read()
+def patch_file(path, block):
+    with open(path, encoding="utf-8") as fh:
+        content = fh.read()
+    marker = "\n# TRUECLOUD_PATCH"
+    idx = content.find(marker)
+    base = content[:idx] if idx != -1 else content
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(base.rstrip("\n") + "\n" + block)
 
-marker = "\n# TRUECLOUD_PATCH"
-idx = content.find(marker)
-base = content[:idx] if idx != -1 else content
-patched = base.rstrip("\n") + "\n" + BLOCK
+b2_ok = restic_ok = False
 
-with open(path, "w", encoding="utf-8") as fh:
-    fh.write(patched)
-PYEOF
-            then
-                echo "OK: Patched restic.py → $_RESTIC_PY"
-                _restic_ok=1
-            else
-                echo "WARNING: Failed to patch restic.py"
-            fi
-        else
-            echo "WARNING: restic.py not found at $_RESTIC_PY"
-        fi
-    # Write hook_status.json so 'verify' reflects the current patch state.
-    "$PYTHON" -c "
-import json, os, sys, time
-b2_ok = sys.argv[1] == '1'
-restic_ok = sys.argv[2] == '1'
+if os.path.exists(b2_path):
+    try:
+        patch_file(b2_path, B2_BLOCK)
+        b2_ok = True
+        print(f"OK: Patched b2.py → {b2_path}")
+    except Exception as e:
+        print(f"WARNING: Failed to patch b2.py: {e}")
+else:
+    print(f"WARNING: b2.py not found at {b2_path}")
+
+if os.path.exists(restic_path):
+    try:
+        patch_file(restic_path, RESTIC_BLOCK)
+        restic_ok = True
+        print(f"OK: Patched restic.py → {restic_path}")
+    except Exception as e:
+        print(f"WARNING: Failed to patch restic.py: {e}")
+else:
+    print(f"WARNING: restic.py not found at {restic_path}")
+
 patches = {
     'middlewared.rclone.remote.b2': {
         'ok': b2_ok,
-        'detail': ('patched on disk in overlay at boot' if b2_ok
-                   else 'b2.py not found or write failed'),
+        'detail': 'patched on disk in overlay at boot' if b2_ok else 'b2.py not found or write failed',
     },
     'middlewared.plugins.cloud_backup.restic': {
         'ok': restic_ok,
-        'detail': ('patched on disk in overlay at boot' if restic_ok
-                   else 'restic.py not found or write failed'),
+        'detail': 'patched on disk in overlay at boot' if restic_ok else 'restic.py not found or write failed',
     },
 }
-payload = {'patched_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-           'patches': patches}
-sf = sys.argv[3]
-tmp = sf + '.tmp'
+payload = {'patched_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'patches': patches}
+tmp = status_path + '.tmp'
 try:
     with open(tmp, 'w') as f:
         json.dump(payload, f, indent=2)
-    os.replace(tmp, sf)
+    os.replace(tmp, status_path)
     print('OK: Wrote hook_status.json')
 except OSError as e:
     print(f'WARNING: Could not write hook_status.json: {e}')
-" "$_b2_ok" "$_restic_ok" "$PATCH_DIR/hook_status.json" || true
+
+sys.exit(0 if (b2_ok and restic_ok) else 1)
+PYEOF
+        then
+            _b2_ok=1
+            _restic_ok=1
+        else
+            # Individual results already printed above; exit code 1 means at least one failed.
+            true
+        fi
 fi
 
 # ── Step 2: Angular bundle ────────────────────────────────────────────────────

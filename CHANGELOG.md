@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.0.3 — 2026-06-22
+
+### Fixed
+
+- **`patch/apply.sh` silently killed by the 10-second PREINIT timeout.**
+  TrueNAS PREINIT initshutdownscripts have a 10-second default timeout. The
+  previous apply.sh ran approximately 8 Python subprocesses (each ~1-2 s), so it
+  was routinely killed mid-run. Symptoms: patches not applied after reboot, but
+  re-running `bash apply.sh` manually (no timeout) always succeeded.
+
+  Fix: `install.sh` now registers the hook with `"timeout": 120`. Existing
+  installations are updated to the new timeout on the next `bash install.sh` run.
+
+  Additionally, `patch/apply.sh` consolidates its Python subprocess invocations
+  from ~8 down to 2, reducing startup overhead from ~12-16 s to ~2-4 s — well
+  within the new 120-second budget.
+
+### Changed
+
+- `find_mw_python` in `apply.sh` no longer spawns a separate Python process to
+  verify the interpreter can import `middlewared`. Verification is now implicit in
+  the combined path-discovery subprocess that follows.
+
+---
+
 ## v0.0.2 — 2026-06-19
 
 ### Fixed

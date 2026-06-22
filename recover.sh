@@ -16,7 +16,7 @@
 #   rm /mnt/tank/truenas-truecloud-patch/disabled
 #   bash /mnt/tank/truenas-truecloud-patch/patch/apply.sh
 
-VERSION="0.0.2"
+VERSION="0.0.3"
 
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 

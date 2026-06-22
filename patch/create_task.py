@@ -48,7 +48,7 @@ import sys
 import urllib.error
 import urllib.request
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 _PATCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _STATUS_FILE = os.path.join(_PATCH_DIR, "hook_status.json")

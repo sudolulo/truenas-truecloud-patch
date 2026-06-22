@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-VERSION="0.0.2"
+VERSION="0.0.3"
 
 # The directory containing install.sh is the permanent install location.
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -73,9 +73,9 @@ for s in json.load(sys.stdin):
 " 2>/dev/null || true)
 
 if [ -n "$EXISTING_ID" ]; then
-    echo "Already registered (id=$EXISTING_ID). Updating path and enabling ..."
+    echo "Already registered (id=$EXISTING_ID). Updating path, timeout, and enabling ..."
     if ! _midclt_out=$(midclt call initshutdownscript.update "$EXISTING_ID" \
-            "{\"enabled\": true, \"script\": \"$PATCH_DIR/patch/apply.sh\"}" 2>&1); then
+            "{\"enabled\": true, \"script\": \"$PATCH_DIR/patch/apply.sh\", \"timeout\": 120}" 2>&1); then
         echo "ERROR: Failed to update PREINIT hook (id=$EXISTING_ID)." >&2
         [ -n "$_midclt_out" ] && echo "  midclt: $_midclt_out" >&2
         echo "  To remove the stale entry and retry:" >&2
@@ -84,7 +84,7 @@ if [ -n "$EXISTING_ID" ]; then
     fi
 else
     if ! _midclt_out=$(midclt call initshutdownscript.create \
-            "{\"type\":\"SCRIPT\",\"script\":\"$PATCH_DIR/patch/apply.sh\",\"when\":\"PREINIT\",\"enabled\":true,\"comment\":\"$_HOOK_COMMENT\"}" \
+            "{\"type\":\"SCRIPT\",\"script\":\"$PATCH_DIR/patch/apply.sh\",\"when\":\"PREINIT\",\"enabled\":true,\"timeout\":120,\"comment\":\"$_HOOK_COMMENT\"}" \
             2>&1); then
         echo "ERROR: Failed to register PREINIT hook." >&2
         [ -n "$_midclt_out" ] && echo "  midclt: $_midclt_out" >&2
