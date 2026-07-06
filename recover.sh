@@ -15,8 +15,9 @@
 # To re-enable the patch after investigating:
 #   rm /mnt/tank/truenas-truecloud-patch/disabled
 #   bash /mnt/tank/truenas-truecloud-patch/patch/apply.sh
+#   systemctl restart middlewared
 
-VERSION="0.0.3"
+VERSION="0.0.4"
 
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -51,6 +52,10 @@ for _tag in mw ui; do
 done
 [ "$_any" -eq 0 ] && echo "  No overlays active."
 
+# Cancel a deferred boot restart if one is still queued — we restart ourselves.
+systemctl stop truecloud-mw-restart.service 2>/dev/null
+systemctl reset-failed truecloud-mw-restart.service 2>/dev/null
+
 echo "Restarting middlewared ..."
 if systemctl restart middlewared; then
     echo ""
@@ -68,3 +73,4 @@ echo ""
 echo "To re-enable the patch once you have investigated:"
 echo "  rm $PATCH_DIR/disabled"
 echo "  bash $PATCH_DIR/patch/apply.sh"
+echo "  systemctl restart middlewared"

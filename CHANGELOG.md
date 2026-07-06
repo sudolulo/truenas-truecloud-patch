@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.0.4 — 2026-07-06
+
+### Fixed
+
+- **Backend patch inactive after every reboot.** PREINIT initshutdownscripts
+  are executed by middlewared itself (`ix-preinit.service` runs
+  `midclt call initshutdownscript.execute_init_tasks PREINIT`, ordered after
+  `ix-zfs.service` pool import). By the time `apply.sh` patched `b2.py` and
+  `restic.py` in the overlay, the running middlewared had already imported the
+  stock modules and never re-imports — so S3/B2 support silently reverted on
+  every reboot until something restarted middlewared. `install.sh` masked the
+  bug because it restarts middlewared explicitly.
+
+  Fix: when `apply.sh` detects it was invoked by middlewared (boot context),
+  it now schedules a single detached restart via a transient systemd unit
+  (`truecloud-mw-restart`, ordered after `multi-user.target` and
+  `ix-postinit.service`) so the patched modules are loaded once boot settles.
+  The restart is never synchronous — `apply.sh` is a child of middlewared's
+  own job runner, and later `ix-*` boot units still need midclt. Manual runs
+  of `apply.sh` never trigger a restart.
+
+- **`create_task.py verify` false-positive after reboot.** `verify` trusted
+  `hook_status.json`, which only records that the files were patched on disk —
+  not that the running process loaded them. `verify` now also compares the
+  middlewared main-process start time against `patched_at` and reports FAIL
+  (with recovery instructions) when the process predates the patch.
+
+### Changed
+
+- README and script comments no longer claim PREINIT runs "before middlewared
+  starts"; the boot ordering and the deferred restart are now documented.
+- `recover.sh` and `uninstall.sh` cancel a still-queued deferred restart
+  before performing their own, and their re-enable instructions now include
+  the required `systemctl restart middlewared`.
+
+---
+
 ## v0.0.3 — 2026-06-22
 
 ### Fixed

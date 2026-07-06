@@ -10,13 +10,15 @@
 #
 # What this does:
 #   1. Registers a PREINIT initshutdownscript so patch/apply.sh re-runs on
-#      every boot before middlewared starts.
+#      every boot. At boot, apply.sh re-patches the overlay and schedules a
+#      one-time deferred middlewared restart to load the patched modules
+#      (PREINIT runs after middlewared starts, so a restart is required).
 #   2. Applies the patches immediately (no reboot required).
 #   3. Restarts middlewared so the backend change takes effect now.
 
 set -euo pipefail
 
-VERSION="0.0.3"
+VERSION="0.0.4"
 
 # The directory containing install.sh is the permanent install location.
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"

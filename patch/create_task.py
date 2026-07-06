@@ -41,14 +41,17 @@ List existing TrueCloud Backup tasks:
 """
 
 import argparse
+import calendar
 import json
 import os
 import ssl
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 _PATCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _STATUS_FILE = os.path.join(_PATCH_DIR, "hook_status.json")
@@ -86,6 +89,31 @@ def make_client(host, api_key, insecure=False):
 
 # ── Sub-commands ──────────────────────────────────────────────────────────────
 
+def _middlewared_start_epoch():
+    """Epoch timestamp of the running middlewared main process, or None."""
+    try:
+        pid = int(subprocess.run(
+            ["systemctl", "show", "--property=MainPID", "--value", "middlewared"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.strip())
+        if pid <= 0:
+            return None
+        with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as fh:
+            stat = fh.read()
+        # Field 22 (starttime, in clock ticks since boot); the comm field may
+        # contain spaces, so split after the closing paren.
+        start_ticks = float(stat.rsplit(")", 1)[1].split()[19])
+        # Base on /proc/stat btime, not uptime: starttime ticks count from the
+        # kernel boot, which uptime does not match inside containers.
+        with open("/proc/stat", encoding="ascii") as fh:
+            btime = next(float(line.split()[1]) for line in fh
+                         if line.startswith("btime "))
+        return btime + start_ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration,
+            subprocess.SubprocessError):
+        return None
+
+
 def cmd_verify():
     """Print the hook status written by apply.sh at boot."""
     if not os.path.exists(_STATUS_FILE):
@@ -115,9 +143,35 @@ def cmd_verify():
         if not ok:
             all_ok = False
 
+    # The disk status alone can false-positive: at boot the files are patched
+    # while middlewared is already running with the stock modules imported.
+    # The running process only has the patch if it started AFTER patched_at.
+    try:
+        patched_epoch = calendar.timegm(
+            time.strptime(status.get("patched_at", ""), "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        patched_epoch = None
+    mw_start = _middlewared_start_epoch()
+
+    proc_stale = False
+    if patched_epoch is None or mw_start is None:
+        print("  [??  ] running middlewared process — could not compare start time;")
+        print("         the results above reflect the on-disk state only")
+    elif mw_start + 2 < patched_epoch:
+        proc_stale = True
+        print("  [FAIL] running middlewared process — started BEFORE the patch was applied,")
+        print("         so it is running the stock (unpatched) modules")
+    else:
+        print("  [OK  ] running middlewared process — started after the patch was applied")
+
     print()
-    if all_ok:
+    if all_ok and not proc_stale:
         print("All patches installed. Run a test backup to confirm end-to-end.")
+    elif all_ok:
+        print("The patch is on disk but not loaded. Right after boot, the deferred")
+        print("restart (unit truecloud-mw-restart) may still be pending — re-check in a")
+        print("minute. Otherwise run: systemctl restart middlewared")
+        sys.exit(1)
     else:
         print("One or more patches failed to apply.")
         print(f"Check {os.path.join(_PATCH_DIR, 'apply.log')} and journalctl -u middlewared")

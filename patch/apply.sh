@@ -1,15 +1,21 @@
 #!/bin/bash
 # patch/apply.sh — registered as a TrueNAS PREINIT initshutdownscript.
 #
-# Runs on every boot BEFORE middlewared starts, so patches land before
-# the first Python process for middlewared is created.
+# PREINIT scripts are executed BY middlewared itself (ix-preinit.service runs
+# `midclt call initshutdownscript.execute_init_tasks PREINIT`, ordered after
+# ix-zfs.service pool import). So when this script runs at boot, middlewared
+# is already up and has already imported the stock modules — the on-disk
+# patch alone cannot reach the running process.
 #
 # TrueNAS updates replace /usr/ entirely; this script re-applies two patches:
 #
 #   1. Backend — b2.py and restic.py are patched directly in the overlay.
+#      On a boot run, a single detached middlewared restart is scheduled
+#      (Step 3) so the patched modules actually get loaded.
 #
 #   2. Angular JS bundle — Widens the TrueCloud Backup credential dropdown
-#                          from Storj-only to include S3 and B2.
+#                          from Storj-only to include S3 and B2. Served from
+#                          disk per request, so no restart is needed for it.
 #
 # Design principle: every step is independently fail-safe.
 # A failed patch logs a warning and continues; middlewared always starts.
@@ -18,7 +24,7 @@
 # Derive PATCH_DIR from this script's location (parent of the patch/ directory).
 PATCH_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="$PATCH_DIR/apply.log"
-VERSION="0.0.3"
+VERSION="0.0.4"
 
 # Rotate log at 512 KB to avoid unbounded growth on a system volume.
 # Keep two prior generations (.1 and .2) so the last three boots are always available.
@@ -41,7 +47,7 @@ fi
 
 # Mounts a writable overlayfs on $1 using /run (tmpfs) for the upper/work dirs
 # when the directory is read-only.  The overlay is volatile per boot; this
-# PREINIT script recreates it on every boot before middlewared starts.
+# PREINIT script recreates it on every boot.
 # Returns 0 if the directory is now writable, 1 if it could not be made so.
 _ensure_writable() {
     local dir="$1" tag="$2"
@@ -309,6 +315,37 @@ if [ -n "$_webui_dir" ]; then
 fi
 
 "$PYTHON" "$PATCH_DIR/patch/patch_ui.py" || echo "WARNING: patch_ui.py exited non-zero; UI dropdown may still show Storj only."
+
+# ── Step 3: deferred middlewared restart (boot runs only) ─────────────────────
+# At boot this script is spawned by middlewared, which already imported the
+# stock modules — the backend patch is on disk but not in the process. Schedule
+# ONE detached restart for after boot settles. Never restart synchronously
+# here: this script is a child of middlewared's own job runner, and the later
+# ix-* boot units still need midclt to answer.
+# Boot context is detected by the parent process being middlewared; manual
+# runs (install.sh, recovery) never trigger a restart.
+
+echo "--- deferred restart ---"
+
+if ! grep -aq middlewared "/proc/$PPID/cmdline" 2>/dev/null; then
+    echo "Manual run (parent is not middlewared) — no restart scheduled."
+elif [ "$_b2_ok" != "1" ] || [ "$_restic_ok" != "1" ]; then
+    echo "Backend patch incomplete — no restart scheduled (nothing new to load)."
+else
+    # A failed unit from an earlier attempt this boot would block systemd-run.
+    systemctl reset-failed truecloud-mw-restart.service 2>/dev/null
+    if systemd-run --no-block --collect --unit=truecloud-mw-restart \
+           --property=Type=oneshot \
+           --property=After=multi-user.target \
+           --property=After=ix-postinit.service \
+           systemctl try-restart middlewared; then
+        echo "OK: Scheduled deferred middlewared restart (unit: truecloud-mw-restart)."
+        echo "    Backend patch becomes active once boot completes."
+    else
+        echo "WARNING: Could not schedule deferred restart — backend patch is on disk but NOT loaded."
+        echo "  Activate manually: systemctl restart middlewared"
+    fi
+fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 

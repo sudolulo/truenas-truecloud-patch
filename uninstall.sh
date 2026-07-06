@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.0.3"
+VERSION="0.0.4"
 
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 _HOOK_COMMENT='TrueCloud provider patch (S3/B2)'
@@ -98,6 +98,10 @@ if [ "$_restore_failed" -eq 1 ]; then
     echo "  Restore the backup(s) manually, then re-run uninstall.sh." >&2
     exit 1
 fi
+
+# Cancel a deferred boot restart if one is still queued — we restart ourselves.
+systemctl stop truecloud-mw-restart.service 2>/dev/null || true
+systemctl reset-failed truecloud-mw-restart.service 2>/dev/null || true
 
 echo "Restarting middlewared ..."
 if systemctl restart middlewared; then

@@ -54,15 +54,23 @@ see [Native support](#if-truenas-adds-native-support) below.
 
 ## What is actually patched
 
-**Nothing in TrueNAS's persistent database or configuration is modified.**
-On every boot, `patch/apply.sh` runs as a PREINIT script before middlewared
-starts. It mounts a writable
+**Nothing in TrueNAS's persistent database or configuration is modified**
+(other than the boot-hook entry itself). On every boot, `patch/apply.sh` runs
+as a PREINIT script. It mounts a writable
 [overlayfs](https://docs.kernel.org/filesystems/overlayfs.html) over the
 relevant directories in `/usr/` (upper layer in `/run` tmpfs), then patches
 `b2.py` and `restic.py` inside that overlay. The overlay is volatile — it
 exists only for the current boot — but the PREINIT script recreates it
 automatically on every subsequent boot. Nothing in `/usr/` is written to
 directly.
+
+PREINIT scripts are executed *by* middlewared, which by then has already
+imported the stock modules — so after patching, `apply.sh` schedules a single
+detached middlewared restart (transient systemd unit `truecloud-mw-restart`,
+ordered after `multi-user.target`) that loads the patched modules once boot
+completes. Expect one middlewared restart shortly after every boot; the UI
+and API are briefly unavailable while it happens, and running services are
+not affected.
 
 | Layer | What changes | Technique |
 |---|---|---|
@@ -86,11 +94,14 @@ support and the reason is logged to `apply.log` in your repo root.
 TrueNAS SCALE updates replace `/usr/` entirely. The patch survives by keeping
 this repository on a **persistent ZFS pool** (your data pool, not `/tmp` or a
 system path) and registering a **PREINIT initshutdownscript** in the TrueNAS
-database. On every boot, `patch/apply.sh` runs before `middlewared` starts. It
-mounts a writable [overlayfs](https://docs.kernel.org/filesystems/overlayfs.html)
-over the relevant directories (upper layer in `/run`, recreated each boot), then
-patches `b2.py` and `restic.py` directly in that overlay and re-patches the UI
-bundle. No extra configuration is needed.
+database — the one piece of state that survives both reboots and OS updates.
+On every boot, `patch/apply.sh` runs (executed by middlewared after pools are
+imported), mounts a writable
+[overlayfs](https://docs.kernel.org/filesystems/overlayfs.html) over the
+relevant directories (upper layer in `/run`, recreated each boot), patches
+`b2.py` and `restic.py` directly in that overlay, re-patches the UI bundle,
+and schedules the one-time deferred middlewared restart that loads the
+patched backend. No extra configuration is needed.
 
 ---
 
@@ -276,6 +287,7 @@ To re-enable the patch once you have investigated:
 ```bash
 rm /mnt/tank/truenas-truecloud-patch/disabled
 bash /mnt/tank/truenas-truecloud-patch/patch/apply.sh
+systemctl restart middlewared   # manual apply.sh runs never restart for you
 ```
 
 ---
@@ -339,9 +351,10 @@ cat /mnt/tank/truenas-truecloud-patch/apply.log
 ```bash
 python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify
 ```
-Reads `hook_status.json` written by `apply.sh` at boot. Reflects whether the
-overlay patches to `b2.py` and `restic.py` were applied successfully. Does not
-require `--host` or `--api-key`.
+Reads `hook_status.json` written by `apply.sh` at boot **and** checks that the
+running middlewared process started *after* the patches were applied — an
+on-disk patch that middlewared has not loaded yet is reported as FAIL with
+instructions. Does not require `--host` or `--api-key`.
 
 **Middlewared log:**
 ```bash
