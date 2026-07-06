@@ -186,6 +186,11 @@ B2_BLOCK = """
 # TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
 def _tc_get_restic_config(task):
     p = task["credentials"]["provider"]
+    if not isinstance(p, dict):
+        # TrueNAS <= 24.10: provider is the type string ("B2") and the
+        # account/key live in the credential's attributes dict. 25.04+
+        # moved them into a provider dict.
+        p = task["credentials"]["attributes"]
     return "", {"B2_ACCOUNT_ID": p["account"], "B2_ACCOUNT_KEY": p["key"]}
 
 B2RcloneRemote.get_restic_config = staticmethod(_tc_get_restic_config)

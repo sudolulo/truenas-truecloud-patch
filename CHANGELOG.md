@@ -21,6 +21,15 @@
   own job runner, and later `ix-*` boot units still need midclt. Manual runs
   of `apply.sh` never trigger a restart.
 
+- **`TypeError: string indices must be integers` when creating a B2 task on
+  TrueNAS 24.10 (Electric Eel)** (#1). The credential schema differs between
+  releases: on 24.10 `credentials["provider"]` is the type string (`"B2"`)
+  with the account/key in `credentials["attributes"]`, while 25.04+ moved
+  them into a provider dict. The injected `get_restic_config` only handled
+  the 25.04+ shape. It now detects the schema and reads the credentials from
+  the right place on both; `create_task.py list-credentials` and `list-tasks`
+  got the same treatment.
+
 - **`create_task.py verify` false-positive after reboot.** `verify` trusted
   `hook_status.json`, which only records that the files were patched on disk —
   not that the running process loaded them. `verify` now also compares the

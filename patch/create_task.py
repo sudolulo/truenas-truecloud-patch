@@ -177,6 +177,14 @@ def cmd_verify():
         print(f"Check {os.path.join(_PATCH_DIR, 'apply.log')} and journalctl -u middlewared")
         sys.exit(1)
 
+def _provider_type(cred):
+    """Provider type string across schemas (<=24.10 plain str, >=25.04 dict)."""
+    p = (cred or {}).get("provider")
+    if isinstance(p, dict):
+        return p.get("type", "?")
+    return p or "?"
+
+
 def cmd_list_credentials(client, _args):
     creds = client("GET", "/cloudsync/credentials")
     if not creds:
@@ -185,7 +193,7 @@ def cmd_list_credentials(client, _args):
     print(f"{'ID':>4}  {'Provider':<14}  Name")
     print("─" * 55)
     for c in sorted(creds, key=lambda x: x["id"]):
-        print(f"{c['id']:>4}  {c['provider']['type']:<14}  {c['name']}")
+        print(f"{c['id']:>4}  {_provider_type(c):<14}  {c['name']}")
 
 
 def cmd_list_tasks(client, _args):
@@ -196,8 +204,7 @@ def cmd_list_tasks(client, _args):
     print(f"{'ID':>4}  {'Enabled':<8}  {'Provider':<14}  Name")
     print("─" * 60)
     for t in sorted(tasks, key=lambda x: x["id"]):
-        creds = t.get("credentials") or {}
-        ptype = (creds.get("provider") or {}).get("type", "?")
+        ptype = _provider_type(t.get("credentials"))
         enabled = "yes" if t.get("enabled") else "no"
         print(f"{t['id']:>4}  {enabled:<8}  {ptype:<14}  {t.get('description', '')}")
 
