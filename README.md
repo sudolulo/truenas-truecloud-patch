@@ -91,17 +91,46 @@ support and the reason is logged to `apply.log` in your repo root.
 
 ## How persistence works
 
-TrueNAS SCALE updates replace `/usr/` entirely. The patch survives by keeping
-this repository on a **persistent ZFS pool** (your data pool, not `/tmp` or a
-system path) and registering a **PREINIT initshutdownscript** in the TrueNAS
-database — the one piece of state that survives both reboots and OS updates.
-On every boot, `patch/apply.sh` runs (executed by middlewared after pools are
-imported), mounts a writable
-[overlayfs](https://docs.kernel.org/filesystems/overlayfs.html) over the
-relevant directories (upper layer in `/run`, recreated each boot), patches
-`b2.py` and `restic.py` directly in that overlay, re-patches the UI bundle,
-and schedules the one-time deferred middlewared restart that loads the
-patched backend. No extra configuration is needed.
+Two different things must survive two different events:
+
+| Event | What would be lost | What makes it survive |
+|---|---|---|
+| **Reboot** | The overlay holding the patched files lives in `/run` (tmpfs) and vanishes | The PREINIT hook re-runs `apply.sh` on every boot and schedules one middlewared restart to load the result |
+| **TrueNAS update** | `/usr/` is replaced entirely; custom files in `/etc/` are wiped with the new boot environment | This repo lives on your **data pool**, and the hook registration lives in the **TrueNAS config database** — both survive updates. The first boot after an update is just a normal boot |
+
+### What happens on every boot
+
+1. **middlewared starts** with the stock (unpatched) modules. This is
+   unavoidable: PREINIT scripts are executed *by* middlewared
+   (`ix-preinit.service` → `midclt call initshutdownscript.execute_init_tasks`),
+   so nothing registered there can run before it.
+2. **Pools import** (`ix-zfs.service`), making `/mnt/<pool>` — and this
+   repository — available.
+3. **`apply.sh` runs** (`ix-preinit.service`): mounts the writable overlay
+   (upper layer in `/run`), patches `b2.py` and `restic.py` on disk inside it,
+   patches the UI bundle, and writes `apply.log` and `hook_status.json`.
+4. **A deferred restart is scheduled.** The middlewared that is running
+   imported the stock modules in step 1 and never re-imports, so the on-disk
+   patch alone is not enough. `apply.sh` detects it was invoked by middlewared
+   and creates a transient systemd unit (`truecloud-mw-restart`, via
+   `systemd-run --no-block`, ordered after `multi-user.target`) — detached and
+   deferred so it cannot disrupt the remainder of the boot sequence.
+5. **Once boot completes, middlewared restarts once** and imports the patched
+   modules from the overlay. S3/B2 backup support is now active until the next
+   reboot, when the cycle repeats.
+
+What you will observe: one middlewared restart shortly after every boot (a
+brief web UI/API blip; running services are unaffected). Between steps 3
+and 5 there is a short window — typically well under a minute — where the UI
+already shows S3/B2 (the JS bundle is read from disk per request) but the
+backend is still stock. A backup job that fires inside that window fails once
+with `NotImplementedError` and succeeds on its next run; see
+[Troubleshooting](#troubleshooting) if it persists beyond boot.
+
+Manual runs of `bash patch/apply.sh` never trigger the restart — that only
+happens in boot context. `install.sh` and `recover.sh` perform their own
+explicit restarts instead, which is why a manual re-apply must be followed by
+`systemctl restart middlewared`.
 
 ---
 
@@ -341,6 +370,36 @@ If one or more entries show `[FAIL]`:
 ---
 
 ## Troubleshooting
+
+**Backups fail with `NotImplementedError` after a reboot**
+
+The traceback ends in `rclone/base.py` → `raise NotImplementedError` and
+contains no `_tc_` frames: the running middlewared is executing stock code.
+Either the deferred restart never fired, or the patch never landed on disk
+this boot. Diagnose in this order:
+
+```bash
+# Did apply.sh run this boot, at which version, and did it schedule the restart?
+tail -40 /mnt/tank/truenas-truecloud-patch/apply.log
+
+# Full check — compares the running process against the patch timestamp
+python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify
+
+# Did the deferred restart unit run, fail, or never get created?
+systemctl status truecloud-mw-restart.service
+journalctl -u truecloud-mw-restart.service --no-pager | tail -20
+```
+
+- `verify` reports the process started **before** the patch → the restart
+  didn't happen. `systemctl restart middlewared` fixes it immediately; the
+  journal output above tells you why it was missed.
+- `apply.log` shows the kill switch is active → `rm .../disabled`, then
+  `bash install.sh`.
+- `apply.log` has no entry for this boot → the hook didn't run; re-run
+  `bash install.sh` to re-register it.
+- `apply.log` header shows `[v0.0.3]` or older → update:
+  `git pull && bash install.sh` (v0.0.4 fixed patches not loading after
+  reboot).
 
 **Apply log** (check after each reboot or install):
 ```bash
