@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.2.0 — 2026-07-08
+
+### Changed
+
+- **`create_task.py` now uses the TrueNAS middleware via `midclt` instead of the
+  deprecated `/api/v2.0` REST API**, which is removed in TrueNAS 26.04. Practical
+  effects:
+  - Run the script **on the TrueNAS host** — it uses the local middleware socket, so
+    it no longer needs a host address or API key.
+  - `--host`, `--api-key`, and `--insecure` are accepted but **ignored** (a deprecation
+    note is printed); they will be removed in a future release.
+  - `list-credentials` → `cloudsync.credentials.query`, `list-tasks` →
+    `cloud_backup.query`, `create` → `cloud_backup.create`.
+- Dropped the `ssl`/`urllib` HTTP client; no TLS certificate handling is needed anymore.
+
 ## v0.1.0 — 2026-07-08
 
 ### Added

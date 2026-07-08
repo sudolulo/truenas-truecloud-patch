@@ -187,18 +187,18 @@ Check [CHANGELOG.md](CHANGELOG.md) to see what changed between versions.
 ## Creating a task via CLI
 
 If the UI still shows only Storj after refreshing (e.g. the JS bundle pattern
-changed in a new TrueNAS version), create tasks directly via the REST API:
+changed in a new TrueNAS version), create tasks directly. Run this **on the
+TrueNAS host** — it talks to the local middleware via `midclt`, so it needs no
+host address or API key:
 
 ```bash
 # Replace /mnt/tank/truenas-truecloud-patch with your clone path
 
 # List your cloud credentials to find the right ID
-python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py \
-    --host 192.168.1.1 --api-key <key> list-credentials
+python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py list-credentials
 
 # Create a task with a B2 credential (id=3)
-python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py \
-    --host 192.168.1.1 --api-key <key> create \
+python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py create \
     --name "tank-to-b2" \
     --path /mnt/tank/data \
     --credential 3 \
@@ -213,7 +213,8 @@ python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py \
 > which re-fetches all repo metadata from the provider every run — glacially slow
 > on large repos. Point it at a writable dir on a pool with free space.
 
-Get an API key from **System → API Keys → Add**.
+> Versions ≤ 0.1.0 used the `/api/v2.0` REST API with `--host`/`--api-key`; those
+> flags are now accepted-but-ignored (REST is removed in TrueNAS 26.04).
 
 ---
 
@@ -433,9 +434,7 @@ grep -c 'STORJ_IX.*S3.*B2' \
     | grep -v ':0'
 ```
 
-**`create_task.py` SSL error connecting to TrueNAS**
-`create_task.py` talks to the **TrueNAS API**, not your S3 endpoint, and
-verifies its TLS certificate. If your NAS uses a self-signed certificate,
-pass `--insecure` — but be aware this disables certificate verification for
-the API call that transmits your TrueNAS API key. Adding your NAS certificate
-to your system's trust store is safer.
+**`create_task.py` — "midclt not found" or permission errors**
+`create_task.py` now talks to the local middleware via `midclt`, so run it **on
+the TrueNAS host** (not remotely) as a user with middleware access (root). There
+is no HTTPS/API-key call anymore, so there is no TLS certificate to configure.

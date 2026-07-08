@@ -3,22 +3,24 @@
 create_task.py — create TrueNAS TrueCloud Backup tasks with S3 or B2 credentials.
 
 The TrueNAS UI normally restricts the credential dropdown to Storj only.
-This script bypasses that restriction by calling the REST API directly.
+This script bypasses that restriction by talking to the TrueNAS middleware
+directly via `midclt` (the /api/v2.0 REST API is removed in TrueNAS 26.04).
 
 Compatible providers (after the truecloud-patch backend patch is applied):
   S3     — any S3-compatible endpoint (AWS, Wasabi, Cloudflare R2, MinIO, …)
   B2     — Backblaze B2 native API
   STORJ_IX — Storj (unchanged, always worked)
 
-Requires a TrueNAS API key: UI → System → API Keys → Add.
+Run this ON the TrueNAS host — it uses the local middleware socket via `midclt`,
+so no host address or API key is needed.
 
 Examples
 --------
 List available cloud credentials:
-    python3 create_task.py --host 192.168.1.1 --api-key <key> list-credentials
+    python3 create_task.py list-credentials
 
 Create a task backed by a B2 credential (id=3):
-    python3 create_task.py --host 192.168.1.1 --api-key <key> create \\
+    python3 create_task.py create \\
         --name "tank-to-b2" \\
         --path /mnt/tank/data \\
         --credential 3 \\
@@ -28,7 +30,7 @@ Create a task backed by a B2 credential (id=3):
         --keep-last 14
 
 Create a task using an S3-compatible credential (Wasabi, R2, etc.):
-    python3 create_task.py --host 192.168.1.1 --api-key <key> create \\
+    python3 create_task.py create \\
         --name "tank-to-wasabi" \\
         --path /mnt/tank/data \\
         --credential 5 \\
@@ -37,54 +39,44 @@ Create a task using an S3-compatible credential (Wasabi, R2, etc.):
         --password "restic-repo-password"
 
 List existing TrueCloud Backup tasks:
-    python3 create_task.py --host 192.168.1.1 --api-key <key> list-tasks
+    python3 create_task.py list-tasks
 """
 
 import argparse
 import calendar
 import json
 import os
-import ssl
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 _PATCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _STATUS_FILE = os.path.join(_PATCH_DIR, "hook_status.json")
 
 
-def make_client(host, api_key, insecure=False):
-    """Return a callable that makes authenticated REST API calls."""
-    base = f"https://{host}/api/v2.0"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    ctx = ssl.create_default_context()
-    if insecure:
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-    def call(method, path, body=None):
-        url = base + path
-        data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(req, context=ctx) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode(errors="replace")
-            print(f"HTTP {exc.code} {exc.reason}: {detail}", file=sys.stderr)
-            sys.exit(1)
-        except urllib.error.URLError as exc:
-            print(f"Connection error: {exc.reason}", file=sys.stderr)
-            sys.exit(1)
-
-    return call
+def midclt_call(method, *args):
+    """Call a middleware method locally via `midclt`, the supported JSON-RPC transport
+    that replaces the deprecated /api/v2.0 REST API (removed in TrueNAS 26.04). Must run
+    on the TrueNAS host. Each arg is JSON-encoded (a dict for create; none for queries).
+    Exits with a clear message on failure."""
+    cmd = ["midclt", "call", method] + [json.dumps(a) for a in args]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except FileNotFoundError:
+        print("ERROR: `midclt` not found — run this script ON the TrueNAS host.",
+              file=sys.stderr)
+        sys.exit(1)
+    except subprocess.SubprocessError as exc:
+        print(f"ERROR: midclt call failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if proc.returncode != 0:
+        print(f"ERROR: midclt {method}: {(proc.stderr or proc.stdout).strip()}",
+              file=sys.stderr)
+        sys.exit(1)
+    out = proc.stdout.strip()
+    return json.loads(out) if out else None
 
 
 # ── Sub-commands ──────────────────────────────────────────────────────────────
@@ -185,8 +177,8 @@ def _provider_type(cred):
     return p or "?"
 
 
-def cmd_list_credentials(client, _args):
-    creds = client("GET", "/cloudsync/credentials")
+def cmd_list_credentials(_args):
+    creds = midclt_call("cloudsync.credentials.query")
     if not creds:
         print("No cloud credentials configured.")
         return
@@ -196,8 +188,8 @@ def cmd_list_credentials(client, _args):
         print(f"{c['id']:>4}  {_provider_type(c):<14}  {c['name']}")
 
 
-def cmd_list_tasks(client, _args):
-    tasks = client("GET", "/cloud_backup")
+def cmd_list_tasks(_args):
+    tasks = midclt_call("cloud_backup.query")
     if not tasks:
         print("No TrueCloud Backup tasks configured.")
         return
@@ -209,7 +201,7 @@ def cmd_list_tasks(client, _args):
         print(f"{t['id']:>4}  {enabled:<8}  {ptype:<14}  {t.get('description', '')}")
 
 
-def cmd_create(client, args):
+def cmd_create(args):
     parts = args.schedule.split()
     if len(parts) != 5:
         print(
@@ -253,7 +245,7 @@ def cmd_create(client, args):
             file=sys.stderr,
         )
 
-    result = client("POST", "/cloud_backup", body)
+    result = midclt_call("cloud_backup.create", body)
     try:
         print(f"Created task id={result['id']}  name={result['description']!r}")
     except (KeyError, TypeError):
@@ -269,14 +261,12 @@ def main():
         epilog=__doc__.split("Examples")[1] if __doc__ and "Examples" in __doc__ else "",
     )
     p.add_argument("--version", "-V", action="version", version=f"truecloud-patch {__version__}")
-    p.add_argument("--host", default=None, metavar="HOST",
-                   help="TrueNAS hostname or IP address (required except for verify)")
-    p.add_argument("--api-key", default=None, metavar="KEY",
-                   help="TrueNAS API key — System → API Keys (required except for verify)")
-    p.add_argument("--insecure", action="store_true",
-                   help="Skip TLS certificate verification (self-signed certs). "
-                        "WARNING: exposes your API key to network interception. "
-                        "Prefer adding your cert to the trust store instead.")
+    # Deprecated & ignored: the tool now uses the local middleware via `midclt` (the
+    # /api/v2.0 REST API is removed in TrueNAS 26.04), so it must run ON the TrueNAS
+    # host and needs no host/API key. Kept accepted-but-ignored for compatibility.
+    p.add_argument("--host", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--api-key", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--insecure", action="store_true", help=argparse.SUPPRESS)
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -323,16 +313,17 @@ def main():
         cmd_verify()
         return
 
-    if not args.host or not args.api_key:
-        p.error("--host and --api-key are required for this command")
+    if args.host or args.api_key or args.insecure:
+        print("NOTE: --host/--api-key/--insecure are deprecated and ignored; this tool "
+              "now uses the local middleware (midclt) and must run on the TrueNAS host.",
+              file=sys.stderr)
 
-    client = make_client(args.host, args.api_key, args.insecure)
     if args.cmd == "list-credentials":
-        cmd_list_credentials(client, args)
+        cmd_list_credentials(args)
     elif args.cmd == "list-tasks":
-        cmd_list_tasks(client, args)
+        cmd_list_tasks(args)
     elif args.cmd == "create":
-        cmd_create(client, args)
+        cmd_create(args)
 
 
 if __name__ == "__main__":
