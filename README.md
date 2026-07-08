@@ -205,8 +205,13 @@ python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py \
     --bucket my-bucket \
     --folder backups/tank \
     --password "restic-repo-password" \
+    --cache-path /mnt/tank/.restic-cache \
     --keep-last 14
 ```
+
+> **Always pass `--cache-path`.** Without it TrueNAS runs restic with `--no-cache`,
+> which re-fetches all repo metadata from the provider every run — glacially slow
+> on large repos. Point it at a writable dir on a pool with free space.
 
 Get an API key from **System → API Keys → Add**.
 

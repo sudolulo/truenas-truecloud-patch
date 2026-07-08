@@ -51,7 +51,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "0.0.4"
+__version__ = "0.1.0"
 
 _PATCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _STATUS_FILE = os.path.join(_PATCH_DIR, "hook_status.json")
@@ -242,6 +242,17 @@ def cmd_create(client, args):
         "enabled": not args.disabled,
     }
 
+    if args.cache_path:
+        body["cache_path"] = args.cache_path
+    else:
+        print(
+            "WARNING: no --cache-path given. TrueNAS will run restic with --no-cache, "
+            "which is very slow for large repositories (it re-reads all repo metadata "
+            "from the provider every run). Set --cache-path to a writable dir on a pool "
+            "with free space.",
+            file=sys.stderr,
+        )
+
     result = client("POST", "/cloud_backup", body)
     try:
         print(f"Created task id={result['id']}  name={result['description']!r}")
@@ -290,6 +301,11 @@ def main():
                    help="Snapshots to retain after each run (default: 14)")
     c.add_argument("--schedule",    default="0 2 * * *",
                    help="Cron schedule (default: '0 2 * * *' — daily at 02:00)")
+    c.add_argument("--cache-path",  default="", metavar="PATH",
+                   help="restic cache directory (e.g. /mnt/pool/.restic-cache). "
+                        "STRONGLY recommended: without it TrueNAS runs restic with "
+                        "--no-cache, which re-fetches all repo metadata from the "
+                        "provider every run and is extremely slow on large repos.")
     c.add_argument("--transfer-setting",
                    choices=["DEFAULT", "PERFORMANCE", "FAST_STORAGE"],
                    default="DEFAULT",

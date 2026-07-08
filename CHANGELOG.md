@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.0 — 2026-07-08
+
+### Added
+
+- `create --cache-path PATH` — sets the restic cache directory on the task.
+  Without a cache path, TrueNAS runs restic with `--no-cache`, which re-reads all
+  repository metadata from the provider on every run and is glacially slow on
+  large repos (a 564 GB dataset estimated **55 days** to a first backup). Tasks
+  created without `--cache-path` now print a warning explaining the consequence.
+
 ## v0.0.4 — 2026-07-06
 
 ### Fixed
