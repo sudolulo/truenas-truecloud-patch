@@ -66,9 +66,11 @@ directly.
 
 PREINIT scripts are executed *by* middlewared, which by then has already
 imported the stock modules — so after patching, `apply.sh` schedules a single
-detached middlewared restart (transient systemd unit `truecloud-mw-restart`,
-ordered after `multi-user.target`) that loads the patched modules once boot
-completes. Expect one middlewared restart shortly after every boot; the UI
+detached middlewared restart (transient systemd unit `truecloud-mw-restart`
+running `patch/wait_restart.sh`) that loads the patched modules once boot has
+*actually* settled: the script waits for the systemd boot job queue to drain
+and for the docker/apps state machine to reach a terminal state before
+restarting. Expect one middlewared restart shortly after every boot; the UI
 and API are briefly unavailable while it happens, and running services are
 not affected.
 
@@ -113,10 +115,15 @@ Two different things must survive two different events:
    imported the stock modules in step 1 and never re-imports, so the on-disk
    patch alone is not enough. `apply.sh` detects it was invoked by middlewared
    and creates a transient systemd unit (`truecloud-mw-restart`, via
-   `systemd-run --no-block`, ordered after `multi-user.target`) — detached and
-   deferred so it cannot disrupt the remainder of the boot sequence.
-5. **Once boot completes, middlewared restarts once** and imports the patched
-   modules from the overlay. S3/B2 backup support is now active until the next
+   `systemd-run --no-block`) running `patch/wait_restart.sh` — detached so it
+   cannot disrupt the remainder of the boot sequence.
+5. **Once boot has settled, middlewared restarts once** and imports the
+   patched modules from the overlay. `wait_restart.sh` holds the restart until
+   the systemd boot job queue has drained (so in-flight `ix-*` units like
+   `ix-reporting` finish first) *and* middlewared's docker/apps startup has
+   reached a terminal state — plain unit ordering cannot see either, and
+   restarting middlewared while they run kills apps and dashboard reporting
+   for the whole boot. S3/B2 backup support is then active until the next
    reboot, when the cycle repeats.
 
 What you will observe: one middlewared restart shortly after every boot (a

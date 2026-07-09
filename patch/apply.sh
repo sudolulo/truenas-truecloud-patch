@@ -24,7 +24,7 @@
 # Derive PATCH_DIR from this script's location (parent of the patch/ directory).
 PATCH_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="$PATCH_DIR/apply.log"
-VERSION="0.0.4"
+VERSION="0.2.1"
 
 # Rotate log at 512 KB to avoid unbounded growth on a system volume.
 # Keep two prior generations (.1 and .2) so the last three boots are always available.
@@ -329,6 +329,14 @@ fi
 # ix-* boot units still need midclt to answer.
 # Boot context is detected by the parent process being middlewared; manual
 # runs (install.sh, recovery) never trigger a restart.
+#
+# The unit runs wait_restart.sh, which blocks until boot has actually
+# settled (systemd job queue drained, docker/apps state terminal) before
+# restarting. systemd ordering alone (After=multi-user.target, ≤ v0.0.4)
+# fired while ix-reporting and the docker/apps startup were still in flight
+# and killed both — apps and dashboard stats stayed down until the next
+# boot. No Type=oneshot: a oneshot's start job would hold the boot queue
+# open against the `is-system-running --wait` inside the script.
 
 echo "--- deferred restart ---"
 
@@ -340,12 +348,10 @@ else
     # A failed unit from an earlier attempt this boot would block systemd-run.
     systemctl reset-failed truecloud-mw-restart.service 2>/dev/null
     if systemd-run --no-block --collect --unit=truecloud-mw-restart \
-           --property=Type=oneshot \
-           --property=After=multi-user.target \
-           --property=After=ix-postinit.service \
-           systemctl try-restart middlewared; then
+           /bin/bash "$PATCH_DIR/patch/wait_restart.sh"; then
         echo "OK: Scheduled deferred middlewared restart (unit: truecloud-mw-restart)."
-        echo "    Backend patch becomes active once boot completes."
+        echo "    It waits for boot to fully settle (apps started, reporting up),"
+        echo "    then restarts middlewared so the backend patch actually loads."
     else
         echo "WARNING: Could not schedule deferred restart — backend patch is on disk but NOT loaded."
         echo "  Activate manually: systemctl restart middlewared"

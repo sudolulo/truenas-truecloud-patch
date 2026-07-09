@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.2.1 — 2026-07-09
+
+### Fixed
+
+- **Deferred restart raced the rest of boot, leaving all apps and dashboard
+  stats down.** The `truecloud-mw-restart` unit introduced in v0.0.4 relied
+  on systemd ordering (`After=multi-user.target`, `After=ix-postinit.service`),
+  which cannot see middlewared's *internal* boot work. Observed on 25.10.4:
+  the restart fired two seconds into `ix-reporting.service`'s
+  `midclt call reporting.start_service` and before the docker/apps startup
+  task (created on middlewared's system-ready event) had run. Both were
+  killed, and nothing retries them until the next boot — every app stayed
+  down (`docker.status` FAILED, the apps dataset never mounted), netdata
+  never started (no dashboard hardware stats), and the SMB middleware
+  backend was left uninitialized.
+
+  The transient unit now runs `patch/wait_restart.sh` instead of restarting
+  directly: it waits for the systemd boot job queue to drain
+  (`systemctl is-system-running --wait`, covering in-flight `ix-*` oneshots
+  such as ix-reporting), then polls `midclt call docker.status` until the
+  docker state machine leaves its transitional states, then allows a short
+  grace period for middleware-internal tasks with no queryable state before
+  issuing `systemctl try-restart middlewared`. The unit no longer sets
+  `Type=oneshot` — a oneshot's start job stays in the very queue the script
+  waits on and would deadlock on itself. All waits are bounded and fail
+  open: worst case the restart still happens, just later.
+
+  Recovery on a boot that already hit this (without rebooting):
+  `midclt call reporting.start_service` and
+  `midclt call docker.state.start_service true`.
+
 ## v0.2.0 — 2026-07-08
 
 ### Changed
