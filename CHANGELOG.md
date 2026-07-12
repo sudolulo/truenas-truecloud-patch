@@ -91,6 +91,28 @@
 
 ### Changed
 
+- **The patch is now two independent modules, and each retires on its own.**
+  Previously the native-support check looked only for native B2 restic support
+  and, on finding it, set the kill switch and disabled *everything*. With a
+  second capability in the patch that would silently take a still-needed module
+  down with the superseded one — TrueNAS is likely to ship one of these long
+  before the other.
+
+  `apply.sh` now detects each separately (`providers`: does `B2RcloneRemote`
+  carry a real `get_restic_config()`; `nested`: is the *"no further nesting"*
+  validation still in `plugins/cloud/crud.py`), skips just the superseded one,
+  and only sets the kill switch once **both** are done. The UI patch belongs to
+  `providers` and is skipped with it. The deferred middlewared restart now fires
+  when *any* still-needed module landed — keying it off `providers` alone would
+  have left a freshly-patched `nested` module on disk and never loaded on a
+  native-B2 box. `hook_status.json` reports each module with an `active` flag and
+  a reason.
+
+- README rewritten to be less alarmist: dropped the warning boxes and the
+  disclaimer's fear-bulleting in favour of plain statements, and documented the
+  two-module design. The one caveat kept as a plain sentence: the `mount --bind`
+  staging step has not yet been exercised by a live backup run.
+
 - Version strings in `install.sh`, `uninstall.sh`, and `recover.sh` were stale
   at `0.0.4`; all scripts now report the same version.
 - `patch_ui.py`: replaced a `try`/`except`/`pass` with `contextlib.suppress`

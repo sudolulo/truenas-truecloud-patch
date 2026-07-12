@@ -105,12 +105,61 @@ def test_crud_block_is_scoped_to_cloud_backup():
     assert '!= "cloud_backup"' in extract_blocks()["CRUD_BLOCK"]
 
 
+class TestIndependentModules:
+    """The two modules must retire independently.
+
+    TrueNAS may ship native B2 support long before (or after) it handles nested
+    datasets. A single all-or-nothing kill switch would silently take a
+    still-needed module down with the superseded one.
+    """
+
+    def _sh(self):
+        with open(APPLY_SH, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_native_support_is_detected_per_module(self):
+        sh = self._sh()
+        assert "native_b2" in sh
+        assert "native_nested" in sh
+        assert "no further nesting" in sh, "nested native-support probe"
+
+    def test_kill_switch_only_when_both_modules_are_done(self):
+        sh = self._sh()
+        assert '[ "$_providers_needed" = "0" ] && [ "$_nested_needed" = "0" ]' in sh
+        # ...and that is the only place the kill switch is actually set. (Ignore
+        # comment lines, which mention the same path.)
+        code = [ln for ln in sh.splitlines() if not ln.lstrip().startswith("#")]
+        sets = [ln for ln in code if 'touch "$PATCH_DIR/disabled"' in ln]
+        assert len(sets) == 1, f"kill switch set in {len(sets)} places"
+
+    def test_each_module_is_gated_separately(self):
+        src = heredoc_source()
+        assert "if not providers_needed:" in src
+        assert "elif nested_native:" in src
+
+    def test_ui_patch_is_tied_to_the_providers_module(self):
+        # The UI change widens the credential dropdown; it is meaningless once B2
+        # is native, but must NOT be skipped merely because nested is off.
+        sh = self._sh()
+        i = sh.index("--- UI patch ---")
+        assert '[ "$_providers_needed" = "0" ]' in sh[i:i + 400]
+
+    def test_restart_fires_when_any_needed_module_landed(self):
+        # Keying the restart off providers alone would leave a freshly-patched
+        # nested module on disk and never loaded on a native-B2 box.
+        sh = self._sh()
+        i = sh.index("--- deferred restart ---")
+        tail = sh[i:]
+        assert '_backend_ok' in tail
+        assert '"$_b2_ok"' not in tail
+
+
 class TestOptIn:
     """Nested-snapshot support must be opt-in and must never self-enable."""
 
     def test_heredoc_gates_on_the_opt_in_flag(self):
         src = heredoc_source()
-        assert "nested_enabled = sys.argv[7]" in src
+        assert re.search(r"nested_enabled = sys\.argv\[\d+\] == \"1\"", src)
         assert "if not nested_enabled:" in src
 
     def test_apply_sh_reads_the_marker_file(self):
