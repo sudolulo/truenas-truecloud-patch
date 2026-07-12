@@ -127,13 +127,21 @@ def cmd_verify():
     print(f"Hook status (recorded at {status.get('patched_at', 'unknown')})")
     print()
     all_ok = True
+    any_active = False
     for module, info in status.get("patches", {}).items():
         ok = info.get("ok", False)
+        # A module can be inactive because TrueNAS now does it natively, or
+        # because it is opt-in and switched off. Neither is a failure.
+        active = info.get("active", True)
         label = "OK  " if ok else "FAIL"
+        if ok and not active:
+            label = "SKIP"
         detail = f"  — {info['detail']}" if info.get("detail") else ""
         print(f"  [{label}] {module}{detail}")
         if not ok:
             all_ok = False
+        if active:
+            any_active = True
 
     # The disk status alone can false-positive: at boot the files are patched
     # while middlewared is already running with the stock modules imported.
@@ -146,7 +154,11 @@ def cmd_verify():
     mw_start = _middlewared_start_epoch()
 
     proc_stale = False
-    if patched_epoch is None or mw_start is None:
+    if not any_active:
+        # Nothing is patched into middlewared, so whether it restarted since is
+        # irrelevant -- there is nothing for it to have loaded.
+        print("  [--  ] running middlewared process — no active module; nothing to load")
+    elif patched_epoch is None or mw_start is None:
         print("  [??  ] running middlewared process — could not compare start time;")
         print("         the results above reflect the on-disk state only")
     elif mw_start + 2 < patched_epoch:

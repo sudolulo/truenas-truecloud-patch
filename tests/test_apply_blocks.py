@@ -144,6 +144,24 @@ class TestIndependentModules:
         i = sh.index("--- UI patch ---")
         assert '[ "$_providers_needed" = "0" ]' in sh[i:i + 400]
 
+    def test_status_reports_an_inactive_module_as_ok(self):
+        # `create_task.py verify` fails if any patches[*].ok is false. An opt-in
+        # module that is switched off (the DEFAULT) must not report FAIL, or a
+        # stock install fails verification out of the box.
+        src = heredoc_source()
+        assert "'ok': (not nested_needed) or nested_ok" in src
+        assert "'ok': (not providers_needed) or bool(b2_ok and restic_ok)" in src
+        assert "'active': nested_needed" in src
+
+    def test_nested_native_probe_ignores_our_own_block(self):
+        # CRUD_BLOCK quotes the guard message, so scanning the whole file would
+        # find the string in our own patch and never detect native support.
+        sh = self._sh()
+        assert "split('\\n# TRUECLOUD_PATCH', 1)[0]" in sh
+        assert "no further nesting" in extract_blocks()["CRUD_BLOCK"], (
+            "if this ever stops being true, the probe comment is stale"
+        )
+
     def test_restart_fires_when_any_needed_module_landed(self):
         # Keying the restart off providers alone would leave a freshly-patched
         # nested module on disk and never loaded on a native-B2 box.
@@ -152,6 +170,18 @@ class TestIndependentModules:
         tail = sh[i:]
         assert '_backend_ok' in tail
         assert '"$_b2_ok"' not in tail
+
+    def test_partial_failure_still_schedules_the_restart(self):
+        # If providers fails but nested landed (or vice versa), something new IS
+        # on disk. Collapsing that into "nothing to do" would leave the module
+        # that succeeded permanently unloaded.
+        src = heredoc_source()
+        assert "sys.exit(2 if _landed else 1)" in src
+        assert "_landed = (providers_needed and b2_ok and restic_ok) or (nested_needed and nested_ok)" in src
+
+        sh = self._sh()
+        assert '_rc=$?' in sh
+        assert '[ "$_rc" = "2" ]' in sh
 
 
 class TestOptIn:

@@ -248,7 +248,7 @@ mount | grep truecloud-nested                            # expect no output
 | Backup fails: `dataset '…' has no snapshot '…'; refusing to back up an incomplete tree` | Working as designed — a descendant dataset was not covered by the snapshot. The backup is refused rather than silently omitting that data. |
 | Backup fails: `snapshot '…' cannot be read (Permission denied)` | The snapshot exists but is unreadable. Middleware runs as root, so this indicates a real permissions problem, not a missing snapshot. |
 | `cloud_backup-*` snapshots accumulating | The sweep is not running. Check `apply.log` for the nested patch applying, and confirm `sync.py` carries the `TRUECLOUD_PATCH` block. |
-| Stale mounts under `/run/truecloud-nested` | A crashed run. The next run tears them down; `uninstall.sh` also cleans them. |
+| Stale mounts under `/run/truecloud-nested` | A crashed run. The next backup tears them down. To clear them now: `python3 patch/truecloud_nested.py cleanup` (also run by `uninstall.sh` and `recover.sh`). It names any ZFS snapshot an interrupted run left pinned. |
 
 ## Supported providers after patching
 
@@ -539,19 +539,28 @@ patch re-runs at next reboot, or you run
 python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify
 ```
 
-If one or more entries show `[FAIL]`:
+`verify` reports one line per module:
+
+| Label | Meaning |
+|---|---|
+| `[OK  ]` | Module is active and applied. |
+| `[SKIP]` | Module is inactive — either TrueNAS now does it natively, or it is opt-in and switched off. **Not a failure.** `nested_snapshots` shows SKIP on a default install. |
+| `[FAIL]` | Module is needed but did not apply. |
+
+If a module shows `[FAIL]`:
 
 1. **Check the apply log** for errors during the last boot:
    ```bash
-   cat /mnt/tank/truenas-truecloud-patch/apply.log | tail -40
+   tail -40 /mnt/tank/truenas-truecloud-patch/apply.log
    ```
 2. **Check middlewared's own log** for Python tracebacks:
    ```bash
    grep -i "truecloud\|traceback\|error" /var/log/middlewared.log 2>/dev/null | tail -30
    journalctl -u middlewared -n 50
    ```
-3. **A FAIL is non-fatal.** middlewared runs normally; the affected provider
-   falls back to Storj-only. Your existing backups are not at risk.
+3. **A FAIL is non-fatal.** middlewared runs normally and the other module is
+   unaffected; the failed one is simply inactive. Existing backups are not at
+   risk.
 4. **If the detail says the module doesn't exist**, a TrueNAS update renamed
    or restructured the internal API.
    [Open an issue](https://github.com/sudolulo/truenas-truecloud-patch/issues)

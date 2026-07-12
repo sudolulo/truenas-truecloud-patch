@@ -153,15 +153,22 @@ except Exception:
     pass
 
 # nested: stock gates nested datasets with a validation in plugins/cloud/crud.py.
-# We only ever append to that file, so the stock text survives our patch -- if the
-# guard is gone, iX removed it, which means they implemented the traversal.
+# If that guard is gone, iX removed it, which means they implemented the traversal.
+#
+# Only look at the STOCK part of the file. Our own CRUD_BLOCK quotes the guard
+# message (it filters on it), so scanning the whole file would find the string in
+# our own patch and conclude the guard is still there. That happens to be
+# harmless today because detection runs before patching, but it makes the probe
+# silently order-dependent -- so cut our block off explicitly.
+#
 # If the file cannot be read we assume 'no' and keep patching: worst case the
 # patch declines to apply and the option simply stays unavailable.
 try:
     crud = os.path.join(result['mw_dir'], 'plugins', 'cloud', 'crud.py')
     with open(crud, encoding='utf-8', errors='replace') as fh:
-        if 'no further nesting' not in fh.read():
-            result['native_nested'] = 'yes'
+        stock_src = fh.read().split('\n# TRUECLOUD_PATCH', 1)[0]
+    if 'no further nesting' not in stock_src:
+        result['native_nested'] = 'yes'
 except Exception:
     pass
 
@@ -532,27 +539,19 @@ else:
         print('WARNING: Stock nesting guard remains; snapshot option stays unavailable')
         print('WARNING: for nested datasets. Existing backups are unaffected.')
 
+# One entry per MODULE, not per file. `ok` means "nothing is wrong", so a module
+# that is inactive (superseded, or opt-in and off) is ok -- reporting a disabled
+# opt-in feature as FAIL would make `create_task.py verify` fail on a default
+# install. `active` says whether the module is doing anything.
 patches = {
-    'module.providers': {
-        'ok': bool(b2_ok and restic_ok) or not providers_needed,
+    'providers': {
+        'ok': (not providers_needed) or bool(b2_ok and restic_ok),
         'active': providers_needed,
         'detail': providers_detail,
     },
-    'module.nested_snapshots': {
-        'ok': nested_ok or not nested_needed,
+    'nested_snapshots': {
+        'ok': (not nested_needed) or nested_ok,
         'active': nested_needed,
-        'detail': nested_detail,
-    },
-    'middlewared.rclone.remote.b2': {
-        'ok': b2_ok,
-        'detail': 'patched on disk in overlay at boot' if b2_ok else providers_detail,
-    },
-    'middlewared.plugins.cloud_backup.restic': {
-        'ok': restic_ok,
-        'detail': 'patched on disk in overlay at boot' if restic_ok else providers_detail,
-    },
-    'middlewared.plugins.cloud.nested_snapshot': {
-        'ok': nested_ok,
         'detail': nested_detail,
     },
 }
@@ -566,18 +565,34 @@ try:
 except OSError as e:
     print(f'WARNING: Could not write hook_status.json: {e}')
 
-# Exit 0 only if every module that is still NEEDED applied cleanly. A module that
-# was skipped (superseded or opt-out) is not a failure.
-_providers_done = (not providers_needed) or (b2_ok and restic_ok)
+# Exit code tells the caller whether a middlewared restart is still worth doing:
+#
+#   0  every module that was needed applied cleanly
+#   2  PARTIAL -- one module failed but another landed, so there IS something new
+#      on disk waiting to be loaded
+#   1  nothing landed; a restart would accomplish nothing
+#
+# Collapsing 2 into 1 would mean a failing providers patch suppresses the restart
+# that a freshly-applied nested patch needs, leaving it on disk and never loaded.
+_providers_done = (not providers_needed) or bool(b2_ok and restic_ok)
 _nested_done = (not nested_needed) or nested_ok
-sys.exit(0 if (_providers_done and _nested_done) else 1)
+_landed = (providers_needed and b2_ok and restic_ok) or (nested_needed and nested_ok)
+
+if _providers_done and _nested_done:
+    sys.exit(0)
+sys.exit(2 if _landed else 1)
 PYEOF
         then
             _backend_ok=1
         else
-            # Individual results already printed above; exit code 1 means at least
-            # one module that was still needed failed to apply.
-            _backend_ok=0
+            _rc=$?
+            if [ "$_rc" = "2" ]; then
+                # One module failed, but another was applied and still needs loading.
+                _backend_ok=1
+                echo "WARNING: a module failed to apply; the other landed and will be loaded."
+            else
+                _backend_ok=0
+            fi
         fi
 fi
 
@@ -625,15 +640,17 @@ fi
 
 echo "--- deferred restart ---"
 
-# Restart when ANY still-needed backend module landed. Keying this off the
-# providers module alone would skip the restart on a box where B2 has gone native
-# but the nested module was freshly patched — leaving it on disk and never loaded.
+# Restart when ANY still-needed backend module landed (_backend_ok, incl. the
+# partial case). Keying this off the providers module alone would skip the restart
+# on a box where B2 has gone native but the nested module was freshly patched —
+# leaving it on disk and never loaded.
+#
+# "No module active at all" cannot reach here: that is the kill-switch branch
+# above, which exits.
 if ! grep -aq middlewared "/proc/$PPID/cmdline" 2>/dev/null; then
     echo "Manual run (parent is not middlewared) — no restart scheduled."
-elif [ "$_providers_needed" = "0" ] && [ "$_nested_needed" = "0" ]; then
-    echo "No backend module active — no restart scheduled (nothing new to load)."
-elif [ "${_backend_ok:-0}" != "1" ]; then
-    echo "Backend patch incomplete — no restart scheduled (nothing new to load)."
+elif [ "$_backend_ok" != "1" ]; then
+    echo "Nothing landed on disk — no restart scheduled (nothing new to load)."
 else
     # A failed unit from an earlier attempt this boot would block systemd-run.
     systemctl reset-failed truecloud-mw-restart.service 2>/dev/null

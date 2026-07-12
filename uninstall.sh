@@ -95,38 +95,13 @@ echo ""
 # These bind mounts pin their ZFS snapshots, so they must go before anything
 # tries to destroy those snapshots. Deepest first.
 
+# Delegated to the patch module rather than reimplemented here: the depth
+# ordering and lazy-umount fallback are fiddly, and a shell copy would be the
+# untested one.
 echo "Unmounting nested-snapshot staging trees (if any) ..."
-_stage_found=0
-_stage_failed=0
-# Deepest FIRST, by path depth (slash count) — not string length, which would
-# let a long shallow path jump ahead of a short deep one and leave a child
-# mounted (and its ZFS snapshot pinned).
-while IFS= read -r _mp; do
-    [ -n "$_mp" ] || continue
-    if umount "$_mp" 2>/dev/null || umount -l "$_mp" 2>/dev/null; then
-        echo "  Unmounted: $_mp"
-    else
-        echo "  WARNING: Could not unmount $_mp"
-        _stage_failed=1
-    fi
-    _stage_found=1
-done < <(awk '$2 == "/run/truecloud-nested" || index($2, "/run/truecloud-nested/") == 1 {
-                 n = gsub(/\//, "/", $2); print n, $2
-             }' /proc/self/mounts 2>/dev/null | sort -rn | cut -d' ' -f2-)
-
-if [ "$_stage_found" -eq 0 ]; then
-    echo "  None active."
-fi
-
-# NEVER `rm -rf` here: if an unmount failed, that would recurse *through* a live
-# bind mount into the ZFS snapshot behind it. Remove empty directories only.
-if [ "$_stage_failed" -eq 0 ]; then
-    find /run/truecloud-nested -depth -type d -exec rmdir {} + 2>/dev/null || true
-    rm -f /run/truecloud-nested/*.snapshot 2>/dev/null || true
-    rmdir /run/truecloud-nested 2>/dev/null || true
-else
-    echo "  WARNING: staging mounts remain; leaving /run/truecloud-nested in place."
-    echo "           Unmount them manually, then remove the directory."
+if ! python3 "$PATCH_DIR/patch/truecloud_nested.py" cleanup; then
+    echo "  WARNING: staging mounts remain. Unmount them manually; until you do,"
+    echo "           the ZFS snapshots they pin cannot be destroyed."
 fi
 
 # The opt-in marker lives in the repo dir; remove it so a later re-install

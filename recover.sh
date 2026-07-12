@@ -21,6 +21,7 @@ VERSION="0.3.0"
 
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+
 echo "=== TrueNAS TrueCloud Provider Patch v${VERSION} — Recover ==="
 echo ""
 
@@ -51,6 +52,14 @@ for _tag in mw ui; do
     fi
 done
 [ "$_any" -eq 0 ] && echo "  No overlays active."
+
+# Nested-snapshot staging trees are bind mounts that PIN their ZFS snapshots, so
+# leaving them mounted blocks those snapshots from ever being destroyed. The
+# overlays above are volatile, but these are not self-healing without a reboot,
+# and recover.sh is expected to work without one.
+echo "Unmounting nested-snapshot staging trees ..."
+# Best-effort: never block recovery. Same tested implementation as uninstall.sh.
+python3 "$PATCH_DIR/patch/truecloud_nested.py" cleanup || true
 
 # Cancel a deferred boot restart if one is still queued — we restart ourselves.
 systemctl stop truecloud-mw-restart.service 2>/dev/null

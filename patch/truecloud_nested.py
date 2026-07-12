@@ -60,10 +60,10 @@ import stat
 import subprocess
 
 __all__ = [
-    "ACTIVE",
     "STAGING_BASE",
     "StagingError",
     "apply_plan",
+    "cleanup_all",
     "cleanup_task",
     "current_mounts_under",
     "delete_snapshot_tree",
@@ -79,9 +79,10 @@ __all__ = [
 #: Where staging trees are assembled. tmpfs; bind mounts consume no space.
 STAGING_BASE = "/run/truecloud-nested"
 
-#: staging_root -> zfs snapshot name. A cache; the sidecar file is the source of
-#: truth, so that a middlewared restart cannot orphan a snapshot.
-ACTIVE: dict[str, str] = {}
+# Which snapshot a staging tree pins is recorded ONLY in the sidecar file, never
+# also in memory. An in-process dict would be a second source of truth that a
+# middlewared restart silently empties -- and it is exactly the restart case that
+# must not orphan a 250-snapshot tree. One record, on disk, or none.
 
 
 class StagingError(Exception):
@@ -459,8 +460,6 @@ async def stage_nested(middleware, path, snapshot, base_dataset, base_mountpoint
         await middleware.run_in_thread(_remove_sidecar, staging_root)
         raise
 
-    ACTIVE[staging_root] = snapshot
-
     if logger:
         logger.info(
             "truecloud-patch: staged %d dataset(s) from %s at %s",
@@ -475,12 +474,7 @@ async def cleanup_task(middleware, task_name, logger=None):
     Safe to call unconditionally: a no-op when the task was never staged.
     """
     staging_root = staging_root_for(task_name)
-    sidecar = sidecar_for(staging_root)
-
-    snapshot = ACTIVE.pop(staging_root, None)
-    if snapshot is None:
-        # Sidecar survives a middlewared restart; ACTIVE does not.
-        snapshot = _read_sidecar(staging_root)
+    snapshot = _read_sidecar(staging_root)
 
     if snapshot is None and not os.path.isdir(staging_root):
         return  # never staged; nothing to do
@@ -493,5 +487,65 @@ async def cleanup_task(middleware, task_name, logger=None):
     if snapshot is not None:
         await delete_snapshot_tree(middleware, snapshot, logger=logger)
 
-    with contextlib.suppress(OSError):
-        os.unlink(sidecar)
+    _remove_sidecar(staging_root)
+
+
+# ── offline cleanup (uninstall.sh / recover.sh) ───────────────────────────────
+
+
+def cleanup_all(base=None, runner=_run, mounts_file="/proc/self/mounts",
+                glob_fn=None, read_sidecar=_read_sidecar):
+    """Tear down every staging tree. Used by uninstall.sh and recover.sh.
+
+    Those scripts must work when middlewared is dead, so they cannot go through
+    the async path -- but they must not reimplement the teardown either: the
+    depth-ordering and lazy-umount fallback are fiddly, and a second copy in
+    shell would be the untested one. This is the same tested code.
+
+    Returns ``(lines, errors)``: report lines to print, and unmount errors.
+    """
+    import glob as _glob
+
+    base = base or STAGING_BASE
+    glob_fn = glob_fn or _glob.glob
+    lines = []
+
+    # Report orphaned snapshots BEFORE removing the sidecars that name them --
+    # a sidecar is the only record that an interrupted run's snapshot tree (one
+    # snapshot per descendant dataset) is still on disk.
+    for sc in sorted(glob_fn(os.path.join(base, "*.snapshot"))):
+        snap = read_sidecar(sc[: -len(".snapshot")])
+        if snap:
+            lines.append(f"  NOTE: an interrupted backup left snapshot '{snap}' behind.")
+            lines.append(f"        Remove it and its children:  zfs destroy -r '{snap}'")
+
+    mounts = current_mounts_under(base, mounts_file=mounts_file)
+    if not mounts:
+        lines.append("  None active.")
+    for mp in mounts:
+        lines.append(f"  Unmounting: {mp}")
+
+    errors = teardown(base, runner=runner, mounts_file=mounts_file)
+    for err in errors:
+        lines.append(f"  WARNING: could not unmount {err}")
+
+    if not errors:
+        for sc in glob_fn(os.path.join(base, "*.snapshot")):
+            with contextlib.suppress(OSError):
+                os.unlink(sc)
+        with contextlib.suppress(OSError):
+            os.rmdir(base)
+
+    return lines, errors
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "cleanup":
+        _lines, _errors = cleanup_all()
+        for _line in _lines:
+            print(_line)
+        sys.exit(1 if _errors else 0)
+    print("usage: truecloud_nested.py cleanup", file=sys.stderr)
+    sys.exit(2)

@@ -123,6 +123,40 @@
 - `patch/__pycache__/create_task.cpython-314.pyc` was committed to the
   repository; it is now untracked and `__pycache__/` is gitignored.
 
+### Fixed (post-merge audit)
+
+- **`create_task.py verify` failed on a default install.** `hook_status.json`
+  emitted a per-file entry for the nested module with `ok: false` whenever the
+  feature was switched off — which is the default — so `verify` printed `[FAIL]`
+  and exited 1 right after the README told users to run it. Status is now
+  reported per *module* with an `active` flag, and `verify` renders an inactive
+  module as `[SKIP]` rather than a failure.
+- **A partial apply suppressed the middlewared restart.** The exit code
+  conflated "nothing applied" with "one module applied, one failed", so a failing
+  providers patch would prevent the restart that a freshly-applied nested patch
+  needs — leaving it on disk and never loaded. Exit 2 now means partial, and the
+  restart still fires.
+- **The native-nested probe could never fire.** It scanned `crud.py` for the
+  guard message, but our own injected block *quotes* that message, so once
+  applied the probe would always conclude the guard was still present. It now
+  reads only the stock portion of the file.
+- `recover.sh` did not unmount staging trees, so an emergency recovery left bind
+  mounts pinning ZFS snapshots that could then never be destroyed.
+- `uninstall.sh` deleted sidecar files without reading them. A sidecar is the
+  only record that an interrupted run's snapshot tree is still on disk; both
+  scripts now name the snapshot (`zfs destroy -r ...`) before clearing it.
+
+### Refactored
+
+- Staging teardown had been copy-pasted into `uninstall.sh` and `recover.sh` —
+  two untested shell copies of the fiddly depth-ordering and lazy-umount logic.
+  Both now call `python3 patch/truecloud_nested.py cleanup`, so there is one
+  implementation and it is the one under test.
+- Dropped the in-memory `ACTIVE` dict. The sidecar file was already the source of
+  truth; a second in-process record could only desync — and it is the
+  middlewared-restart case (which empties it) that must not orphan a snapshot
+  tree. One record, on disk, or none.
+
 ### Known issues
 
 - Stock `restic_backup()` deletes the ZFS snapshot in its own `finally`, which

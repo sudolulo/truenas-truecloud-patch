@@ -21,9 +21,9 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "patch"))
 
 from truecloud_nested import (  # noqa: E402
-    ACTIVE,
     StagingError,
     apply_plan,
+    cleanup_all,
     cleanup_task,
     current_mounts_under,
     delete_snapshot_tree,
@@ -255,9 +255,6 @@ class TestDeleteSnapshotTree:
 
 
 class TestStageNestedOrdering:
-    def setup_method(self):
-        ACTIVE.clear()
-
     def test_sidecar_is_written_before_anything_is_mounted(self, tmp_path, monkeypatch):
         # middlewared can die at any moment. If the snapshot were recorded only
         # after apply_plan, a crash in that window would orphan a 160-snapshot
@@ -344,13 +341,10 @@ class TestStageNestedOrdering:
 
 
 class TestCleanupTask:
-    def setup_method(self):
-        ACTIVE.clear()
-
     def test_recovers_snapshot_from_sidecar_after_middlewared_restart(self, tmp_path,
                                                                       monkeypatch):
-        # ACTIVE is in-process; a restart wipes it. The sidecar is the source of
-        # truth, otherwise the snapshot tree is orphaned forever.
+        # The sidecar is the ONLY record of the pinned snapshot, precisely so a
+        # middlewared restart cannot orphan the tree.
         import truecloud_nested as tn
 
         monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
@@ -359,7 +353,6 @@ class TestCleanupTask:
         with open(sidecar_for(root), "w", encoding="utf-8") as fh:
             fh.write("Tap@snap")
 
-        ACTIVE.clear()  # simulate the restart
         mw = FakeMiddleware(["Tap@snap", "Tap/apps@snap"])
         monkeypatch.setattr(tn, "teardown", lambda *_a, **_k: [])
 
@@ -487,6 +480,86 @@ class TestTeardown:
         runner = Busy()
         assert teardown(ROOT, runner=runner, mounts_file=str(mounts_file)) == []
         assert ["umount", "-l", ROOT] in runner.calls
+
+
+class TestCleanupAll:
+    """uninstall.sh and recover.sh call this instead of reimplementing teardown."""
+
+    def test_reports_orphan_snapshots_before_deleting_their_sidecars(self, tmp_path):
+        # The sidecar is the only record that an interrupted run's snapshot tree
+        # is still on disk. Deleting it without naming the snapshot orphans the
+        # whole tree silently.
+        base = tmp_path / "stage"
+        base.mkdir()
+        (base / "cloud_backup-5.snapshot").write_text("Tap@interrupted")
+
+        mounts_file = tmp_path / "mounts"
+        mounts_file.write_text("")
+
+        lines, errors = cleanup_all(
+            base=str(base), runner=FakeRunner(), mounts_file=str(mounts_file)
+        )
+        assert errors == []
+        assert any("Tap@interrupted" in ln for ln in lines)
+        assert any("zfs destroy -r" in ln for ln in lines)
+        # Sidecar cleared only after being reported.
+        assert not (base / "cloud_backup-5.snapshot").exists()
+
+    def test_unmounts_everything_under_the_base_deepest_first(self, tmp_path):
+        base = tmp_path / "stage"
+        base.mkdir()
+        mounts_file = tmp_path / "mounts"
+        mounts_file.write_text(
+            f"tmpfs {base} tmpfs rw 0 0\n"
+            f"tmpfs {base}/cloud_backup-5 tmpfs rw 0 0\n"
+            f"tmpfs {base}/cloud_backup-5/apps tmpfs rw 0 0\n"
+        )
+        runner = FakeRunner()
+        _lines, errors = cleanup_all(
+            base=str(base), runner=runner, mounts_file=str(mounts_file)
+        )
+        assert errors == []
+        order = [c[-1] for c in runner.calls if c[0] == "umount"]
+        assert order == [
+            f"{base}/cloud_backup-5/apps",
+            f"{base}/cloud_backup-5",
+            str(base),
+        ]
+
+    def test_keeps_sidecars_when_an_unmount_failed(self, tmp_path):
+        # If a mount is stuck, the snapshot is still pinned — so the record of it
+        # must survive for the next run (or the operator) to act on.
+        base = tmp_path / "stage"
+        base.mkdir()
+        (base / "cloud_backup-5.snapshot").write_text("Tap@stuck")
+        mounts_file = tmp_path / "mounts"
+        mounts_file.write_text(f"tmpfs {base}/cloud_backup-5 tmpfs rw 0 0\n")
+
+        class Stuck(FakeRunner):
+            def __call__(self, cmd):
+                self.calls.append(cmd)
+
+                class R:
+                    returncode = 32
+                    stderr = "target is busy"
+
+                return R
+
+        _lines, errors = cleanup_all(
+            base=str(base), runner=Stuck(), mounts_file=str(mounts_file)
+        )
+        assert errors, "a stuck unmount must be reported"
+        assert (base / "cloud_backup-5.snapshot").exists()
+
+    def test_is_a_noop_on_a_clean_system(self, tmp_path):
+        mounts_file = tmp_path / "mounts"
+        mounts_file.write_text("")
+        lines, errors = cleanup_all(
+            base=str(tmp_path / "absent"), runner=FakeRunner(),
+            mounts_file=str(mounts_file),
+        )
+        assert errors == []
+        assert lines == ["  None active."]
 
 
 class TestCurrentMountsUnder:
