@@ -8,6 +8,7 @@ these tests do.
 import ast
 import os
 import re
+import textwrap
 
 import pytest
 
@@ -44,6 +45,35 @@ def extract_blocks():
                 ):
                     blocks[tgt.id] = node.value.value
     return blocks
+
+
+def _nested_native_detector():
+    """The REAL native-nested probe, lifted out of apply.sh.
+
+    Extracted rather than reimplemented: a reimplementation would happily pass
+    while the shipped probe stayed broken, which is precisely the bug this guards.
+    """
+    with open(APPLY_SH, encoding="utf-8") as fh:
+        sh = fh.read()
+
+    m = re.search(
+        r"^(\s*)_drop = str\.maketrans\(.*?\n\s*if 'nofurthernesting' not in "
+        r"stock_src\.translate\(_drop\):\n\s*result\['native_nested'\] = 'yes'",
+        sh, re.S | re.M,
+    )
+    assert m, "could not find the native-nested probe in apply.sh"
+
+    # The block lives inside a double-quoted shell string; undo bash's escaping.
+    body = m.group(0)
+    body = body.replace("\\\\", "\x00").replace('\\"', '"').replace("\x00", "\\")
+    body = textwrap.dedent(body)
+
+    def detect(stock_src):
+        ns = {"stock_src": stock_src, "result": {"native_nested": "no"}, "chr": chr}
+        exec(body, ns)  # noqa: S102 - executing our own shipped code, on purpose
+        return ns["result"]["native_nested"]
+
+    return detect
 
 
 def test_heredoc_itself_compiles():
@@ -152,6 +182,38 @@ class TestIndependentModules:
         assert "'ok': (not nested_needed) or nested_ok" in src
         assert "'ok': (not providers_needed) or bool(b2_ok and restic_ok)" in src
         assert "'active': nested_needed" in src
+
+    def test_nested_native_probe_matches_the_real_wrapped_source(self):
+        """Stock splits the guard message across adjacent string literals.
+
+        Python concatenates them at runtime, so the errmsg is contiguous -- but the
+        SOURCE never contains the whole phrase. A raw substring search finds
+        nothing, concludes iX removed the guard, and silently skips this module
+        forever. This is exactly what happened, and only a run against real
+        middlewared caught it.
+        """
+        detect = _nested_native_detector()
+
+        # Verbatim shape from TrueNAS plugins/cloud/crud.py.
+        stock_wrapped = (
+            '            verrors.add(f"{name}.snapshot", '
+            '"This option is only available for datasets that have no further "\n'
+            '                                            "nesting")\n'
+        )
+        assert detect(stock_wrapped) == "no", "guard is present; must NOT report native"
+
+        # Same message on a single line — must also be detected.
+        assert detect('verrors.add(x, "... have no further nesting")\n') == "no"
+
+        # Single-quoted, three-way split — still the guard.
+        assert detect(
+            "verrors.add(x, 'This option is only available for '\n"
+            "               'datasets that have no further '\n"
+            "               'nesting')\n"
+        ) == "no"
+
+        # Guard genuinely gone -> native support.
+        assert detect("def _validate(self):\n    pass\n") == "yes"
 
     def test_nested_native_probe_ignores_our_own_block(self):
         # CRUD_BLOCK quotes the guard message, so scanning the whole file would

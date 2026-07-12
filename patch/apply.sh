@@ -167,7 +167,20 @@ try:
     crud = os.path.join(result['mw_dir'], 'plugins', 'cloud', 'crud.py')
     with open(crud, encoding='utf-8', errors='replace') as fh:
         stock_src = fh.read().split('\n# TRUECLOUD_PATCH', 1)[0]
-    if 'no further nesting' not in stock_src:
+    # The guard message is SPLIT across adjacent string literals in the source:
+    #
+    #     verrors.add(..., 'This option is only available for datasets that have no further '
+    #                      'nesting')
+    #
+    # Python concatenates those at runtime, so the errmsg is contiguous -- but the
+    # SOURCE never contains the whole phrase. A raw search finds nothing, concludes
+    # iX removed the guard, and silently skips this module FOREVER. (Caught only by
+    # running the probe against real middlewared.)
+    #
+    # Strip whitespace and quote characters, then match the compacted phrase. That
+    # is robust to any wrapping or concatenation style iX may use.
+    _drop = str.maketrans('', '', ' \\t\\n\\r' + chr(34) + chr(39))
+    if 'nofurthernesting' not in stock_src.translate(_drop):
         result['native_nested'] = 'yes'
 except Exception:
     pass

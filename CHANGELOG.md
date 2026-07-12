@@ -146,6 +146,25 @@
   only record that an interrupted run's snapshot tree is still on disk; both
   scripts now name the snapshot (`zfs destroy -r ...`) before clearing it.
 
+- **The native-nested probe could never detect the guard, silently disabling the
+  whole module.** Stock splits the message across adjacent string literals:
+
+  ```python
+  verrors.add(f"{name}.snapshot", "This option is only available for datasets that have no further "
+                                  "nesting")
+  ```
+
+  Python concatenates those at runtime — so the *errmsg* is contiguous and the
+  runtime filter works — but the **source never contains the whole phrase**. The
+  probe's substring search found nothing, concluded iX had removed the guard, and
+  skipped the nested module as "already native". `apply.log` would report
+  *"TrueNAS now handles nesting natively"* and the feature would never work.
+  It fails safe (the stock guard stays, so no data is at risk) but the module was
+  100% dead. The probe now strips whitespace and quotes before matching, which is
+  robust to any wrapping style. Caught only by running the probe against real
+  middlewared; there is now a regression test that executes apply.sh's own probe
+  code against the real wrapped source.
+
 ### Refactored
 
 - Staging teardown had been copy-pasted into `uninstall.sh` and `recover.sh` —
