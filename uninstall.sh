@@ -91,6 +91,52 @@ if [ "$_ov_found" -eq 0 ]; then
 fi
 echo ""
 
+# ── Unmount nested-snapshot staging trees ─────────────────────────────────────
+# These bind mounts pin their ZFS snapshots, so they must go before anything
+# tries to destroy those snapshots. Deepest first.
+
+echo "Unmounting nested-snapshot staging trees (if any) ..."
+_stage_found=0
+_stage_failed=0
+# Deepest FIRST, by path depth (slash count) — not string length, which would
+# let a long shallow path jump ahead of a short deep one and leave a child
+# mounted (and its ZFS snapshot pinned).
+while IFS= read -r _mp; do
+    [ -n "$_mp" ] || continue
+    if umount "$_mp" 2>/dev/null || umount -l "$_mp" 2>/dev/null; then
+        echo "  Unmounted: $_mp"
+    else
+        echo "  WARNING: Could not unmount $_mp"
+        _stage_failed=1
+    fi
+    _stage_found=1
+done < <(awk '$2 == "/run/truecloud-nested" || index($2, "/run/truecloud-nested/") == 1 {
+                 n = gsub(/\//, "/", $2); print n, $2
+             }' /proc/self/mounts 2>/dev/null | sort -rn | cut -d' ' -f2-)
+
+if [ "$_stage_found" -eq 0 ]; then
+    echo "  None active."
+fi
+
+# NEVER `rm -rf` here: if an unmount failed, that would recurse *through* a live
+# bind mount into the ZFS snapshot behind it. Remove empty directories only.
+if [ "$_stage_failed" -eq 0 ]; then
+    find /run/truecloud-nested -depth -type d -exec rmdir {} + 2>/dev/null || true
+    rm -f /run/truecloud-nested/*.snapshot 2>/dev/null || true
+    rmdir /run/truecloud-nested 2>/dev/null || true
+else
+    echo "  WARNING: staging mounts remain; leaving /run/truecloud-nested in place."
+    echo "           Unmount them manually, then remove the directory."
+fi
+
+# The opt-in marker lives in the repo dir; remove it so a later re-install
+# starts from the safe default (feature off).
+if [ -f "$PATCH_DIR/nested_snapshots_enabled" ]; then
+    rm -f "$PATCH_DIR/nested_snapshots_enabled"
+    echo "  Removed nested-snapshot opt-in marker."
+fi
+echo ""
+
 if [ "$_restore_failed" -eq 1 ]; then
     echo ""
     echo "ERROR: One or more UI bundle backups could not be restored." >&2

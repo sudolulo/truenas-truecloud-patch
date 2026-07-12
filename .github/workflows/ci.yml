@@ -24,8 +24,10 @@ jobs:
           done < <(find . -name '*.sh' -not -path './.git/*')
           exit $fail
 
+      # Pinned to a release tag, not @master: a third-party action on a moving
+      # branch runs whatever that branch contains at the time CI fires.
       - name: shellcheck
-        uses: ludeeus/action-shellcheck@master
+        uses: ludeeus/action-shellcheck@2.0.0
         env:
           SHELLCHECK_OPTS: -S warning -e SC1091
 

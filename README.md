@@ -89,6 +89,18 @@ support and the reason is logged to `apply.log` in your repo root.
 
 ## Nested-dataset snapshots
 
+> **Opt-in, and off by default.** This feature changes how backups read their
+> source data, so it is never enabled implicitly:
+>
+> ```bash
+> bash install.sh --enable-nested-snapshots    # turn it on
+> bash install.sh --disable-nested-snapshots   # turn it back off
+> ```
+>
+> With neither flag, `install.sh` leaves the current setting alone — so a
+> `git pull && bash install.sh` can never silently flip it. The B2/S3 provider
+> patch is unaffected either way.
+
 TrueCloud Backup's **Take Snapshot** option makes restic read from a frozen ZFS
 snapshot instead of live files. Without it the backup reads data *while apps are
 writing to it* — databases get captured mid-write, and an app that rewrites its

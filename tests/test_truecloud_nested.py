@@ -1,11 +1,18 @@
 """Tests for nested-dataset snapshot staging.
 
-The cardinal rule under test: a tree that cannot be staged completely must fail
-LOUDLY. A silently-incomplete backup is the exact failure that stock TrueNAS's
-"no further nesting" guard exists to prevent, and it is the one regression this
-feature must never introduce.
+Two rules are under test above all else:
+
+1. A tree that cannot be staged completely must fail LOUDLY. A silently
+   incomplete backup is the exact failure that stock TrueNAS's "no further
+   nesting" guard exists to prevent.
+
+2. Every snapshot we cause to exist must be cleaned up. ``zfs.snapshot.delete``
+   is non-recursive by default and stock calls it with no options, so a
+   recursive snapshot would otherwise orphan one snapshot per descendant dataset
+   on EVERY run.
 """
 
+import asyncio
 import os
 import sys
 
@@ -14,10 +21,15 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "patch"))
 
 from truecloud_nested import (  # noqa: E402
+    ACTIVE,
     StagingError,
     apply_plan,
+    cleanup_task,
     current_mounts_under,
+    delete_snapshot_tree,
     plan_staging,
+    sidecar_for,
+    snapshot_tree_names,
     staging_root_for,
     teardown,
     verify_staged,
@@ -47,22 +59,24 @@ DATASETS = [
     ds("Tap/apps/immich/pgdata", "/mnt/Tap/apps/immich/pgdata"),
 ]
 
-ALL_DIRS_EXIST = lambda _p: True  # noqa: E731
+
+def yes(_path):
+    return True
+
+
+def plan(datasets=DATASETS, base_dataset="Tap", base_mp="/mnt/Tap",
+         path="/mnt/Tap", isdir=yes):
+    return plan_staging(base_dataset, base_mp, path, SNAP, datasets, ROOT, isdir=isdir)
 
 
 class TestPlanStaging:
     def test_stages_every_descendant_dataset(self):
-        mounts, skipped = plan_staging(
-            "/mnt/Tap", "/mnt/Tap", SNAP, DATASETS, ROOT, isdir=ALL_DIRS_EXIST
-        )
+        mounts, skipped = plan()
         assert skipped == []
-
-        # Root + all 5 descendants. The base dataset itself is the root, not a
-        # descendant, so it must not be double-mounted.
-        assert len(mounts) == 6
+        assert len(mounts) == 6  # root + 5 descendants
         assert mounts[0] == (f"/mnt/Tap/.zfs/snapshot/{SNAP}", ROOT)
 
-        by_target = dict((t, s) for s, t in mounts)
+        by_target = {t: s for s, t in mounts}
         assert by_target[f"{ROOT}/apps"] == f"/mnt/Tap/apps/.zfs/snapshot/{SNAP}"
         assert by_target[f"{ROOT}/apps/immich/pgdata"] == (
             f"/mnt/Tap/apps/immich/pgdata/.zfs/snapshot/{SNAP}"
@@ -71,72 +85,282 @@ class TestPlanStaging:
     def test_parents_are_mounted_before_children(self):
         # A child's mountpoint dir only exists inside its parent's snapshot, so
         # mounting a child first would fail.
-        mounts, _ = plan_staging(
-            "/mnt/Tap", "/mnt/Tap", SNAP, DATASETS, ROOT, isdir=ALL_DIRS_EXIST
-        )
+        mounts, _ = plan()
         seen = set()
         for _src, target in mounts:
-            parent = os.path.dirname(target)
             if target != ROOT:
-                assert parent in seen or parent == ROOT, f"{target} mounted before {parent}"
+                assert os.path.dirname(target) in seen
             seen.add(target)
 
     def test_backup_path_below_dataset_root(self):
-        mounts, _ = plan_staging(
-            "/mnt/Tap", "/mnt/Tap/apps", SNAP, DATASETS, ROOT, isdir=ALL_DIRS_EXIST
-        )
-        # Root source is the *subdirectory* inside the base dataset's snapshot.
-        assert mounts[0] == (f"/mnt/Tap/.zfs/snapshot/{SNAP}/apps", ROOT)
+        mounts, _ = plan(base_dataset="Tap/apps", base_mp="/mnt/Tap/apps",
+                         path="/mnt/Tap/apps")
+        assert mounts[0] == (f"/mnt/Tap/apps/.zfs/snapshot/{SNAP}", ROOT)
         targets = [t for _s, t in mounts]
-        assert f"{ROOT}/lidarr" in targets       # relative to /mnt/Tap/apps
+        assert f"{ROOT}/lidarr" in targets
         assert f"{ROOT}/apps/lidarr" not in targets
 
     def test_base_dataset_is_not_a_descendant_of_itself(self):
-        mounts, _ = plan_staging(
-            "/mnt/Tap", "/mnt/Tap", SNAP, [ds("Tap", "/mnt/Tap")], ROOT, isdir=ALL_DIRS_EXIST
-        )
-        assert len(mounts) == 1  # just the root
+        mounts, _ = plan(datasets=[ds("Tap", "/mnt/Tap")])
+        assert len(mounts) == 1
 
 
-class TestSkipping:
-    @pytest.mark.parametrize("mp", ["none", "legacy", "-", ""])
-    def test_unmountable_mountpoints_are_skipped_and_reported(self, mp):
-        datasets = DATASETS + [ds("Tap/weird", mp)]
-        mounts, skipped = plan_staging(
-            "/mnt/Tap", "/mnt/Tap", SNAP, datasets, ROOT, isdir=ALL_DIRS_EXIST
-        )
+class TestScoping:
+    def test_unrelated_datasets_are_ignored_silently(self):
+        # Regression: scoping by mountpoint first dragged in every
+        # mountpoint-less dataset on the box (all of Tank/.system/*), burying the
+        # warnings that actually matter.
+        noisy = DATASETS + [
+            ds("Tank/.system", "none"),
+            ds("Tank/.system/cores", "legacy"),
+            ds("Tank/backups", "/mnt/Tank/backups"),
+        ]
+        mounts, skipped = plan(datasets=noisy)
         assert len(mounts) == 6
-        assert any(name == "Tap/weird" for name, _reason in skipped)
+        assert skipped == [], "datasets outside the base dataset must not be reported"
+
+    def test_in_scope_dataset_without_mountpoint_is_reported(self):
+        datasets = DATASETS + [ds("Tap/apps/weird", "none")]
+        _mounts, skipped = plan(datasets=datasets)
+        assert ("Tap/apps/weird", "mountpoint is none") in skipped
 
     def test_unmounted_dataset_is_skipped_but_never_silently(self):
-        # A locked/encrypted dataset contributes nothing to the live tree either,
-        # so skipping matches stock semantics -- but it MUST be reported.
         datasets = DATASETS + [ds("Tap/apps/vault", "/mnt/Tap/apps/vault", mounted="no")]
-        mounts, skipped = plan_staging(
-            "/mnt/Tap", "/mnt/Tap", SNAP, datasets, ROOT, isdir=ALL_DIRS_EXIST
-        )
+        mounts, skipped = plan(datasets=datasets)
         assert f"{ROOT}/apps/vault" not in [t for _s, t in mounts]
         assert ("Tap/apps/vault", "dataset is not mounted (locked/encrypted?)") in skipped
+
+    def test_descendant_mounted_outside_the_path_is_not_an_omission(self):
+        datasets = DATASETS + [ds("Tap/elsewhere", "/mnt/other")]
+        mounts, skipped = plan(datasets=datasets)
+        assert len(mounts) == 6
+        assert skipped == []
 
 
 class TestSilentOmissionGuard:
     """The whole point of the feature. These are the tests that matter."""
 
-    def test_missing_snapshot_on_descendant_raises(self):
-        # If the recursive snapshot somehow missed a dataset, staging it would
-        # silently omit its data. Refuse rather than upload an incomplete tree.
-        def isdir(path):
-            return "/mnt/Tap/apps/immich/pgdata/" not in path
+    @staticmethod
+    def _missing_pgdata(path):
+        return "/mnt/Tap/apps/immich/pgdata/" not in path
 
+    def test_missing_snapshot_on_descendant_raises(self):
         with pytest.raises(StagingError, match="incomplete tree"):
-            plan_staging("/mnt/Tap", "/mnt/Tap", SNAP, DATASETS, ROOT, isdir=isdir)
+            plan(isdir=self._missing_pgdata)
 
     def test_error_names_the_offending_dataset(self):
-        def isdir(path):
-            return "/mnt/Tap/apps/immich/pgdata/" not in path
-
         with pytest.raises(StagingError, match="Tap/apps/immich/pgdata"):
-            plan_staging("/mnt/Tap", "/mnt/Tap", SNAP, DATASETS, ROOT, isdir=isdir)
+            plan(isdir=self._missing_pgdata)
+
+
+class TestSnapshotTreeNames:
+    """zfs.snapshot.delete is non-recursive; we must sweep children ourselves."""
+
+    ALL = [
+        "Tap@cloud_backup-5-20260712030000",
+        "Tap/apps@cloud_backup-5-20260712030000",
+        "Tap/apps/lidarr/config@cloud_backup-5-20260712030000",
+        "Tap@auto-2026-07-12_03-00",            # unrelated periodic snapshot
+        "Tap/apps@cloud_backup-9-20260712030000",  # another task
+        "Tank/backups@cloud_backup-5-20260712030000",  # different pool
+    ]
+
+    def test_returns_parent_and_all_children(self):
+        got = snapshot_tree_names("Tap@cloud_backup-5-20260712030000", self.ALL)
+        assert set(got) == {
+            "Tap@cloud_backup-5-20260712030000",
+            "Tap/apps@cloud_backup-5-20260712030000",
+            "Tap/apps/lidarr/config@cloud_backup-5-20260712030000",
+        }
+
+    def test_never_touches_periodic_or_other_tasks_or_other_pools(self):
+        got = snapshot_tree_names("Tap@cloud_backup-5-20260712030000", self.ALL)
+        assert "Tap@auto-2026-07-12_03-00" not in got
+        assert "Tap/apps@cloud_backup-9-20260712030000" not in got
+        assert "Tank/backups@cloud_backup-5-20260712030000" not in got
+
+    def test_malformed_snapshot_name_yields_nothing(self):
+        assert snapshot_tree_names("Tap", self.ALL) == []
+
+
+class FakeMiddleware:
+    def __init__(self, snapshots=None):
+        self.snapshots = list(snapshots or [])
+        self.calls = []
+        self.logger = None
+
+    async def call(self, method, *args):
+        self.calls.append((method, args))
+        if method == "zfs.snapshot.query":
+            return [{"name": n} for n in self.snapshots]
+        if method == "zfs.snapshot.delete":
+            if args[0] not in self.snapshots:
+                raise RuntimeError("does not exist")
+            self.snapshots.remove(args[0])
+            return True
+        raise AssertionError(f"unexpected call {method}")
+
+    async def run_in_thread(self, fn, *args):
+        return fn(*args)
+
+
+class TestDeleteSnapshotTree:
+    def test_deletes_parent_and_every_child(self):
+        mw = FakeMiddleware([
+            "Tap@snap", "Tap/apps@snap", "Tap/apps/lidarr@snap", "Tap@keepme",
+        ])
+        asyncio.run(delete_snapshot_tree(mw, "Tap@snap"))
+        assert mw.snapshots == ["Tap@keepme"]
+
+    def test_is_idempotent_when_stock_already_removed_the_parent(self):
+        # Stock's finally can win the race once our mounts are released.
+        mw = FakeMiddleware(["Tap/apps@snap", "Tap/apps/lidarr@snap"])
+        asyncio.run(delete_snapshot_tree(mw, "Tap@snap"))
+        assert mw.snapshots == []
+
+    def test_survives_query_failure_by_deleting_at_least_the_parent(self):
+        class Broken(FakeMiddleware):
+            async def call(self, method, *args):
+                if method == "zfs.snapshot.query":
+                    raise RuntimeError("boom")
+                return await super().call(method, *args)
+
+        mw = Broken(["Tap@snap"])
+        asyncio.run(delete_snapshot_tree(mw, "Tap@snap"))
+        assert mw.snapshots == []
+
+    def test_attempts_no_delete_when_the_tree_is_already_gone(self):
+        # A successful query returning nothing means there is nothing to do.
+        # Falling back to the parent here would log a spurious "does not exist"
+        # warning on every clean run.
+        mw = FakeMiddleware(["Tap@unrelated"])
+        asyncio.run(delete_snapshot_tree(mw, "Tap@snap"))
+        assert [m for m, _a in mw.calls if m == "zfs.snapshot.delete"] == []
+        assert mw.snapshots == ["Tap@unrelated"]
+
+
+class TestStageNestedOrdering:
+    def setup_method(self):
+        ACTIVE.clear()
+
+    def test_sidecar_is_written_before_anything_is_mounted(self, tmp_path, monkeypatch):
+        # middlewared can die at any moment. If the snapshot were recorded only
+        # after apply_plan, a crash in that window would orphan a 160-snapshot
+        # tree -- the precise failure the sidecar exists to prevent.
+        import truecloud_nested as tn
+
+        monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
+        order = []
+
+        class Recorder(FakeMiddleware):
+            async def run_in_thread(self, fn, *args):
+                order.append(fn.__name__)
+                if fn.__name__ == "plan_staging":
+                    return ([("/src", str(tmp_path / "cloud_backup-5"))], [])
+                if fn.__name__ in ("apply_plan", "verify_staged", "teardown"):
+                    return [] if fn.__name__ == "teardown" else True
+                return fn(*args)
+
+        asyncio.run(tn.stage_nested(
+            Recorder(), "/mnt/Tap", "Tap@snap", "Tap", "/mnt/Tap",
+            "cloud_backup-5", DATASETS,
+        ))
+
+        assert order.index("_write_sidecar") < order.index("apply_plan")
+
+    def test_reclaims_the_snapshot_tree_left_by_a_crashed_run(self, tmp_path,
+                                                              monkeypatch):
+        # teardown() reclaims the crashed run's MOUNTS, but nothing else would
+        # ever reclaim its SNAPSHOTS -- and we are about to overwrite the only
+        # record of them. One crash would orphan 160+ snapshots permanently.
+        import truecloud_nested as tn
+
+        monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
+        root = tn.staging_root_for("cloud_backup-5")
+        os.makedirs(os.path.dirname(root), exist_ok=True)
+        with open(sidecar_for(root), "w", encoding="utf-8") as fh:
+            fh.write("Tap@old-crashed-run")
+
+        mw = FakeMiddleware(["Tap@old-crashed-run", "Tap/apps@old-crashed-run"])
+
+        class Stub(FakeMiddleware):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+
+            async def call(self, method, *args):
+                return await self.inner.call(method, *args)
+
+            async def run_in_thread(self, fn, *args):
+                if fn.__name__ == "plan_staging":
+                    return ([("/src", root)], [])
+                if fn.__name__ == "teardown":
+                    return []
+                if fn.__name__ in ("apply_plan", "verify_staged"):
+                    return True
+                return fn(*args)
+
+        asyncio.run(tn.stage_nested(
+            Stub(mw), "/mnt/Tap", "Tap@new", "Tap", "/mnt/Tap",
+            "cloud_backup-5", DATASETS,
+        ))
+
+        assert mw.snapshots == [], "the crashed run's snapshot tree must be reclaimed"
+
+    def test_sidecar_is_removed_when_staging_fails(self, tmp_path, monkeypatch):
+        import truecloud_nested as tn
+
+        monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
+        root = tn.staging_root_for("cloud_backup-5")
+
+        class Failing(FakeMiddleware):
+            async def run_in_thread(self, fn, *args):
+                if fn.__name__ == "plan_staging":
+                    raise StagingError("boom")
+                return fn(*args)
+
+        with pytest.raises(StagingError):
+            asyncio.run(tn.stage_nested(
+                Failing(), "/mnt/Tap", "Tap@snap", "Tap", "/mnt/Tap",
+                "cloud_backup-5", DATASETS,
+            ))
+
+        assert not os.path.exists(sidecar_for(root))
+
+
+class TestCleanupTask:
+    def setup_method(self):
+        ACTIVE.clear()
+
+    def test_recovers_snapshot_from_sidecar_after_middlewared_restart(self, tmp_path,
+                                                                      monkeypatch):
+        # ACTIVE is in-process; a restart wipes it. The sidecar is the source of
+        # truth, otherwise the snapshot tree is orphaned forever.
+        import truecloud_nested as tn
+
+        monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
+        root = tn.staging_root_for("cloud_backup-5", base=str(tmp_path))
+        os.makedirs(root, exist_ok=True)
+        with open(sidecar_for(root), "w", encoding="utf-8") as fh:
+            fh.write("Tap@snap")
+
+        ACTIVE.clear()  # simulate the restart
+        mw = FakeMiddleware(["Tap@snap", "Tap/apps@snap"])
+        monkeypatch.setattr(tn, "teardown", lambda *_a, **_k: [])
+
+        asyncio.run(cleanup_task(mw, "cloud_backup-5"))
+
+        assert mw.snapshots == []
+        assert not os.path.exists(sidecar_for(root))
+
+    def test_is_a_noop_when_never_staged(self, tmp_path, monkeypatch):
+        import truecloud_nested as tn
+
+        monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path / "nope"))
+        mw = FakeMiddleware(["Tap@snap"])
+        asyncio.run(cleanup_task(mw, "cloud_backup-5"))
+        assert mw.calls == []
+        assert mw.snapshots == ["Tap@snap"]
 
 
 class TestVerifyStaged:
@@ -144,22 +368,17 @@ class TestVerifyStaged:
 
     def test_passes_when_every_target_is_mounted_and_root_non_empty(self):
         mounts = [("/src", ROOT), ("/src/a", f"{ROOT}/a")]
-        assert verify_staged(
-            mounts, ismount=lambda p: True, listdir=lambda p: ["apps"]
-        )
+        assert verify_staged(mounts, ismount=lambda p: True, listdir=lambda p: ["apps"])
 
     def test_raises_when_a_target_is_not_actually_mounted(self):
         # This is the case that would produce a silently-empty backup.
         mounts = [("/src", ROOT), ("/src/a", f"{ROOT}/a")]
         with pytest.raises(StagingError, match="not a mountpoint"):
-            verify_staged(
-                mounts, ismount=lambda p: p == ROOT, listdir=lambda p: ["apps"]
-            )
+            verify_staged(mounts, ismount=lambda p: p == ROOT, listdir=lambda p: ["apps"])
 
     def test_raises_when_staging_root_is_empty(self):
-        mounts = [("/src", ROOT)]
         with pytest.raises(StagingError, match="empty"):
-            verify_staged(mounts, ismount=lambda p: True, listdir=lambda p: [])
+            verify_staged([("/src", ROOT)], ismount=lambda p: True, listdir=lambda p: [])
 
     def test_raises_on_empty_plan(self):
         with pytest.raises(StagingError):
@@ -185,25 +404,26 @@ class FakeRunner:
 
 
 class TestApplyPlanRollback:
-    def test_rolls_back_mounts_when_one_fails(self, tmp_path, monkeypatch):
+    def test_rolls_back_mounts_when_one_fails(self, tmp_path):
         # A half-built tree must never reach the backup tool.
         root = str(tmp_path / "root")
         mounts = [("/src", root), ("/src/a", root + "/a"), ("/src/b", root + "/b")]
-        monkeypatch.setattr(os.path, "isdir", lambda p: True)
 
         runner = FakeRunner(fail_on="/src/b")
         with pytest.raises(StagingError, match="bind-mount"):
-            apply_plan(mounts, runner=runner)
+            apply_plan(mounts, runner=runner, isdir=yes)
 
-        umounts = [c for c in runner.calls if c[0] == "umount"]
-        # Everything successfully mounted before the failure is unmounted again.
-        assert [c[-1] for c in umounts] == [root + "/a", root]
+        umounts = [c[-1] for c in runner.calls if c[0] == "umount"]
+        assert umounts == [root + "/a", root]
 
-    def test_raises_when_target_missing(self, tmp_path, monkeypatch):
+    def test_raises_when_target_missing(self, tmp_path):
         root = str(tmp_path / "root")
-        monkeypatch.setattr(os.path, "isdir", lambda p: p == root)
         with pytest.raises(StagingError, match="does not exist"):
-            apply_plan([("/src", root), ("/src/a", root + "/a")], runner=FakeRunner())
+            apply_plan(
+                [("/src", root), ("/src/a", root + "/a")],
+                runner=FakeRunner(),
+                isdir=lambda p: p == root,
+            )
 
 
 class TestTeardown:
@@ -226,7 +446,7 @@ class TestTeardown:
             f"{ROOT}/apps",
             ROOT,
         ]
-        assert "/somewhere/else" not in order  # never touch unrelated mounts
+        assert "/somewhere/else" not in order
 
     def test_is_idempotent_when_nothing_mounted(self, tmp_path):
         mounts_file = tmp_path / "mounts"
@@ -257,13 +477,12 @@ class TestTeardown:
 class TestCurrentMountsUnder:
     def test_matches_only_the_staging_subtree(self, tmp_path):
         mounts_file = tmp_path / "mounts"
-        # "/run/truecloud-nested/cloud_backup-50" must NOT match "cloud_backup-5".
+        # "cloud_backup-50" must NOT match "cloud_backup-5".
         mounts_file.write_text(
             f"tmpfs {ROOT} tmpfs rw 0 0\n"
             "tmpfs /run/truecloud-nested/cloud_backup-50 tmpfs rw 0 0\n"
         )
-        found = current_mounts_under(ROOT, mounts_file=str(mounts_file))
-        assert found == [ROOT]
+        assert current_mounts_under(ROOT, mounts_file=str(mounts_file)) == [ROOT]
 
 
 class TestStagingRootFor:
@@ -271,4 +490,10 @@ class TestStagingRootFor:
         assert staging_root_for("cloud_backup-5") == "/run/truecloud-nested/cloud_backup-5"
 
     def test_sanitises_path_separators(self):
-        assert "/" not in staging_root_for("evil/../../etc").rsplit("/", 1)[-1]
+        assert "/" not in staging_root_for("evil/name").rsplit("/", 1)[-1]
+
+    @pytest.mark.parametrize("name", ["..", ".", "...", "/", ""])
+    def test_dot_components_cannot_escape_the_staging_base(self, name):
+        # os.path.join(BASE, "..") normalises to /run — teardown would rmdir it.
+        root = staging_root_for(name)
+        assert os.path.normpath(root).startswith("/run/truecloud-nested/")

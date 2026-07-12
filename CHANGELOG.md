@@ -4,7 +4,13 @@
 
 ### Added
 
-- **`snapshot = true` now works on datasets that have child datasets.**
+- **`snapshot = true` now works on datasets that have child datasets** —
+  **opt-in, off by default** (`install.sh --enable-nested-snapshots` /
+  `--disable-nested-snapshots`). It changes how backups read their source data,
+  so it is never enabled implicitly; with neither flag `install.sh` preserves
+  the existing setting, so a `git pull && bash install.sh` cannot silently flip
+  it. When disabled, `apply.sh` skips the patch entirely and the stock guard
+  remains. `uninstall.sh` tears down any staging mounts and removes the marker.
   Stock TrueNAS refuses this with *"This option is only available for datasets
   that have no further nesting"*, which makes the snapshot option unusable for
   the single most common case on any box running Apps — every app is its own
@@ -46,6 +52,24 @@
     `snapshot.py`, then `sync.py`, and only then `crud.py`. A partial failure
     leaves the guard intact and the option merely unavailable — never
     "guard removed, traversal missing".
+  - **The patch owns the whole snapshot lifecycle.** `zfs.snapshot.delete`
+    defaults to `recursive=False` and stock `restic_backup()` calls it with no
+    options. Stock gets away with that only because its validation means
+    `recursive` is never True in the field — but enabling nested datasets makes
+    recursive snapshots real, so the parent now has one child snapshot per
+    descendant dataset (160+ on a typical Apps pool). Relying on stock's delete
+    would therefore orphan every child snapshot **on every successful run**.
+    This patch sweeps the parent *and* all children, is idempotent against
+    stock's `finally` winning the race, records the snapshot in a sidecar file
+    (so a middlewared restart mid-backup cannot orphan it), reclaims the tree
+    left by a crashed run, and deletes the tree when staging fails — where
+    sync.py's own `finally` would otherwise delete nothing at all, because its
+    `snapshot` local never gets assigned.
+  - **The dataset list is enumerated *after* the snapshot, never before.** A
+    list read beforehand can miss a dataset created in the gap: the recursive
+    snapshot would capture it but the staging plan would not, silently omitting
+    its data. Read afterwards, an unsnapshotted dataset trips the staging check
+    and fails the run loudly instead.
   - **Every injected block no-ops** if `_truecloud_nested` is absent.
   - Datasets that cannot contribute to a file tree (`mountpoint=none|legacy`,
     unmounted/locked, encrypted-and-locked) are skipped and **reported** —

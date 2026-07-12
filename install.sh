@@ -23,6 +23,45 @@ VERSION="0.3.0"
 # The directory containing install.sh is the permanent install location.
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 _HOOK_COMMENT='TrueCloud provider patch (S3/B2)'
+_NESTED_MARKER="$PATCH_DIR/nested_snapshots_enabled"
+
+# ── Options ───────────────────────────────────────────────────────────────────
+# Nested-dataset snapshot support is OPT-IN and off by default. It changes how
+# backups read their source data, so an unattended re-run (e.g. after a
+# `git pull`) must never flip it on or off by itself: with neither flag given,
+# whatever was chosen previously is preserved.
+_nested_choice=""
+
+usage() {
+    cat <<USAGE
+Usage: bash install.sh [options]
+
+Options:
+  --enable-nested-snapshots   Allow the "Take Snapshot" option on datasets that
+                              have child datasets (every pool running Apps).
+                              Stock TrueNAS refuses this; see README. Off by
+                              default because it changes how backups read data.
+  --disable-nested-snapshots  Turn it back off; the stock guard is restored.
+  -h, --help                  Show this help.
+
+With neither flag, the current setting is left unchanged.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --enable-nested-snapshots)  _nested_choice="on" ;;
+        --disable-nested-snapshots) _nested_choice="off" ;;
+        -h|--help)                  usage; exit 0 ;;
+        *)
+            echo "ERROR: unknown option: $1" >&2
+            echo "" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
 
 if [ ! -f "$PATCH_DIR/patch/apply.sh" ]; then
     echo "ERROR: patch files not found at $PATCH_DIR/patch/" >&2
@@ -103,6 +142,42 @@ if [ -f "$PATCH_DIR/disabled" ]; then
     echo "Removed kill switch ($PATCH_DIR/disabled) left from a previous recovery."
     echo ""
 fi
+
+# ── Nested-dataset snapshot support (opt-in) ──────────────────────────────────
+
+case "$_nested_choice" in
+    on)
+        touch "$_NESTED_MARKER"
+        echo "Nested-dataset snapshots: ENABLED"
+        echo "  The \"Take Snapshot\" option will be allowed on datasets that have"
+        echo "  child datasets. Backups then read from a frozen, complete staging"
+        echo "  tree instead of live files."
+        echo ""
+        echo "  This changes how your backups read their source data. Verify that a"
+        echo "  backup completes AND that its restic snapshot actually contains"
+        echo "  child-dataset data before you rely on it."
+        ;;
+    off)
+        if [ -f "$_NESTED_MARKER" ]; then
+            rm -f "$_NESTED_MARKER"
+            echo "Nested-dataset snapshots: DISABLED (stock guard restored)."
+            echo "  Any task that already has snapshot=true on a nested dataset will"
+            echo "  fail validation on its next edit. Turn the option off on those"
+            echo "  tasks, or re-run with --enable-nested-snapshots."
+        else
+            echo "Nested-dataset snapshots: already disabled."
+        fi
+        ;;
+    *)
+        if [ -f "$_NESTED_MARKER" ]; then
+            echo "Nested-dataset snapshots: enabled (unchanged)."
+        else
+            echo "Nested-dataset snapshots: disabled (default)."
+            echo "  Enable with: bash install.sh --enable-nested-snapshots"
+        fi
+        ;;
+esac
+echo ""
 
 # ── Apply now ─────────────────────────────────────────────────────────────────
 

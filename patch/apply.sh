@@ -187,14 +187,25 @@ else
     _SYNC_PY="$_MW_DIR/plugins/cloud_backup/sync.py"
     _NESTED_SRC="$PATCH_DIR/patch/truecloud_nested.py"
 
+    # Nested-dataset snapshot support is OPT-IN. It changes how backups read
+    # their source data, so it is never enabled implicitly by a `git pull`.
+    # Enable:  bash install.sh --enable-nested-snapshots
+    # Disable: bash install.sh --disable-nested-snapshots
+    if [ -f "$PATCH_DIR/nested_snapshots_enabled" ]; then
+        _NESTED_ENABLED=1
+    else
+        _NESTED_ENABLED=0
+    fi
+
         # ── patch b2.py + restic.py + nested-snapshot + hook_status.json ────────
         # (single subprocess: PREINIT has a tight timeout budget)
         if "$PYTHON" - "$_B2_PY" "$_RESTIC_PY" "$PATCH_DIR/hook_status.json" \
-                      "$_CLOUD_DIR" "$_SYNC_PY" "$_NESTED_SRC" << 'PYEOF'
+                      "$_CLOUD_DIR" "$_SYNC_PY" "$_NESTED_SRC" "$_NESTED_ENABLED" << 'PYEOF'
 import json, os, shutil, sys, time
 
 b2_path, restic_path, status_path = sys.argv[1], sys.argv[2], sys.argv[3]
 cloud_dir, sync_path, nested_src = sys.argv[4], sys.argv[5], sys.argv[6]
+nested_enabled = sys.argv[7] == "1"
 
 B2_BLOCK = """
 # TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
@@ -277,25 +288,42 @@ if _tc_nested is not None:
     _tc_orig_create_snapshot = create_snapshot
 
     async def create_snapshot(middleware, path, name="cloud_task-onetime"):
-        # Determine nesting BEFORE delegating. We must never silently fall back
-        # to stock behaviour on a nested path: stock returns the parent's
-        # .zfs/snapshot/ path, where children are invisible, which is exactly
-        # the near-empty backup this feature exists to prevent. If we cannot
-        # tell, we raise -- loud failure beats a backup that lies.
-        datasets = await middleware.call("zfs.dataset.query", [["type", "=", "FILESYSTEM"]])
-        dataset, nested = get_dataset_recursive(datasets, path)
-
         # Stock takes the (already recursive) snapshot; we only replace the PATH.
         snapshot, snap_path = await _tc_orig_create_snapshot(middleware, path, name)
 
-        if not nested:
-            return snapshot, snap_path  # no children: stock behaviour, untouched
+        _logger = getattr(middleware, "logger", None)
+        try:
+            # Enumerate datasets AFTER the snapshot, never before. The snapshot is
+            # the point-in-time truth; a list read beforehand could miss a dataset
+            # created in the gap, which the recursive snapshot WOULD capture but
+            # our staging plan would not -- silently omitting it from the backup.
+            # Read afterwards, an unsnapshotted dataset instead trips the isdir()
+            # check in plan_staging and fails the run loudly. Loud beats silent.
+            datasets = await middleware.call(
+                "zfs.dataset.query", [["type", "=", "FILESYSTEM"]]
+            )
+            dataset, nested = get_dataset_recursive(datasets, path)
 
-        staging_root = await _tc_nested.stage_nested(
-            middleware, path, snapshot,
-            dataset["properties"]["mountpoint"]["value"], name,
-            logger=getattr(middleware, "logger", None),
-        )
+            if not nested:
+                # No children: stock behaviour, untouched. Stock's `finally` owns
+                # the snapshot from here (its non-recursive delete is correct,
+                # because a non-nested snapshot has no children).
+                return snapshot, snap_path
+
+            staging_root = await _tc_nested.stage_nested(
+                middleware, path, snapshot,
+                dataset["name"], dataset["properties"]["mountpoint"]["value"],
+                name, datasets, logger=_logger,
+            )
+        except Exception:
+            # The snapshot exists, but this exception means sync.py never completes
+            # `snapshot, local_path = await create_snapshot(...)`, so its local
+            # `snapshot` stays None and its `finally` deletes NOTHING. Sweep the
+            # tree ourselves or leak the parent plus one snapshot per descendant
+            # dataset (160+ here) on every failed run.
+            await _tc_nested.delete_snapshot_tree(middleware, snapshot, logger=_logger)
+            raise
+
         return snapshot, staging_root
 
     create_snapshot._truecloud_patched = True
@@ -401,29 +429,34 @@ else:
 # guard LAST. If anything fails partway, the guard is still in place and the
 # option stays unavailable -- we never expose "guard removed, traversal missing".
 nested_detail = ''
-try:
-    snapshot_py = os.path.join(cloud_dir, 'snapshot.py')
-    crud_py = os.path.join(cloud_dir, 'crud.py')
-    nested_dst = os.path.join(cloud_dir, '_truecloud_nested.py')
+if not nested_enabled:
+    nested_detail = 'disabled (opt-in; enable with: install.sh --enable-nested-snapshots)'
+    print('INFO: Nested-dataset snapshot support is disabled (opt-in feature).')
+    print('INFO: Enable with: bash install.sh --enable-nested-snapshots')
+else:
+    try:
+        snapshot_py = os.path.join(cloud_dir, 'snapshot.py')
+        crud_py = os.path.join(cloud_dir, 'crud.py')
+        nested_dst = os.path.join(cloud_dir, '_truecloud_nested.py')
 
-    missing = [p for p in (snapshot_py, crud_py, sync_path, nested_src) if not os.path.exists(p)]
-    if missing:
-        raise FileNotFoundError('missing: ' + ', '.join(missing))
+        missing = [p for p in (snapshot_py, crud_py, sync_path, nested_src) if not os.path.exists(p)]
+        if missing:
+            raise FileNotFoundError('missing: ' + ', '.join(missing))
 
-    shutil.copyfile(nested_src, nested_dst)   # 1. traversal implementation
-    patch_file(snapshot_py, SNAPSHOT_BLOCK)   # 2. build the staging tree
-    patch_file(sync_path, SYNC_BLOCK)         # 3. tear it down afterwards
-    patch_file(crud_py, CRUD_BLOCK)           # 4. ONLY NOW allow nested tasks
+        shutil.copyfile(nested_src, nested_dst)   # 1. traversal implementation
+        patch_file(snapshot_py, SNAPSHOT_BLOCK)   # 2. build the staging tree
+        patch_file(sync_path, SYNC_BLOCK)         # 3. tear it down afterwards
+        patch_file(crud_py, CRUD_BLOCK)           # 4. ONLY NOW allow nested tasks
 
-    nested_ok = True
-    nested_detail = 'nested-dataset snapshots enabled (staging tree)'
-    print(f'OK: Installed nested-snapshot support → {nested_dst}')
-    print(f'OK: Patched snapshot.py, sync.py, crud.py → {cloud_dir}')
-except Exception as e:
-    nested_detail = f'not applied: {e}'
-    print(f'WARNING: Failed to apply nested-snapshot patch: {e}')
-    print('WARNING: Stock nesting guard remains; snapshot option stays unavailable')
-    print('WARNING: for nested datasets. Existing backups are unaffected.')
+        nested_ok = True
+        nested_detail = 'nested-dataset snapshots enabled (staging tree)'
+        print(f'OK: Installed nested-snapshot support → {nested_dst}')
+        print(f'OK: Patched snapshot.py, sync.py, crud.py → {cloud_dir}')
+    except Exception as e:
+        nested_detail = f'not applied: {e}'
+        print(f'WARNING: Failed to apply nested-snapshot patch: {e}')
+        print('WARNING: Stock nesting guard remains; snapshot option stays unavailable')
+        print('WARNING: for nested datasets. Existing backups are unaffected.')
 
 patches = {
     'middlewared.rclone.remote.b2': {
