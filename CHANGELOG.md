@@ -1,5 +1,135 @@
 # Changelog
 
+## v0.3.0 — 2026-07-12
+
+### Added
+
+- **`snapshot = true` now works on datasets that have child datasets** —
+  **opt-in, off by default** (`install.sh --enable-nested-snapshots` /
+  `--disable-nested-snapshots`). It changes how backups read their source data,
+  so it is never enabled implicitly; with neither flag `install.sh` preserves
+  the existing setting, so a `git pull && bash install.sh` cannot silently flip
+  it. When disabled, `apply.sh` skips the patch entirely and the stock guard
+  remains. `uninstall.sh` tears down any staging mounts and removes the marker.
+  Stock TrueNAS refuses this with *"This option is only available for datasets
+  that have no further nesting"*, which makes the snapshot option unusable for
+  the single most common case on any box running Apps — every app is its own
+  dataset, often with `config`/`pgdata` children of its own. Without it, the
+  backup reads **live** files: databases are captured mid-write, and a busy app
+  rewriting its files can stall a backup indefinitely as restic chases a moving
+  target.
+
+  The stock guard is **correct, and it is not an arbitrary limit.**
+  `plugins/cloud/snapshot.py` already takes a *recursive* ZFS snapshot, but it
+  then points the backup tool at the **parent** dataset's
+  `.zfs/snapshot/<snap>/` directory — and ZFS does not expose child datasets
+  through a parent's snapshot directory:
+
+  ```
+  /mnt/Tap/.zfs/snapshot/<snap>/apps/               -> 0 entries (children invisible)
+  /mnt/Tap/apps/lidarr/config/.zfs/snapshot/<snap>/ -> the real data
+  ```
+
+  So without the guard the backup tool would walk a near-empty tree, report
+  SUCCESS, and upload almost nothing. iX gate the config rather than ship a
+  backup that lies about succeeding.
+
+  This release implements the missing half. After the (already recursive)
+  snapshot is taken, every descendant dataset's own `.zfs/snapshot/<snap>` is
+  bind-mounted into a **staging tree** mirroring the original layout, and the
+  backup tool is pointed at the staging root — a complete, consistent,
+  point-in-time view of the whole subtree. Only then is the guard relaxed.
+
+  Safety properties, in order of importance:
+
+  - **Staging failure is loud.** If any descendant cannot be staged, the backup
+    fails. A silently-incomplete backup is the exact outcome the stock guard
+    exists to prevent, and it would be worse than not having the feature.
+  - **A post-mount verification pass** asserts every planned target is really a
+    mountpoint and the staging root is non-empty, so this can never regress into
+    the empty-backup failure it is meant to fix.
+  - **The guard is relaxed last.** `apply.sh` installs the traversal, patches
+    `snapshot.py`, then `sync.py`, and only then `crud.py`. A partial failure
+    leaves the guard intact and the option merely unavailable — never
+    "guard removed, traversal missing".
+  - **The patch owns the whole snapshot lifecycle.** `zfs.snapshot.delete`
+    defaults to `recursive=False` and stock `restic_backup()` calls it with no
+    options. Stock gets away with that only because its validation means
+    `recursive` is never True in the field — but enabling nested datasets makes
+    recursive snapshots real, so the parent now has one child snapshot per
+    descendant dataset (160+ on a typical Apps pool). Relying on stock's delete
+    would therefore orphan every child snapshot **on every successful run**.
+    This patch sweeps the parent *and* all children, is idempotent against
+    stock's `finally` winning the race, records the snapshot in a sidecar file
+    (so a middlewared restart mid-backup cannot orphan it), reclaims the tree
+    left by a crashed run, and deletes the tree when staging fails — where
+    sync.py's own `finally` would otherwise delete nothing at all, because its
+    `snapshot` local never gets assigned.
+  - **The dataset list is enumerated *after* the snapshot, never before.** A
+    list read beforehand can miss a dataset created in the gap: the recursive
+    snapshot would capture it but the staging plan would not, silently omitting
+    its data. Read afterwards, an unsnapshotted dataset trips the staging check
+    and fails the run loudly instead.
+  - **Every injected block no-ops** if `_truecloud_nested` is absent.
+  - Datasets that cannot contribute to a file tree (`mountpoint=none|legacy`,
+    unmounted/locked, encrypted-and-locked) are skipped and **reported** —
+    never dropped silently.
+  - Scoped to `cloud_backup` only. Cloud Sync (rclone) shares the same
+    validation mixin but has no staging teardown wired in, so its guard is left
+    in place deliberately.
+
+  Side benefit: the staging root is a **stable** path per task, so restic can
+  find its parent snapshot between runs. Stock's
+  `.zfs/snapshot/<name>-<timestamp>/` path changes every run, which defeats
+  restic's parent detection and forces a full re-scan each time.
+
+- **CI** (GitHub Actions): shellcheck + `bash -n` on every script, ruff, and
+  pytest on Python 3.11/3.12/3.13. Includes tests that `compile()` the
+  `*_BLOCK` strings — they are Python source appended to live middlewared
+  modules, so a syntax error there would break the box at boot, and nothing
+  previously checked them.
+
+### Changed
+
+- **The patch is now two independent modules, and each retires on its own.**
+  Previously the native-support check looked only for native B2 restic support
+  and, on finding it, set the kill switch and disabled *everything*. With a
+  second capability in the patch that would silently take a still-needed module
+  down with the superseded one — TrueNAS is likely to ship one of these long
+  before the other.
+
+  `apply.sh` now detects each separately (`providers`: does `B2RcloneRemote`
+  carry a real `get_restic_config()`; `nested`: is the *"no further nesting"*
+  validation still in `plugins/cloud/crud.py`), skips just the superseded one,
+  and only sets the kill switch once **both** are done. The UI patch belongs to
+  `providers` and is skipped with it. The deferred middlewared restart now fires
+  when *any* still-needed module landed — keying it off `providers` alone would
+  have left a freshly-patched `nested` module on disk and never loaded on a
+  native-B2 box. `hook_status.json` reports each module with an `active` flag and
+  a reason.
+
+- README rewritten to be less alarmist: dropped the warning boxes and the
+  disclaimer's fear-bulleting in favour of plain statements, and documented the
+  two-module design. The one caveat kept as a plain sentence: the `mount --bind`
+  staging step has not yet been exercised by a live backup run.
+
+- Version strings in `install.sh`, `uninstall.sh`, and `recover.sh` were stale
+  at `0.0.4`; all scripts now report the same version.
+- `patch_ui.py`: replaced a `try`/`except`/`pass` with `contextlib.suppress`
+  (no behaviour change; satisfies the new lint gate).
+
+### Removed
+
+- `patch/__pycache__/create_task.cpython-314.pyc` was committed to the
+  repository; it is now untracked and `__pycache__/` is gitignored.
+
+### Known issues
+
+- Stock `restic_backup()` deletes the ZFS snapshot in its own `finally`, which
+  fails with `EBUSY` while the staging bind mounts pin it. It logs one benign
+  `Error deleting snapshot ...` warning per run; the patch then unmounts and
+  deletes the snapshot for real. The warning is expected and harmless.
+
 ## v0.2.1 — 2026-07-09
 
 ### Fixed

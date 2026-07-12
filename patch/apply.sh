@@ -7,13 +7,21 @@
 # is already up and has already imported the stock modules — the on-disk
 # patch alone cannot reach the running process.
 #
-# TrueNAS updates replace /usr/ entirely; this script re-applies two patches:
+# TrueNAS updates replace /usr/ entirely; this script re-applies three patches:
 #
 #   1. Backend — b2.py and restic.py are patched directly in the overlay.
 #      On a boot run, a single detached middlewared restart is scheduled
 #      (Step 3) so the patched modules actually get loaded.
 #
-#   2. Angular JS bundle — Widens the TrueCloud Backup credential dropdown
+#   2. Nested-dataset snapshots — installs _truecloud_nested.py and patches
+#      plugins/cloud/{snapshot,crud}.py + plugins/cloud_backup/sync.py so the
+#      "Take Snapshot" option works on a dataset that has child datasets.
+#      Stock middleware refuses that config, because it points the backup tool
+#      at the PARENT's .zfs/snapshot/ where children are invisible — it would
+#      silently back up a near-empty tree. We stage a complete tree of
+#      per-dataset bind mounts and only then relax the guard.
+#
+#   3. Angular JS bundle — Widens the TrueCloud Backup credential dropdown
 #                          from Storj-only to include S3 and B2. Served from
 #                          disk per request, so no restart is needed for it.
 #
@@ -24,7 +32,7 @@
 # Derive PATCH_DIR from this script's location (parent of the patch/ directory).
 PATCH_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="$PATCH_DIR/apply.log"
-VERSION="0.2.1"
+VERSION="0.3.0"
 
 # Rotate log at 512 KB to avoid unbounded growth on a system volume.
 # Keep two prior generations (.1 and .2) so the last three boots are always available.
@@ -101,10 +109,20 @@ echo "Using Python: $PYTHON"
 # Combines what were previously four separate Python invocations into one to
 # avoid repeated interpreter startup overhead under the PREINIT timeout budget.
 
+# The patch has two independent modules, and each retires on its own:
+#
+#   providers  — B2/S3 credentials for TrueCloud Backup (b2.py, restic.py, UI)
+#   nested     — snapshots on datasets that have child datasets (cloud/*.py)
+#
+# TrueNAS may well ship one natively long before the other, so a single
+# all-or-nothing kill switch would silently take a still-needed module down with
+# the superseded one. Each module is detected separately and skipped on its own;
+# the global kill switch fires only once BOTH are native.
+
 _tc_info=$("$PYTHON" -c "
 import inspect, os, sys
 
-result = {'native': 'no', 'site_pkg': '', 'mw_dir': ''}
+result = {'native_b2': 'no', 'native_nested': 'no', 'site_pkg': '', 'mw_dir': ''}
 
 try:
     import middlewared
@@ -118,6 +136,7 @@ except ImportError:
     except Exception:
         pass
 
+# providers: does B2RcloneRemote already carry a real get_restic_config()?
 try:
     import middlewared.rclone.remote.b2 as _b2_mod
     from middlewared.rclone.remote.b2 import B2RcloneRemote
@@ -129,21 +148,59 @@ try:
             except (OSError, TypeError):
                 method_src = ''
             if 'NotImplementedError' not in method_src:
-                result['native'] = 'yes'
+                result['native_b2'] = 'yes'
 except Exception:
     pass
 
-print(result['native'])
+# nested: stock gates nested datasets with a validation in plugins/cloud/crud.py.
+# We only ever append to that file, so the stock text survives our patch -- if the
+# guard is gone, iX removed it, which means they implemented the traversal.
+# If the file cannot be read we assume 'no' and keep patching: worst case the
+# patch declines to apply and the option simply stays unavailable.
+try:
+    crud = os.path.join(result['mw_dir'], 'plugins', 'cloud', 'crud.py')
+    with open(crud, encoding='utf-8', errors='replace') as fh:
+        if 'no further nesting' not in fh.read():
+            result['native_nested'] = 'yes'
+except Exception:
+    pass
+
+print(result['native_b2'])
+print(result['native_nested'])
 print(result['site_pkg'])
 print(result['mw_dir'])
-" 2>/dev/null || printf 'no\n\n\n')
+" 2>/dev/null || printf 'no\nno\n\n\n')
 
-_tc_native=$(printf '%s' "$_tc_info" | sed -n '1p')
-SITE_PKG=$(printf '%s' "$_tc_info"  | sed -n '2p')
-_MW_DIR=$(printf '%s' "$_tc_info"   | sed -n '3p')
+_tc_native_b2=$(printf '%s' "$_tc_info"     | sed -n '1p')
+_tc_native_nested=$(printf '%s' "$_tc_info" | sed -n '2p')
+SITE_PKG=$(printf '%s' "$_tc_info"          | sed -n '3p')
+_MW_DIR=$(printf '%s' "$_tc_info"           | sed -n '4p')
 
-if [ "$_tc_native" = "yes" ]; then
-    echo "NOTICE: TrueNAS now provides native B2 restic support — truecloud-patch is no longer needed."
+# Nested support is opt-in; if it was never enabled, it cannot be the reason to
+# keep the patch alive.
+if [ -f "$PATCH_DIR/nested_snapshots_enabled" ]; then
+    _NESTED_ENABLED=1
+else
+    _NESTED_ENABLED=0
+fi
+
+# Is either module still doing something useful?
+_providers_needed=1
+[ "$_tc_native_b2" = "yes" ] && _providers_needed=0
+
+_nested_needed=0
+if [ "$_NESTED_ENABLED" = "1" ] && [ "$_tc_native_nested" != "yes" ]; then
+    _nested_needed=1
+fi
+
+if [ "$_providers_needed" = "0" ] && [ "$_nested_needed" = "0" ]; then
+    echo "NOTICE: Nothing left for truecloud-patch to do:"
+    [ "$_tc_native_b2" = "yes" ] && echo "NOTICE:   - TrueNAS now provides native B2 restic support."
+    if [ "$_tc_native_nested" = "yes" ]; then
+        echo "NOTICE:   - TrueNAS now handles snapshots on nested datasets natively."
+    elif [ "$_NESTED_ENABLED" = "0" ]; then
+        echo "NOTICE:   - Nested-dataset snapshots are not enabled (opt-in)."
+    fi
     echo "NOTICE: Setting kill switch; patching will be skipped on all future boots."
     echo "NOTICE: Run the following to fully remove the patch:"
     echo "NOTICE:   bash $PATCH_DIR/uninstall.sh"
@@ -158,12 +215,21 @@ if [ "$_tc_native" = "yes" ]; then
     exit 0
 fi
 
+if [ "$_providers_needed" = "0" ]; then
+    echo "NOTICE: TrueNAS now provides native B2 restic support — the providers module"
+    echo "NOTICE: is superseded and will be skipped. The nested-snapshot module is still"
+    echo "NOTICE: active, so the patch stays installed."
+fi
+if [ "$_NESTED_ENABLED" = "1" ] && [ "$_tc_native_nested" = "yes" ]; then
+    echo "NOTICE: TrueNAS now handles nested-dataset snapshots natively — that module is"
+    echo "NOTICE: superseded and will be skipped. You can drop --enable-nested-snapshots."
+fi
+
 # ── Step 1: backend patch ─────────────────────────────────────────────────────
 
 echo "--- backend patch ---"
 
-_b2_ok=0
-_restic_ok=0
+_backend_ok=0
 
 if [ -z "$SITE_PKG" ]; then
     echo "WARNING: Cannot determine site-packages directory; skipping backend patch."
@@ -175,12 +241,27 @@ elif [ -z "$_MW_DIR" ]; then
 else
     _B2_PY="$_MW_DIR/rclone/remote/b2.py"
     _RESTIC_PY="$_MW_DIR/plugins/cloud_backup/restic.py"
+    _CLOUD_DIR="$_MW_DIR/plugins/cloud"
+    _SYNC_PY="$_MW_DIR/plugins/cloud_backup/sync.py"
+    _NESTED_SRC="$PATCH_DIR/patch/truecloud_nested.py"
 
-        # ── patch b2.py + restic.py + hook_status.json (single subprocess) ──────
-        if "$PYTHON" - "$_B2_PY" "$_RESTIC_PY" "$PATCH_DIR/hook_status.json" << 'PYEOF'
-import json, os, sys, time
+    # Each module is applied only if it is still needed. _providers_needed and
+    # _nested_needed were computed above (native-support detection + the opt-in
+    # marker), so one module going native never disables the other.
+        # ── patch b2.py + restic.py + nested-snapshot + hook_status.json ────────
+        # (single subprocess: PREINIT has a tight timeout budget)
+        if "$PYTHON" - "$_B2_PY" "$_RESTIC_PY" "$PATCH_DIR/hook_status.json" \
+                      "$_CLOUD_DIR" "$_SYNC_PY" "$_NESTED_SRC" \
+                      "$_providers_needed" "$_nested_needed" "$_NESTED_ENABLED" \
+                      "$_tc_native_nested" << 'PYEOF'
+import json, os, shutil, sys, time
 
 b2_path, restic_path, status_path = sys.argv[1], sys.argv[2], sys.argv[3]
+cloud_dir, sync_path, nested_src = sys.argv[4], sys.argv[5], sys.argv[6]
+providers_needed = sys.argv[7] == "1"
+nested_needed = sys.argv[8] == "1"
+nested_enabled = sys.argv[9] == "1"
+nested_native = sys.argv[10] == "yes"
 
 B2_BLOCK = """
 # TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
@@ -240,6 +321,133 @@ else:
     get_restic_config._truecloud_patched = True
 """
 
+# ── nested-dataset snapshot support ───────────────────────────────────────────
+# Stock middleware refuses `snapshot=true` on a path containing child datasets,
+# because it points the backup tool at the PARENT dataset's .zfs/snapshot/,
+# where child datasets are INVISIBLE -- it would silently back up a near-empty
+# tree. That guard is correct. We implement the missing traversal (a staging
+# tree of per-dataset bind mounts) and only then relax the guard.
+#
+# Fail-safe direction: if any of these three blocks fails to apply, the stock
+# guard remains and the option simply stays unavailable. We never end up with
+# the guard removed but the traversal missing -- that would be a silently empty
+# backup, the worst possible outcome.
+
+SNAPSHOT_BLOCK = """
+# TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
+try:
+    from middlewared.plugins.cloud import _truecloud_nested as _tc_nested
+except ImportError:
+    _tc_nested = None
+
+if _tc_nested is not None:
+    _tc_orig_create_snapshot = create_snapshot
+
+    async def create_snapshot(middleware, path, name="cloud_task-onetime"):
+        # Stock takes the (already recursive) snapshot; we only replace the PATH.
+        snapshot, snap_path = await _tc_orig_create_snapshot(middleware, path, name)
+
+        _logger = getattr(middleware, "logger", None)
+        try:
+            # Enumerate datasets AFTER the snapshot, never before. The snapshot is
+            # the point-in-time truth; a list read beforehand could miss a dataset
+            # created in the gap, which the recursive snapshot WOULD capture but
+            # our staging plan would not -- silently omitting it from the backup.
+            # Read afterwards, an unsnapshotted dataset instead trips the isdir()
+            # check in plan_staging and fails the run loudly. Loud beats silent.
+            datasets = await middleware.call(
+                "zfs.dataset.query", [["type", "=", "FILESYSTEM"]]
+            )
+            dataset, nested = get_dataset_recursive(datasets, path)
+
+            if not nested:
+                # No children: stock behaviour, untouched. Stock's `finally` owns
+                # the snapshot from here (its non-recursive delete is correct,
+                # because a non-nested snapshot has no children).
+                return snapshot, snap_path
+
+            staging_root = await _tc_nested.stage_nested(
+                middleware, path, snapshot,
+                dataset["name"], dataset["properties"]["mountpoint"]["value"],
+                name, datasets, logger=_logger,
+            )
+        except Exception:
+            # The snapshot exists, but this exception means sync.py never completes
+            # `snapshot, local_path = await create_snapshot(...)`, so its local
+            # `snapshot` stays None and its `finally` deletes NOTHING. Sweep the
+            # tree ourselves or leak the parent plus one snapshot per descendant
+            # dataset (160+ here) on every failed run.
+            await _tc_nested.delete_snapshot_tree(middleware, snapshot, logger=_logger)
+            raise
+
+        return snapshot, staging_root
+
+    create_snapshot._truecloud_patched = True
+"""
+
+CRUD_BLOCK = """
+# TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
+try:
+    from middlewared.plugins.cloud import _truecloud_nested as _tc_nested
+except ImportError:
+    _tc_nested = None
+
+if _tc_nested is not None:
+    _tc_orig_validate = CloudTaskServiceMixin._validate
+
+    async def _tc_validate(self, app, verrors, name, data):
+        await _tc_orig_validate(self, app, verrors, name, data)
+
+        # Only cloud_backup: staging teardown is wired into cloud_backup.sync's
+        # finally. cloudsync would leak bind mounts, so leave its guard intact.
+        if getattr(getattr(self, "_config", None), "namespace", "") != "cloud_backup":
+            return
+
+        # Drop ONLY the nested-dataset guard. If iX ever rewords the message the
+        # filter stops matching, the guard survives, and the option merely stays
+        # unavailable -- the safe direction to fail.
+        verrors.errors = [
+            e for e in verrors.errors
+            if not (
+                getattr(e, "attribute", "") == f"{name}.snapshot"
+                and "no further nesting" in getattr(e, "errmsg", "")
+            )
+        ]
+
+    CloudTaskServiceMixin._validate = _tc_validate
+    CloudTaskServiceMixin._validate._truecloud_patched = True
+"""
+
+SYNC_BLOCK = """
+# TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
+try:
+    from middlewared.plugins.cloud import _truecloud_nested as _tc_nested
+except ImportError:
+    _tc_nested = None
+
+if _tc_nested is not None:
+    _tc_orig_restic_backup = restic_backup
+
+    async def restic_backup(middleware, job, cloud_backup, dry_run=False, rate_limit=None):
+        # Our bind mounts pin the ZFS snapshot, so stock's `finally` cannot
+        # destroy it (EBUSY) and logs one benign warning. We unmount here and
+        # then delete the snapshot for real.
+        try:
+            return await _tc_orig_restic_backup(middleware, job, cloud_backup, dry_run, rate_limit)
+        finally:
+            try:
+                await _tc_nested.cleanup_task(
+                    middleware,
+                    f"cloud_backup-{cloud_backup.get('id', 'onetime')}",
+                    logger=getattr(middleware, "logger", None),
+                )
+            except Exception as e:
+                middleware.logger.warning("truecloud-patch: staging cleanup failed: %r", e)
+
+    restic_backup._truecloud_patched = True
+"""
+
+
 def patch_file(path, block):
     with open(path, encoding="utf-8") as fh:
         content = fh.read()
@@ -250,35 +458,102 @@ def patch_file(path, block):
         fh.write(base.rstrip("\n") + "\n" + block)
 
 b2_ok = restic_ok = False
+nested_ok = False
 
-if os.path.exists(b2_path):
-    try:
-        patch_file(b2_path, B2_BLOCK)
-        b2_ok = True
-        print(f"OK: Patched b2.py → {b2_path}")
-    except Exception as e:
-        print(f"WARNING: Failed to patch b2.py: {e}")
+# ── module: providers (B2/S3) ─────────────────────────────────────────────────
+# Skipped entirely once TrueNAS ships native B2 restic support. That must not
+# take the nested module down with it, so the two are gated independently.
+providers_detail = ''
+if not providers_needed:
+    providers_detail = 'superseded: TrueNAS provides native B2 restic support'
+    print('INFO: Providers module skipped — TrueNAS now supports B2 natively.')
 else:
-    print(f"WARNING: b2.py not found at {b2_path}")
+    if os.path.exists(b2_path):
+        try:
+            patch_file(b2_path, B2_BLOCK)
+            b2_ok = True
+            print(f"OK: Patched b2.py → {b2_path}")
+        except Exception as e:
+            print(f"WARNING: Failed to patch b2.py: {e}")
+    else:
+        print(f"WARNING: b2.py not found at {b2_path}")
 
-if os.path.exists(restic_path):
-    try:
-        patch_file(restic_path, RESTIC_BLOCK)
-        restic_ok = True
-        print(f"OK: Patched restic.py → {restic_path}")
-    except Exception as e:
-        print(f"WARNING: Failed to patch restic.py: {e}")
+    if os.path.exists(restic_path):
+        try:
+            patch_file(restic_path, RESTIC_BLOCK)
+            restic_ok = True
+            print(f"OK: Patched restic.py → {restic_path}")
+        except Exception as e:
+            print(f"WARNING: Failed to patch restic.py: {e}")
+    else:
+        print(f"WARNING: restic.py not found at {restic_path}")
+    providers_detail = (
+        'patched on disk in overlay at boot' if (b2_ok and restic_ok)
+        else 'b2.py/restic.py not found or write failed'
+    )
+
+# ── module: nested-dataset snapshots ──────────────────────────────────────────
+# Order matters: install the traversal machinery FIRST, relax the validation
+# guard LAST. If anything fails partway, the guard is still in place and the
+# option stays unavailable -- we never expose "guard removed, traversal missing".
+nested_detail = ''
+if not nested_enabled:
+    nested_detail = 'disabled (opt-in; enable with: install.sh --enable-nested-snapshots)'
+    print('INFO: Nested-dataset snapshot support is disabled (opt-in feature).')
+    print('INFO: Enable with: bash install.sh --enable-nested-snapshots')
+elif nested_native:
+    nested_detail = 'superseded: TrueNAS handles nested-dataset snapshots natively'
+    print('INFO: Nested module skipped — TrueNAS now handles nesting natively.')
+elif not nested_needed:
+    nested_detail = 'not needed'
+    print('INFO: Nested module skipped.')
 else:
-    print(f"WARNING: restic.py not found at {restic_path}")
+    try:
+        snapshot_py = os.path.join(cloud_dir, 'snapshot.py')
+        crud_py = os.path.join(cloud_dir, 'crud.py')
+        nested_dst = os.path.join(cloud_dir, '_truecloud_nested.py')
+
+        missing = [p for p in (snapshot_py, crud_py, sync_path, nested_src) if not os.path.exists(p)]
+        if missing:
+            raise FileNotFoundError('missing: ' + ', '.join(missing))
+
+        shutil.copyfile(nested_src, nested_dst)   # 1. traversal implementation
+        patch_file(snapshot_py, SNAPSHOT_BLOCK)   # 2. build the staging tree
+        patch_file(sync_path, SYNC_BLOCK)         # 3. tear it down afterwards
+        patch_file(crud_py, CRUD_BLOCK)           # 4. ONLY NOW allow nested tasks
+
+        nested_ok = True
+        nested_detail = 'nested-dataset snapshots enabled (staging tree)'
+        print(f'OK: Installed nested-snapshot support → {nested_dst}')
+        print(f'OK: Patched snapshot.py, sync.py, crud.py → {cloud_dir}')
+    except Exception as e:
+        nested_detail = f'not applied: {e}'
+        print(f'WARNING: Failed to apply nested-snapshot patch: {e}')
+        print('WARNING: Stock nesting guard remains; snapshot option stays unavailable')
+        print('WARNING: for nested datasets. Existing backups are unaffected.')
 
 patches = {
+    'module.providers': {
+        'ok': bool(b2_ok and restic_ok) or not providers_needed,
+        'active': providers_needed,
+        'detail': providers_detail,
+    },
+    'module.nested_snapshots': {
+        'ok': nested_ok or not nested_needed,
+        'active': nested_needed,
+        'detail': nested_detail,
+    },
     'middlewared.rclone.remote.b2': {
         'ok': b2_ok,
-        'detail': 'patched on disk in overlay at boot' if b2_ok else 'b2.py not found or write failed',
+        'detail': 'patched on disk in overlay at boot' if b2_ok else providers_detail,
     },
     'middlewared.plugins.cloud_backup.restic': {
         'ok': restic_ok,
-        'detail': 'patched on disk in overlay at boot' if restic_ok else 'restic.py not found or write failed',
+        'detail': 'patched on disk in overlay at boot' if restic_ok else providers_detail,
+    },
+    'middlewared.plugins.cloud.nested_snapshot': {
+        'ok': nested_ok,
+        'detail': nested_detail,
     },
 }
 payload = {'patched_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'patches': patches}
@@ -291,35 +566,45 @@ try:
 except OSError as e:
     print(f'WARNING: Could not write hook_status.json: {e}')
 
-sys.exit(0 if (b2_ok and restic_ok) else 1)
+# Exit 0 only if every module that is still NEEDED applied cleanly. A module that
+# was skipped (superseded or opt-out) is not a failure.
+_providers_done = (not providers_needed) or (b2_ok and restic_ok)
+_nested_done = (not nested_needed) or nested_ok
+sys.exit(0 if (_providers_done and _nested_done) else 1)
 PYEOF
         then
-            _b2_ok=1
-            _restic_ok=1
+            _backend_ok=1
         else
-            # Individual results already printed above; exit code 1 means at least one failed.
-            true
+            # Individual results already printed above; exit code 1 means at least
+            # one module that was still needed failed to apply.
+            _backend_ok=0
         fi
 fi
 
 # ── Step 2: Angular bundle ────────────────────────────────────────────────────
+# Belongs to the providers module (it widens the credential dropdown), so it is
+# skipped along with it once TrueNAS supports B2 natively.
 
 echo "--- UI patch ---"
 
-# Ensure the webui directory is writable before patch_ui.py tries to create a
-# backup and write the patched bundle.  On immutable OS we mount an overlay.
-_webui_dir=""
-for _d in /usr/share/truenas/webui /usr/share/truenas-ui /var/www/truenas; do
-    if [ -d "$_d" ]; then
-        _webui_dir="$_d"
-        break
+if [ "$_providers_needed" = "0" ]; then
+    echo "Skipped — providers module superseded by native B2 support."
+else
+    # Ensure the webui directory is writable before patch_ui.py tries to create a
+    # backup and write the patched bundle.  On immutable OS we mount an overlay.
+    _webui_dir=""
+    for _d in /usr/share/truenas/webui /usr/share/truenas-ui /var/www/truenas; do
+        if [ -d "$_d" ]; then
+            _webui_dir="$_d"
+            break
+        fi
+    done
+    if [ -n "$_webui_dir" ]; then
+        _ensure_writable "$_webui_dir" "ui" || true   # non-fatal; patch_ui.py reports the error
     fi
-done
-if [ -n "$_webui_dir" ]; then
-    _ensure_writable "$_webui_dir" "ui" || true   # non-fatal; patch_ui.py reports the error
-fi
 
-"$PYTHON" "$PATCH_DIR/patch/patch_ui.py" || echo "WARNING: patch_ui.py exited non-zero; UI dropdown may still show Storj only."
+    "$PYTHON" "$PATCH_DIR/patch/patch_ui.py" || echo "WARNING: patch_ui.py exited non-zero; UI dropdown may still show Storj only."
+fi
 
 # ── Step 3: deferred middlewared restart (boot runs only) ─────────────────────
 # At boot this script is spawned by middlewared, which already imported the
@@ -340,9 +625,14 @@ fi
 
 echo "--- deferred restart ---"
 
+# Restart when ANY still-needed backend module landed. Keying this off the
+# providers module alone would skip the restart on a box where B2 has gone native
+# but the nested module was freshly patched — leaving it on disk and never loaded.
 if ! grep -aq middlewared "/proc/$PPID/cmdline" 2>/dev/null; then
     echo "Manual run (parent is not middlewared) — no restart scheduled."
-elif [ "$_b2_ok" != "1" ] || [ "$_restic_ok" != "1" ]; then
+elif [ "$_providers_needed" = "0" ] && [ "$_nested_needed" = "0" ]; then
+    echo "No backend module active — no restart scheduled (nothing new to load)."
+elif [ "${_backend_ok:-0}" != "1" ]; then
     echo "Backend patch incomplete — no restart scheduled (nothing new to load)."
 else
     # A failed unit from an earlier attempt this boot would block systemd-run.

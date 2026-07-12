@@ -4,3 +4,12 @@
 /apply.log.2
 /hook_status.json
 /disabled
+/nested_snapshots_enabled
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
