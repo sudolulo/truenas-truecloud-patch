@@ -4,3 +4,11 @@
 /apply.log.2
 /hook_status.json
 /disabled
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/

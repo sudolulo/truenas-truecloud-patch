@@ -1,7 +1,10 @@
 # truenas-truecloud-patch
 
-Extends TrueNAS SCALE's **TrueCloud Backup** feature to work with S3-compatible
-providers and native Backblaze B2, instead of Storj only.
+Extends TrueNAS SCALE's **TrueCloud Backup** feature to:
+
+- work with S3-compatible providers and native Backblaze B2, instead of Storj only;
+- take **consistent snapshots of datasets that have child datasets** — which is
+  every box running Apps (see [Nested-dataset snapshots](#nested-dataset-snapshots)).
 
 ---
 
@@ -77,11 +80,89 @@ not affected.
 | Layer | What changes | Technique |
 |---|---|---|
 | **Backend** | `B2RcloneRemote` gains `get_restic_config()` — skipped automatically if TrueNAS already provides one on the class. `restic.py` URL builder is fixed: strips the stray leading slash and converts the slash separator to a colon (`b2:bucket:path`), which is the format restic 0.16.x expects. URL wrapper is a no-op if the URL is already correctly formed. | File patch applied inside the overlayfs upper layer |
+| **Nested snapshots** | `_truecloud_nested.py` is installed into `plugins/cloud/`, and `plugins/cloud/{snapshot,crud}.py` + `plugins/cloud_backup/sync.py` are patched so `snapshot = true` works on a dataset that has child datasets. See [below](#nested-dataset-snapshots). | New module + file patches inside the overlayfs upper layer |
 | **UI** | The Angular bundle's `filterByProviders` binding is widened from `["STORJ_IX"]` to `["STORJ_IX","S3","B2"]` | In-place text replacement in the compiled JS chunk; original is backed up before patching |
 
-Both changes are **fail-safe**: if a patch cannot be applied (e.g. TrueNAS
+All changes are **fail-safe**: if a patch cannot be applied (e.g. TrueNAS
 restructured the relevant code), middlewared starts normally with Storj-only
 support and the reason is logged to `apply.log` in your repo root.
+
+## Nested-dataset snapshots
+
+TrueCloud Backup's **Take Snapshot** option makes restic read from a frozen ZFS
+snapshot instead of live files. Without it the backup reads data *while apps are
+writing to it* — databases get captured mid-write, and an app that rewrites its
+files continuously can stall a backup indefinitely as restic chases a moving
+target.
+
+Stock TrueNAS refuses to enable it on most real-world paths:
+
+```
+[EINVAL] cloud_backup_update.snapshot:
+  This option is only available for datasets that have no further nesting
+```
+
+That rules out **any pool running Apps** — every app is its own dataset, usually
+with `config`/`pgdata` children of its own. On a typical box that is 100+ nested
+datasets, so the feature is effectively unusable exactly where it matters most.
+
+### Why stock refuses — and why you must not simply delete the check
+
+The guard is **correct**. `plugins/cloud/snapshot.py` already takes a *recursive*
+ZFS snapshot — but it then points restic at the **parent** dataset's
+`.zfs/snapshot/<snap>/` directory, and ZFS does not expose child datasets
+through a parent's snapshot directory:
+
+```
+/mnt/Tap/.zfs/snapshot/<snap>/apps/                 ->  0 entries  (children invisible)
+/mnt/Tap/apps/lidarr/config/.zfs/snapshot/<snap>/   ->  the real data
+```
+
+So if you just remove the validation, restic walks a **near-empty tree, reports
+SUCCESS, and uploads almost nothing.** You get a green backup job protecting no
+data. iX gate the config rather than ship a backup that lies about succeeding.
+
+> **⚠ If you are tempted to patch this yourself: deleting those four lines in
+> `plugins/cloud/crud.py` is the obvious move and it is catastrophic.** The
+> guard is load-bearing. It must be *replaced* with a working traversal, never
+> merely removed.
+
+### What this patch does instead
+
+After the (already recursive) snapshot is taken, every descendant dataset's own
+`.zfs/snapshot/<snap>` is bind-mounted into a **staging tree** that mirrors the
+original layout, and restic is pointed at the staging root — a complete,
+consistent, point-in-time view of the whole subtree. Only then is the guard
+relaxed.
+
+Safety properties, in order of importance:
+
+- **Staging failure is loud.** If any descendant cannot be staged, the backup
+  *fails*. A silently-incomplete backup is precisely what the stock guard exists
+  to prevent, and it would be worse than not having the feature at all.
+- **Post-mount verification** asserts every planned target really is a mountpoint
+  and the staging root is non-empty — so this cannot regress into the empty
+  backup it exists to fix.
+- **The guard is relaxed last.** `apply.sh` installs the traversal, patches
+  `snapshot.py`, then `sync.py`, and only then `crud.py`. Any partial failure
+  leaves the guard intact and the option merely unavailable — never
+  "guard removed, traversal missing".
+- Datasets that cannot contribute to a file tree (`mountpoint=none|legacy`,
+  unmounted, locked/encrypted) are skipped and **reported to the log** — never
+  dropped silently.
+- Scoped to **cloud_backup only**. Cloud Sync (rclone) shares the same
+  validation mixin but has no staging teardown wired in, so its guard is
+  deliberately left in place.
+
+Side benefit: the staging root is a **stable path per task**, so restic can find
+its parent snapshot between runs. Stock's `.zfs/snapshot/<name>-<timestamp>/`
+path changes every run, defeating restic's parent detection and forcing a full
+re-scan each time.
+
+**Expected log noise:** stock `restic_backup()` deletes the ZFS snapshot in its
+own `finally`, which fails with `EBUSY` while the staging mounts pin it. You will
+see one benign `Error deleting snapshot ...` warning per run; the patch then
+unmounts and deletes the snapshot for real.
 
 ## Supported providers after patching
 

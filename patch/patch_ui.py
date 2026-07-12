@@ -19,6 +19,7 @@ Safe to run multiple times — a marker string detects an already-patched file.
 Exits 0 in all cases (warnings are printed to stdout and logged by apply.sh).
 """
 
+import contextlib
 import os
 import re
 import shutil
@@ -131,10 +132,8 @@ def main():
         os.replace(tmp, path)
     except OSError as exc:
         print(f"[truecloud-patch] ERROR: Could not write {path}: {exc}")
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(tmp)
-        except OSError:
-            pass
         return
 
     print(f"[truecloud-patch] UI bundle patched ({count} replacement(s)): {path}")

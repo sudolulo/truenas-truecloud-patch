@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**", "fix/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: shell (shellcheck + syntax)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash syntax check
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            bash -n "$f" || { echo "::error file=$f::bash syntax error"; fail=1; }
+          done < <(find . -name '*.sh' -not -path './.git/*')
+          exit $fail
+
+      - name: shellcheck
+        uses: ludeeus/action-shellcheck@master
+        env:
+          SHELLCHECK_OPTS: -S warning -e SC1091
+
+  python:
+    name: python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # TrueNAS SCALE middleware runs 3.11+; keep the patch importable across
+        # the versions it may be injected into.
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: install dev deps
+        run: python -m pip install --upgrade pip pytest ruff
+
+      - name: ruff
+        run: ruff check patch tests
+
+      - name: pytest
+        run: pytest tests -v
+
+      - name: verify injected middleware blocks compile
+        # Belt-and-braces: the *_BLOCK strings are appended into live middlewared
+        # modules. A syntax error there would break the box at boot.
+        run: pytest tests/test_apply_blocks.py -v

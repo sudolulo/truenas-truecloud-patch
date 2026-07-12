@@ -1,5 +1,89 @@
 # Changelog
 
+## v0.3.0 — 2026-07-12
+
+### Added
+
+- **`snapshot = true` now works on datasets that have child datasets.**
+  Stock TrueNAS refuses this with *"This option is only available for datasets
+  that have no further nesting"*, which makes the snapshot option unusable for
+  the single most common case on any box running Apps — every app is its own
+  dataset, often with `config`/`pgdata` children of its own. Without it, the
+  backup reads **live** files: databases are captured mid-write, and a busy app
+  rewriting its files can stall a backup indefinitely as restic chases a moving
+  target.
+
+  The stock guard is **correct, and it is not an arbitrary limit.**
+  `plugins/cloud/snapshot.py` already takes a *recursive* ZFS snapshot, but it
+  then points the backup tool at the **parent** dataset's
+  `.zfs/snapshot/<snap>/` directory — and ZFS does not expose child datasets
+  through a parent's snapshot directory:
+
+  ```
+  /mnt/Tap/.zfs/snapshot/<snap>/apps/               -> 0 entries (children invisible)
+  /mnt/Tap/apps/lidarr/config/.zfs/snapshot/<snap>/ -> the real data
+  ```
+
+  So without the guard the backup tool would walk a near-empty tree, report
+  SUCCESS, and upload almost nothing. iX gate the config rather than ship a
+  backup that lies about succeeding.
+
+  This release implements the missing half. After the (already recursive)
+  snapshot is taken, every descendant dataset's own `.zfs/snapshot/<snap>` is
+  bind-mounted into a **staging tree** mirroring the original layout, and the
+  backup tool is pointed at the staging root — a complete, consistent,
+  point-in-time view of the whole subtree. Only then is the guard relaxed.
+
+  Safety properties, in order of importance:
+
+  - **Staging failure is loud.** If any descendant cannot be staged, the backup
+    fails. A silently-incomplete backup is the exact outcome the stock guard
+    exists to prevent, and it would be worse than not having the feature.
+  - **A post-mount verification pass** asserts every planned target is really a
+    mountpoint and the staging root is non-empty, so this can never regress into
+    the empty-backup failure it is meant to fix.
+  - **The guard is relaxed last.** `apply.sh` installs the traversal, patches
+    `snapshot.py`, then `sync.py`, and only then `crud.py`. A partial failure
+    leaves the guard intact and the option merely unavailable — never
+    "guard removed, traversal missing".
+  - **Every injected block no-ops** if `_truecloud_nested` is absent.
+  - Datasets that cannot contribute to a file tree (`mountpoint=none|legacy`,
+    unmounted/locked, encrypted-and-locked) are skipped and **reported** —
+    never dropped silently.
+  - Scoped to `cloud_backup` only. Cloud Sync (rclone) shares the same
+    validation mixin but has no staging teardown wired in, so its guard is left
+    in place deliberately.
+
+  Side benefit: the staging root is a **stable** path per task, so restic can
+  find its parent snapshot between runs. Stock's
+  `.zfs/snapshot/<name>-<timestamp>/` path changes every run, which defeats
+  restic's parent detection and forces a full re-scan each time.
+
+- **CI** (GitHub Actions): shellcheck + `bash -n` on every script, ruff, and
+  pytest on Python 3.11/3.12/3.13. Includes tests that `compile()` the
+  `*_BLOCK` strings — they are Python source appended to live middlewared
+  modules, so a syntax error there would break the box at boot, and nothing
+  previously checked them.
+
+### Changed
+
+- Version strings in `install.sh`, `uninstall.sh`, and `recover.sh` were stale
+  at `0.0.4`; all scripts now report the same version.
+- `patch_ui.py`: replaced a `try`/`except`/`pass` with `contextlib.suppress`
+  (no behaviour change; satisfies the new lint gate).
+
+### Removed
+
+- `patch/__pycache__/create_task.cpython-314.pyc` was committed to the
+  repository; it is now untracked and `__pycache__/` is gitignored.
+
+### Known issues
+
+- Stock `restic_backup()` deletes the ZFS snapshot in its own `finally`, which
+  fails with `EBUSY` while the staging bind mounts pin it. It logs one benign
+  `Error deleting snapshot ...` warning per run; the patch then unmounts and
+  deletes the snapshot for real. The warning is expected and harmless.
+
 ## v0.2.1 — 2026-07-09
 
 ### Fixed

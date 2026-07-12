@@ -7,13 +7,21 @@
 # is already up and has already imported the stock modules — the on-disk
 # patch alone cannot reach the running process.
 #
-# TrueNAS updates replace /usr/ entirely; this script re-applies two patches:
+# TrueNAS updates replace /usr/ entirely; this script re-applies three patches:
 #
 #   1. Backend — b2.py and restic.py are patched directly in the overlay.
 #      On a boot run, a single detached middlewared restart is scheduled
 #      (Step 3) so the patched modules actually get loaded.
 #
-#   2. Angular JS bundle — Widens the TrueCloud Backup credential dropdown
+#   2. Nested-dataset snapshots — installs _truecloud_nested.py and patches
+#      plugins/cloud/{snapshot,crud}.py + plugins/cloud_backup/sync.py so the
+#      "Take Snapshot" option works on a dataset that has child datasets.
+#      Stock middleware refuses that config, because it points the backup tool
+#      at the PARENT's .zfs/snapshot/ where children are invisible — it would
+#      silently back up a near-empty tree. We stage a complete tree of
+#      per-dataset bind mounts and only then relax the guard.
+#
+#   3. Angular JS bundle — Widens the TrueCloud Backup credential dropdown
 #                          from Storj-only to include S3 and B2. Served from
 #                          disk per request, so no restart is needed for it.
 #
@@ -24,7 +32,7 @@
 # Derive PATCH_DIR from this script's location (parent of the patch/ directory).
 PATCH_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="$PATCH_DIR/apply.log"
-VERSION="0.2.1"
+VERSION="0.3.0"
 
 # Rotate log at 512 KB to avoid unbounded growth on a system volume.
 # Keep two prior generations (.1 and .2) so the last three boots are always available.
@@ -175,12 +183,18 @@ elif [ -z "$_MW_DIR" ]; then
 else
     _B2_PY="$_MW_DIR/rclone/remote/b2.py"
     _RESTIC_PY="$_MW_DIR/plugins/cloud_backup/restic.py"
+    _CLOUD_DIR="$_MW_DIR/plugins/cloud"
+    _SYNC_PY="$_MW_DIR/plugins/cloud_backup/sync.py"
+    _NESTED_SRC="$PATCH_DIR/patch/truecloud_nested.py"
 
-        # ── patch b2.py + restic.py + hook_status.json (single subprocess) ──────
-        if "$PYTHON" - "$_B2_PY" "$_RESTIC_PY" "$PATCH_DIR/hook_status.json" << 'PYEOF'
-import json, os, sys, time
+        # ── patch b2.py + restic.py + nested-snapshot + hook_status.json ────────
+        # (single subprocess: PREINIT has a tight timeout budget)
+        if "$PYTHON" - "$_B2_PY" "$_RESTIC_PY" "$PATCH_DIR/hook_status.json" \
+                      "$_CLOUD_DIR" "$_SYNC_PY" "$_NESTED_SRC" << 'PYEOF'
+import json, os, shutil, sys, time
 
 b2_path, restic_path, status_path = sys.argv[1], sys.argv[2], sys.argv[3]
+cloud_dir, sync_path, nested_src = sys.argv[4], sys.argv[5], sys.argv[6]
 
 B2_BLOCK = """
 # TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
@@ -240,6 +254,116 @@ else:
     get_restic_config._truecloud_patched = True
 """
 
+# ── nested-dataset snapshot support ───────────────────────────────────────────
+# Stock middleware refuses `snapshot=true` on a path containing child datasets,
+# because it points the backup tool at the PARENT dataset's .zfs/snapshot/,
+# where child datasets are INVISIBLE -- it would silently back up a near-empty
+# tree. That guard is correct. We implement the missing traversal (a staging
+# tree of per-dataset bind mounts) and only then relax the guard.
+#
+# Fail-safe direction: if any of these three blocks fails to apply, the stock
+# guard remains and the option simply stays unavailable. We never end up with
+# the guard removed but the traversal missing -- that would be a silently empty
+# backup, the worst possible outcome.
+
+SNAPSHOT_BLOCK = """
+# TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
+try:
+    from middlewared.plugins.cloud import _truecloud_nested as _tc_nested
+except ImportError:
+    _tc_nested = None
+
+if _tc_nested is not None:
+    _tc_orig_create_snapshot = create_snapshot
+
+    async def create_snapshot(middleware, path, name="cloud_task-onetime"):
+        # Determine nesting BEFORE delegating. We must never silently fall back
+        # to stock behaviour on a nested path: stock returns the parent's
+        # .zfs/snapshot/ path, where children are invisible, which is exactly
+        # the near-empty backup this feature exists to prevent. If we cannot
+        # tell, we raise -- loud failure beats a backup that lies.
+        datasets = await middleware.call("zfs.dataset.query", [["type", "=", "FILESYSTEM"]])
+        dataset, nested = get_dataset_recursive(datasets, path)
+
+        # Stock takes the (already recursive) snapshot; we only replace the PATH.
+        snapshot, snap_path = await _tc_orig_create_snapshot(middleware, path, name)
+
+        if not nested:
+            return snapshot, snap_path  # no children: stock behaviour, untouched
+
+        staging_root = await _tc_nested.stage_nested(
+            middleware, path, snapshot,
+            dataset["properties"]["mountpoint"]["value"], name,
+            logger=getattr(middleware, "logger", None),
+        )
+        return snapshot, staging_root
+
+    create_snapshot._truecloud_patched = True
+"""
+
+CRUD_BLOCK = """
+# TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
+try:
+    from middlewared.plugins.cloud import _truecloud_nested as _tc_nested
+except ImportError:
+    _tc_nested = None
+
+if _tc_nested is not None:
+    _tc_orig_validate = CloudTaskServiceMixin._validate
+
+    async def _tc_validate(self, app, verrors, name, data):
+        await _tc_orig_validate(self, app, verrors, name, data)
+
+        # Only cloud_backup: staging teardown is wired into cloud_backup.sync's
+        # finally. cloudsync would leak bind mounts, so leave its guard intact.
+        if getattr(getattr(self, "_config", None), "namespace", "") != "cloud_backup":
+            return
+
+        # Drop ONLY the nested-dataset guard. If iX ever rewords the message the
+        # filter stops matching, the guard survives, and the option merely stays
+        # unavailable -- the safe direction to fail.
+        verrors.errors = [
+            e for e in verrors.errors
+            if not (
+                getattr(e, "attribute", "") == f"{name}.snapshot"
+                and "no further nesting" in getattr(e, "errmsg", "")
+            )
+        ]
+
+    CloudTaskServiceMixin._validate = _tc_validate
+    CloudTaskServiceMixin._validate._truecloud_patched = True
+"""
+
+SYNC_BLOCK = """
+# TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
+try:
+    from middlewared.plugins.cloud import _truecloud_nested as _tc_nested
+except ImportError:
+    _tc_nested = None
+
+if _tc_nested is not None:
+    _tc_orig_restic_backup = restic_backup
+
+    async def restic_backup(middleware, job, cloud_backup, dry_run=False, rate_limit=None):
+        # Our bind mounts pin the ZFS snapshot, so stock's `finally` cannot
+        # destroy it (EBUSY) and logs one benign warning. We unmount here and
+        # then delete the snapshot for real.
+        try:
+            return await _tc_orig_restic_backup(middleware, job, cloud_backup, dry_run, rate_limit)
+        finally:
+            try:
+                await _tc_nested.cleanup_task(
+                    middleware,
+                    f"cloud_backup-{cloud_backup.get('id', 'onetime')}",
+                    logger=getattr(middleware, "logger", None),
+                )
+            except Exception as e:
+                middleware.logger.warning("truecloud-patch: staging cleanup failed: %r", e)
+
+    restic_backup._truecloud_patched = True
+"""
+
+
 def patch_file(path, block):
     with open(path, encoding="utf-8") as fh:
         content = fh.read()
@@ -250,6 +374,7 @@ def patch_file(path, block):
         fh.write(base.rstrip("\n") + "\n" + block)
 
 b2_ok = restic_ok = False
+nested_ok = False
 
 if os.path.exists(b2_path):
     try:
@@ -271,6 +396,35 @@ if os.path.exists(restic_path):
 else:
     print(f"WARNING: restic.py not found at {restic_path}")
 
+# ── nested-dataset snapshot support ───────────────────────────────────────────
+# Order matters: install the traversal machinery FIRST, relax the validation
+# guard LAST. If anything fails partway, the guard is still in place and the
+# option stays unavailable -- we never expose "guard removed, traversal missing".
+nested_detail = ''
+try:
+    snapshot_py = os.path.join(cloud_dir, 'snapshot.py')
+    crud_py = os.path.join(cloud_dir, 'crud.py')
+    nested_dst = os.path.join(cloud_dir, '_truecloud_nested.py')
+
+    missing = [p for p in (snapshot_py, crud_py, sync_path, nested_src) if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError('missing: ' + ', '.join(missing))
+
+    shutil.copyfile(nested_src, nested_dst)   # 1. traversal implementation
+    patch_file(snapshot_py, SNAPSHOT_BLOCK)   # 2. build the staging tree
+    patch_file(sync_path, SYNC_BLOCK)         # 3. tear it down afterwards
+    patch_file(crud_py, CRUD_BLOCK)           # 4. ONLY NOW allow nested tasks
+
+    nested_ok = True
+    nested_detail = 'nested-dataset snapshots enabled (staging tree)'
+    print(f'OK: Installed nested-snapshot support → {nested_dst}')
+    print(f'OK: Patched snapshot.py, sync.py, crud.py → {cloud_dir}')
+except Exception as e:
+    nested_detail = f'not applied: {e}'
+    print(f'WARNING: Failed to apply nested-snapshot patch: {e}')
+    print('WARNING: Stock nesting guard remains; snapshot option stays unavailable')
+    print('WARNING: for nested datasets. Existing backups are unaffected.')
+
 patches = {
     'middlewared.rclone.remote.b2': {
         'ok': b2_ok,
@@ -279,6 +433,10 @@ patches = {
     'middlewared.plugins.cloud_backup.restic': {
         'ok': restic_ok,
         'detail': 'patched on disk in overlay at boot' if restic_ok else 'restic.py not found or write failed',
+    },
+    'middlewared.plugins.cloud.nested_snapshot': {
+        'ok': nested_ok,
+        'detail': nested_detail,
     },
 }
 payload = {'patched_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'patches': patches}
