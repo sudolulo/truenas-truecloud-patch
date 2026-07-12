@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import stat
 import subprocess
 
 __all__ = [
@@ -155,8 +156,25 @@ def snapshot_tree_names(snapshot: str, all_names) -> list[str]:
     ]
 
 
+def _probe_snapdir(path):
+    """Classify a snapshot directory: ``ok``, ``missing``, or why it is unusable.
+
+    ``os.path.isdir()`` collapses "does not exist" and "cannot stat" into the
+    same ``False``, so an EACCES would report itself as "has no snapshot" and
+    send someone hunting for a snapshot that is sitting right there. Both cases
+    still abort the backup -- but it has to say which one.
+    """
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return "missing"
+    except OSError as e:
+        return f"cannot be read ({e.strerror})"
+    return "ok" if stat.S_ISDIR(st.st_mode) else "is not a directory"
+
+
 def plan_staging(base_dataset, base_mountpoint, path, snapshot_name, datasets,
-                 staging_root, isdir=os.path.isdir):
+                 staging_root, probe=_probe_snapdir):
     """Compute the bind-mount plan for staging a nested tree. Pure function.
 
     ``datasets`` is a list of dicts shaped like ``zfs.dataset.query`` results:
@@ -216,11 +234,18 @@ def plan_staging(base_dataset, base_mountpoint, path, snapshot_name, datasets,
             continue
 
         src = snapdir(mp)
-        if not isdir(src):
-            # The recursive snapshot should have covered every descendant. If it
-            # did not, this dataset's data would be silently omitted. Refuse.
+        status = probe(src)
+        if status != "ok":
+            # Either the recursive snapshot missed this dataset, or we cannot read
+            # it. Either way its data would be silently omitted. Refuse -- but say
+            # WHICH, because "no snapshot" and "permission denied" send you to
+            # completely different places.
+            detail = (
+                f"has no snapshot {snapshot_name!r}" if status == "missing"
+                else f"snapshot {snapshot_name!r} {status}"
+            )
             raise StagingError(
-                f"dataset {name!r} has no snapshot {snapshot_name!r} at {src!r}; "
+                f"dataset {name!r} {detail} at {src!r}; "
                 f"refusing to back up an incomplete tree"
             )
 

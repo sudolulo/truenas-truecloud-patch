@@ -61,12 +61,12 @@ DATASETS = [
 
 
 def yes(_path):
-    return True
+    return "ok"
 
 
 def plan(datasets=DATASETS, base_dataset="Tap", base_mp="/mnt/Tap",
-         path="/mnt/Tap", isdir=yes):
-    return plan_staging(base_dataset, base_mp, path, SNAP, datasets, ROOT, isdir=isdir)
+         path="/mnt/Tap", probe=yes):
+    return plan_staging(base_dataset, base_mp, path, SNAP, datasets, ROOT, probe=probe)
 
 
 class TestPlanStaging:
@@ -142,15 +142,30 @@ class TestSilentOmissionGuard:
 
     @staticmethod
     def _missing_pgdata(path):
-        return "/mnt/Tap/apps/immich/pgdata/" not in path
+        return "missing" if "/mnt/Tap/apps/immich/pgdata/" in path else "ok"
+
+    @staticmethod
+    def _denied_pgdata(path):
+        if "/mnt/Tap/apps/immich/pgdata/" in path:
+            return "cannot be read (Permission denied)"
+        return "ok"
 
     def test_missing_snapshot_on_descendant_raises(self):
         with pytest.raises(StagingError, match="incomplete tree"):
-            plan(isdir=self._missing_pgdata)
+            plan(probe=self._missing_pgdata)
 
     def test_error_names_the_offending_dataset(self):
         with pytest.raises(StagingError, match="Tap/apps/immich/pgdata"):
-            plan(isdir=self._missing_pgdata)
+            plan(probe=self._missing_pgdata)
+
+    def test_missing_and_unreadable_are_reported_differently(self):
+        # os.path.isdir() collapses both into False, which would report a
+        # permission problem as "has no snapshot" and send you hunting for a
+        # snapshot that is sitting right there. Both abort -- but say which.
+        with pytest.raises(StagingError, match="has no snapshot"):
+            plan(probe=self._missing_pgdata)
+        with pytest.raises(StagingError, match="Permission denied"):
+            plan(probe=self._denied_pgdata)
 
 
 class TestSnapshotTreeNames:
@@ -411,7 +426,7 @@ class TestApplyPlanRollback:
 
         runner = FakeRunner(fail_on="/src/b")
         with pytest.raises(StagingError, match="bind-mount"):
-            apply_plan(mounts, runner=runner, isdir=yes)
+            apply_plan(mounts, runner=runner, isdir=lambda _p: True)
 
         umounts = [c[-1] for c in runner.calls if c[0] == "umount"]
         assert umounts == [root + "/a", root]
