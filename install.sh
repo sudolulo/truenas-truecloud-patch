@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="0.3.1"
+VERSION="0.3.2"
 
 # The directory containing install.sh is the permanent install location.
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -160,10 +160,17 @@ case "$_nested_choice" in
     off)
         if [ -f "$_NESTED_MARKER" ]; then
             rm -f "$_NESTED_MARKER"
-            echo "Nested-dataset snapshots: DISABLED (stock guard restored)."
+            # Tear down any staging tree first: those bind mounts PIN their ZFS
+            # snapshots, so leaving them would block those snapshots from ever
+            # being destroyed. apply.sh (below) then reverts the patched files.
+            python3 "$PATCH_DIR/patch/truecloud_nested.py" cleanup || \
+                echo "  WARNING: staging mounts remain; unmount them manually."
+            echo "Nested-dataset snapshots: DISABLED."
+            echo "  apply.sh will revert the patched middleware files and the stock"
+            echo "  guard is restored when middlewared restarts (this script does that)."
             echo "  Any task that already has snapshot=true on a nested dataset will"
             echo "  fail validation on its next edit. Turn the option off on those"
-            echo "  tasks, or re-run with --enable-nested-snapshots."
+            echo "  tasks first, or re-run with --enable-nested-snapshots."
         else
             echo "Nested-dataset snapshots: already disabled."
         fi

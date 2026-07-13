@@ -32,7 +32,7 @@
 # Derive PATCH_DIR from this script's location (parent of the patch/ directory).
 PATCH_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="$PATCH_DIR/apply.log"
-VERSION="0.3.1"
+VERSION="0.3.2"
 
 # Rotate log at 512 KB to avoid unbounded growth on a system volume.
 # Keep two prior generations (.1 and .2) so the last three boots are always available.
@@ -477,6 +477,57 @@ def patch_file(path, block):
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(base.rstrip("\n") + "\n" + block)
 
+
+def unpatch_file(path):
+    """Strip our appended block, restoring the stock file. True if it was patched."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            content = fh.read()
+    except OSError:
+        return False
+    idx = content.find("\n# TRUECLOUD_PATCH")
+    if idx == -1:
+        return False
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content[:idx].rstrip("\n") + "\n")
+    except OSError:
+        return False
+    return True
+
+
+def revert_nested(cloud_dir, sync_path):
+    """Undo the nested patch. Returns the names of what was actually reverted.
+
+    Skipping the patch is NOT enough to disable the feature. The overlay persists
+    for the whole boot, so an earlier run this boot may already have written the
+    patched files -- and middlewared re-imports them on the restart that
+    install.sh performs. Without this, `install.sh --disable-nested-snapshots`
+    would report "disabled" while the feature kept running until the next reboot.
+    """
+    reverted = []
+
+    # Remove the module FIRST. Every injected block is guarded by
+    # `if _tc_nested is not None`, so once it is gone they all no-op even if a
+    # later step here fails -- the guard is restored no matter what.
+    try:
+        os.unlink(os.path.join(cloud_dir, '_truecloud_nested.py'))
+        reverted.append('_truecloud_nested.py')
+    except OSError:
+        pass
+
+    # NB: restic.py also carries a TRUECLOUD_PATCH block, but that belongs to the
+    # providers module. Only these three are ours to revert.
+    for name, path in (
+        ('crud.py', os.path.join(cloud_dir, 'crud.py')),
+        ('sync.py', sync_path),
+        ('snapshot.py', os.path.join(cloud_dir, 'snapshot.py')),
+    ):
+        if unpatch_file(path):
+            reverted.append(name)
+
+    return reverted
+
 b2_ok = restic_ok = False
 nested_ok = False
 
@@ -517,16 +568,28 @@ else:
 # guard LAST. If anything fails partway, the guard is still in place and the
 # option stays unavailable -- we never expose "guard removed, traversal missing".
 nested_detail = ''
-if not nested_enabled:
-    nested_detail = 'disabled (opt-in; enable with: install.sh --enable-nested-snapshots)'
-    print('INFO: Nested-dataset snapshot support is disabled (opt-in feature).')
-    print('INFO: Enable with: bash install.sh --enable-nested-snapshots')
-elif nested_native:
-    nested_detail = 'superseded: TrueNAS handles nested-dataset snapshots natively'
-    print('INFO: Nested module skipped — TrueNAS now handles nesting natively.')
-elif not nested_needed:
-    nested_detail = 'not needed'
-    print('INFO: Nested module skipped.')
+if not nested_needed:
+    # Not just "skip": actively revert. The overlay lives for the whole boot, so a
+    # previously-applied patch is still sitting there and middlewared would
+    # re-import it on restart. See revert_nested().
+    if not nested_enabled:
+        nested_detail = 'disabled (opt-in; enable with: install.sh --enable-nested-snapshots)'
+        print('INFO: Nested-dataset snapshot support is disabled (opt-in feature).')
+    elif nested_native:
+        nested_detail = 'superseded: TrueNAS handles nested-dataset snapshots natively'
+        print('INFO: Nested module skipped — TrueNAS now handles nesting natively.')
+    else:
+        nested_detail = 'not needed'
+        print('INFO: Nested module skipped.')
+
+    reverted = revert_nested(cloud_dir, sync_path)
+    if reverted:
+        print('OK: Reverted a previously-applied nested patch (' + ', '.join(reverted) + ').')
+        print('    The stock nesting guard is restored once middlewared restarts.')
+        nested_detail += ' — previous patch reverted'
+
+    if not nested_enabled:
+        print('INFO: Enable with: bash install.sh --enable-nested-snapshots')
 else:
     try:
         snapshot_py = os.path.join(cloud_dir, 'snapshot.py')

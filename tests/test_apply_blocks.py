@@ -263,9 +263,56 @@ class TestOptIn:
     def test_patching_is_skipped_entirely_when_disabled(self):
         # The guard-relaxing crud.py patch must be inside the enabled branch.
         src = heredoc_source()
-        gate = src.index("if not nested_enabled:")
+        gate = src.index("if not nested_needed:")
         crud = src.index("patch_file(crud_py, CRUD_BLOCK)")
         assert gate < crud, "crud.py patch must sit inside the opt-in branch"
+
+    def test_disabling_REVERTS_the_patch_rather_than_merely_skipping_it(self):
+        """Skipping is not disabling.
+
+        The overlay persists for the whole boot, so a patch applied by an earlier
+        run this boot is still on disk — and middlewared re-imports it on the
+        restart install.sh performs. Without an active revert,
+        `--disable-nested-snapshots` reports "disabled" while the feature keeps
+        running until the next reboot.
+        """
+        src = heredoc_source()
+        assert "def unpatch_file(" in src
+        assert "def revert_nested(" in src
+        # The revert must run on every not-needed path (opt-out, superseded).
+        gate = src.index("if not nested_needed:")
+        revert = src.index("reverted = revert_nested(")
+        patch = src.index("patch_file(crud_py, CRUD_BLOCK)")
+        assert gate < revert < patch, "revert belongs in the not-needed branch"
+
+    def test_revert_removes_the_module_before_unpatching_files(self):
+        # Every injected block is guarded by `if _tc_nested is not None`, so
+        # deleting the module first means the guard is restored even if a later
+        # unpatch step fails.
+        src = heredoc_source()
+        body = src[src.index("def revert_nested("):src.index("def patch_file(") if
+                   src.index("def patch_file(") > src.index("def revert_nested(") else len(src)]
+        body = src[src.index("def revert_nested("):]
+        body = body[:body.index("\n\n\n")] if "\n\n\n" in body else body
+        assert body.index("_truecloud_nested.py") < body.index("crud.py")
+
+    def test_revert_never_touches_the_providers_patch(self):
+        # restic.py also carries a TRUECLOUD_PATCH block, but it belongs to the
+        # providers module. Reverting it would silently break B2 backups.
+        src = heredoc_source()
+        body = src[src.index("def revert_nested("):]
+        body = body[:body.index("return reverted")]
+        # Comments legitimately *mention* restic.py to explain why it is excluded;
+        # what matters is that no code line touches it.
+        code = "\n".join(
+            ln for ln in body.splitlines() if not ln.lstrip().startswith("#")
+        )
+        assert "restic" not in code
+        assert "b2.py" not in code
+        # It must only ever revert these three, plus the module itself.
+        assert "crud.py" in code
+        assert "sync_path" in code
+        assert "snapshot.py" in code
 
 
 def test_guard_is_relaxed_only_after_traversal_is_installed():

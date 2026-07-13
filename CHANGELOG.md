@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.3.2 — 2026-07-13
+
+### Fixed
+
+- **`install.sh --disable-nested-snapshots` did not actually disable anything
+  until the next reboot.** `apply.sh` only ever *added* patches — there was no
+  revert path. Disabling removed the opt-in marker and then merely *skipped*
+  re-applying, but the overlay persists for the whole boot, so the previously
+  patched `plugins/cloud/{snapshot,crud}.py`, `plugins/cloud_backup/sync.py` and
+  `_truecloud_nested.py` were all still sitting there — and middlewared
+  re-imported them on the restart `install.sh` performs.
+
+  It printed *"DISABLED (stock guard restored)"* while the feature kept running.
+  Someone turning it off *because they were worried about it* would have believed
+  it was off.
+
+  `apply.sh` now actively reverts: it removes the module first (every injected
+  block is guarded by `if _tc_nested is not None`, so the stock guard is restored
+  even if a later step fails), then strips its appended blocks from the three
+  patched files. `restic.py` also carries a `TRUECLOUD_PATCH` block but belongs to
+  the *providers* module and is deliberately left alone — reverting it would break
+  B2 backups. `install.sh --disable` also tears down any staging tree first, since
+  those bind mounts pin ZFS snapshots that could otherwise never be destroyed.
+
+  Updating **without** the flag was always correct and is unchanged: the nested
+  module is never installed into middleware unless it is explicitly enabled.
+
 ## v0.3.1 — 2026-07-13
 
 ### Added
