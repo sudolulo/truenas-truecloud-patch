@@ -337,3 +337,47 @@ class TestWrappersDoNotHardcodeStockArity:
         assert "rate_limit" not in code, (
             "naming a trailing stock parameter re-introduces the arity bug"
         )
+
+
+class TestTheTwoNativeProbesCannotDrift:
+    """The split-literal trick is implemented TWICE: inline in apply.sh's probe, and
+    as compat._squash. It has already caused one silent bug.
+
+    Stock middleware writes the guard as an implicitly-concatenated literal, so the
+    contiguous phrase never appears in the source. A naive search finds nothing,
+    concludes iX removed the guard, and reports "native" -- which means "retire the
+    module". That would disable nested snapshots on every box that depends on them.
+
+    apply.sh (runtime, on the box) and compat.py (static, in CI) must therefore agree
+    on every input, or one of them is wrong about whether to retire a module.
+    """
+
+    CASES = [
+        # (crud.py source, expected native?)
+        ("verrors.add('x', 'datasets that have no further nesting')", False),
+        # THE case: split across adjacent literals, as stock actually writes it.
+        ("verrors.add('x', 'datasets that have no further '\n"
+         "                 'nesting')", False),
+        ('verrors.add("x", "no further "\n              "nesting")', False),
+        # Guard genuinely gone -> iX implemented it -> native.
+        ("verrors.add('x', 'some other validation entirely')", True),
+        ("", True),
+    ]
+
+    @pytest.mark.parametrize("src,expect_native", CASES)
+    def test_both_probes_agree(self, src, expect_native):
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+        import compat
+
+        shipped = _nested_native_detector()(src)
+        assert (shipped == "yes") == expect_native, (
+            f"apply.sh's probe says native={shipped!r} for {src!r}"
+        )
+
+        path, phrase, native_when_present = compat.NATIVE_PROBES[compat.NESTED]
+        present = compat._squash(phrase) in compat._squash(src)
+        static_native = (present == native_when_present)
+        assert static_native == expect_native, (
+            f"compat.py says native={static_native} for {src!r}"
+        )
