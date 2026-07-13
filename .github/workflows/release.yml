@@ -85,32 +85,17 @@ jobs:
       - name: "gate: this commit was a release candidate"
         run: python3 tools/release_gate.py "${{ steps.tag.outputs.tag }}" -C .
 
-      # ...and the candidate has to have actually passed. Only CI can see this, so
-      # it cannot live in release_gate.py with the rest.
-      - name: "gate: that candidate's CI run passed"
-        if: ${{ !contains(steps.tag.outputs.tag, '-rc') && !contains(steps.tag.outputs.tag, '-beta') && !contains(steps.tag.outputs.tag, '-alpha') }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tag.outputs.tag }}
-        run: |
-          sha="$(git rev-list -n 1 "$TAG")"
-          # Every rc tag on this exact commit -- release_gate.py already proved
-          # there is at least one.
-          rcs="$(git tag --points-at "$sha" | grep -E -- '-rc[0-9]+$' || true)"
-
-          for rc in $rcs; do
-            concl="$(gh run list --workflow=release.yml --branch "$rc" \
-                       --json conclusion --jq '.[0].conclusion // ""' 2>/dev/null || true)"
-            echo "candidate $rc -> ${concl:-<no run found>}"
-            if [ "$concl" = "success" ]; then
-              echo "::notice::$TAG is promoting $rc, whose release run passed."
-              exit 0
-            fi
-          done
-
-          echo "::error::No release candidate on $sha has a passing release run."
-          echo "::error::Candidates found: ${rcs:-none}. Wait for CI, or cut a new one."
-          exit 1
+      # There is deliberately NO "did the candidate's CI run pass?" gate here.
+      #
+      # It would have to query the forge's run history, which is the one thing that
+      # differs between GitHub and Gitea -- and it adds nothing: the steps above
+      # re-run ruff, pytest and the shell checks against the TAGGED COMMIT, and
+      # release_gate.py has already proved a candidate points at that same commit.
+      # If the code passes now, it passed then; they are the same code.
+      #
+      # What a candidate really buys is the thing no CI can check: that a human
+      # installed it on a real box and exercised it. The barrier makes room for
+      # that; it cannot verify it.
 
       - name: extract release notes from CHANGELOG
         run: |
@@ -118,12 +103,17 @@ jobs:
           echo "--- release body ---"
           cat /tmp/notes.md
 
-      - name: create or update the release
+      # This repo is canonically hosted on Gitea (git.onetick.ninja) and mirrored to
+      # GitHub, and BOTH run this workflow -- Gitea reads .github/workflows too. So
+      # the publish step has to work on whichever forge it lands on. Everything
+      # above is forge-agnostic; only the "create a release" API differs.
+
+      - name: publish the release (GitHub)
+        if: ${{ contains(github.server_url, 'github.com') }}
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          # Pre-1.0 and any -rc/-beta suffix ship as prereleases, not "Latest".
           prerelease=""
           case "$TAG" in
             *-rc*|*-beta*|*-alpha*) prerelease="--prerelease" ;;
@@ -134,8 +124,42 @@ jobs:
             gh release edit "$TAG" --notes-file /tmp/notes.md
           else
             # shellcheck disable=SC2086
-            gh release create "$TAG" \
-              --title "$TAG" \
-              --notes-file /tmp/notes.md \
-              $prerelease
+            gh release create "$TAG" --title "$TAG" --notes-file /tmp/notes.md $prerelease
+          fi
+
+      - name: publish the release (Gitea)
+        if: ${{ !contains(github.server_url, 'github.com') }}
+        env:
+          TOKEN: ${{ secrets.GITEA_TOKEN || github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+        run: |
+          prerelease=false
+          case "$TAG" in
+            *-rc*|*-beta*|*-alpha*) prerelease=true ;;
+          esac
+
+          # jq -Rs so the notes are JSON-encoded properly: the changelog is full of
+          # quotes, backticks and newlines, and hand-built JSON would mangle them.
+          body="$(jq -Rs . < /tmp/notes.md)"
+          payload="$(printf '{"tag_name":%s,"name":%s,"body":%s,"prerelease":%s}' \
+            "$(printf '%s' "$TAG" | jq -Rs .)" \
+            "$(printf '%s' "$TAG" | jq -Rs .)" \
+            "$body" "$prerelease")"
+
+          existing="$(curl -sf -H "Authorization: token $TOKEN" \
+            "$API/releases/tags/$TAG" 2>/dev/null || true)"
+
+          if [ -n "$existing" ]; then
+            id="$(printf '%s' "$existing" | jq -r .id)"
+            echo "Release $TAG exists (id=$id) — updating notes."
+            curl -sS -X PATCH "$API/releases/$id" \
+              -H "Authorization: token $TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$payload" -o /dev/null -w 'PATCH -> %{http_code}\n'
+          else
+            curl -sS -X POST "$API/releases" \
+              -H "Authorization: token $TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$payload" -o /dev/null -w 'POST -> %{http_code}\n'
           fi

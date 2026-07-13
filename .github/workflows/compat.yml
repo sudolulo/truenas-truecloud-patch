@@ -1,0 +1,193 @@
+name: TrueNAS compatibility
+
+# Find out that iX broke us BEFORE their release ships, not after a user's backup
+# fails.
+#
+# This patch appends code to middlewared's internal modules. There is no stability
+# contract: TrueNAS 26 rewrote the whole cloud_backup path from async to sync, and
+# every block the nested module injects is an `async def` wrapping an `await`ed
+# original. Nobody would have found out until a restore did not work.
+#
+# tools/compat.py records what the patch assumes and checks it against iX's actual
+# source at every release line -- including master and the current BETA/RC, which is
+# where a break shows up first. When an UNRELEASED line breaks, this opens a bug
+# report so there is time to fix it before that version reaches anyone.
+#
+# Runs on both forges: Gitea (canonical) and GitHub (mirror). Only the "file an
+# issue" call differs.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"     # daily, off the hour: everyone crons on the hour
+  workflow_dispatch:
+  push:
+    paths:
+      # The manifest itself changed -- re-check immediately rather than waiting a day.
+      - "tools/compat.py"
+      - ".github/workflows/compat.yml"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # ONE pass over the network. Every other step renders from this JSON -- calling
+      # compat.py three times would re-fetch every file from every release line three
+      # times, and could even disagree with itself if iX pushed mid-run.
+      #
+      # The exit code is CAPTURED, not allowed to abort the step: a nonzero exit means
+      # "a shipped release is broken", which is a result to report, not a reason to
+      # die before reporting it. (Actions runs `bash -e`, so `cmd > out` followed by
+      # `echo $?` never reaches the echo.) It becomes a job failure at the end, after
+      # the bug report has been filed.
+      - name: check every TrueNAS release line
+        id: check
+        run: |
+          rc=0
+          python3 tools/compat.py --matrix --json > /tmp/matrix.json || rc=$?
+          echo "shipped_broken=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: build the report
+        id: report
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, sys
+
+          sys.path.insert(0, "tools")
+          import compat
+
+          with open("/tmp/matrix.json") as fh:
+              rows = json.load(fh)
+
+          with open("/tmp/matrix.md", "w") as fh:
+              fh.write(compat.render_markdown(rows))
+
+          broken = [
+              r for r in rows
+              if any(not m["ok"] and not m["native"] for m in r["modules"].values())
+          ]
+          native = [
+              r for r in rows
+              if any(m["native"] for m in r["modules"].values())
+          ]
+
+          print(f"broken={'1' if broken else '0'}")
+          print(f"refs={','.join(r['ref'] for r in broken)}")
+
+          lines = []
+          for r in broken:
+              lines.append(f"### {r['ref']}")
+              lines.append("")
+              for mod, m in sorted(r["modules"].items()):
+                  if m["ok"] or m["native"]:
+                      continue
+                  lines.append(f"**{mod}** — the patch will not apply:")
+                  lines.append("")
+                  for p in m["problems"]:
+                      lines.append(f"- `{p['id']}`: {p['detail']}")
+                      lines.append(f"  - why it matters: {p['why']}")
+                  lines.append("")
+          if native:
+              lines.append("### Native support detected")
+              lines.append("")
+              for r in native:
+                  for mod, m in sorted(r["modules"].items()):
+                      if m["native"]:
+                          lines.append(
+                              f"- `{r['ref']}`: **{mod}** appears to be native now — "
+                              f"retire the module rather than fixing it."
+                          )
+
+          # GITHUB_OUTPUT is line-based; a multi-line value needs a heredoc marker.
+          print("body<<__EOF__")
+          print("\n".join(lines))
+          print("__EOF__")
+          PY
+
+      - name: matrix
+        run: cat /tmp/matrix.md
+
+      # A broken SHIPPED release is an outage: users are on it right now.
+      - name: fail if a shipped release is broken
+        if: ${{ steps.check.outputs.shipped_broken != '0' }}
+        run: |
+          echo "::error::The patch is broken on a SHIPPED TrueNAS release."
+          exit 1
+
+      - name: file a bug report (GitHub)
+        if: ${{ steps.report.outputs.broken == '1' && contains(github.server_url, 'github.com') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: "Incompatible with upcoming TrueNAS: ${{ steps.report.outputs.refs }}"
+        run: |
+          # One issue per set of broken refs, reopened/updated rather than duplicated
+          # daily -- a bot that files the same issue every morning gets muted, and
+          # then it is not a warning system any more.
+          existing="$(gh issue list --state all --label compat --search "$TITLE" \
+                        --json number,title,state \
+                        --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)"
+
+          {
+            echo "\`tools/compat.py\` found that the patch's assumptions no longer hold."
+            echo
+            cat /tmp/matrix.md
+            echo
+            echo "${{ steps.report.outputs.body }}"
+            echo
+            echo "_Filed automatically by \`.github/workflows/compat.yml\`._"
+          } > /tmp/issue.md
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file /tmp/issue.md
+            gh issue reopen "$existing" 2>/dev/null || true
+          else
+            gh issue create --title "$TITLE" --body-file /tmp/issue.md --label compat
+          fi
+
+      - name: file a bug report (Gitea)
+        if: ${{ steps.report.outputs.broken == '1' && !contains(github.server_url, 'github.com') }}
+        env:
+          TOKEN: ${{ secrets.GITEA_TOKEN || github.token }}
+          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          TITLE: "Incompatible with upcoming TrueNAS: ${{ steps.report.outputs.refs }}"
+        run: |
+          {
+            echo "\`tools/compat.py\` found that the patch's assumptions no longer hold."
+            echo
+            cat /tmp/matrix.md
+            echo
+            echo "${{ steps.report.outputs.body }}"
+            echo
+            echo "_Filed automatically by \`.github/workflows/compat.yml\`._"
+          } > /tmp/issue.md
+
+          body="$(jq -Rs . < /tmp/issue.md)"
+          title="$(printf '%s' "$TITLE" | jq -Rs .)"
+
+          # Same title => same issue. Comment on it instead of filing a new one.
+          number="$(curl -sf -H "Authorization: token $TOKEN" \
+            "$API/issues?state=all&type=issues" \
+            | jq -r --arg t "$TITLE" '.[] | select(.title == $t) | .number' | head -1)"
+
+          if [ -n "$number" ]; then
+            curl -sS -X POST "$API/issues/$number/comments" \
+              -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
+              -d "$(printf '{"body":%s}' "$body")" -o /dev/null -w 'comment -> %{http_code}\n'
+            curl -sS -X PATCH "$API/issues/$number" \
+              -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
+              -d '{"state":"open"}' -o /dev/null -w 'reopen -> %{http_code}\n'
+          else
+            curl -sS -X POST "$API/issues" \
+              -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
+              -d "$(printf '{"title":%s,"body":%s}' "$title" "$body")" \
+              -o /dev/null -w 'create -> %{http_code}\n'
+          fi

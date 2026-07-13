@@ -108,9 +108,14 @@ class TestAgainstTheRealRepo:
             f"scripts say v{version} but the newest CHANGELOG entry is v{newest}"
         )
 
-    def test_check_passes_for_the_current_version(self):
+    def test_the_repo_is_always_releasable_as_a_candidate(self):
+        # Deliberately checked as an rc, not as a stable release. `main` carries
+        # work under `## Unreleased` most of the time, and the stable gate refuses
+        # that on purpose -- shipping with work stranded mid-section is how you get
+        # a release that needs another release. So the invariant main must uphold is
+        # the candidate one: versions agree, and the CHANGELOG section exists.
         version = next(iter({normalise(v) for v in script_versions(REPO).values()}))
-        assert check(version, REPO) == []
+        assert check(f"v{version}-rc1", REPO) == []
 
 
 class TestCheckCatchesMistakes:
