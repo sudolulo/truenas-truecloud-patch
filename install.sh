@@ -88,6 +88,44 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# ── Minimum TrueNAS version ───────────────────────────────────────────────────
+#
+# TrueCloud Backup -- the feature this whole project extends -- was introduced in
+# 24.10. On anything older, `plugins/cloud_backup/` does not exist at all: there is
+# no restic, no cloud_backup task type, and nothing for the patch to attach to. It
+# would not break the box, it would simply do nothing, silently, while the user
+# believed their backups were configured. Say no clearly instead.
+#
+# A version we cannot PARSE is not a version we may refuse on: warn and continue.
+# Refusing to install over a string we failed to read would be a worse failure than
+# the one being prevented.
+MIN_TRUENAS="24.10"
+
+_tc_version_raw=""
+if command -v midclt &>/dev/null; then
+    _tc_version_raw=$(midclt call system.version 2>/dev/null || true)   # TrueNAS-25.10.4
+fi
+# Both spellings are real: modern releases report `TrueNAS-25.10.4`, older ones
+# `TrueNAS-SCALE-24.04.2` -- and the SCALE- form is used by exactly the versions
+# this gate exists to turn away, so failing to parse it would let them through.
+_tc_version=$(printf '%s' "$_tc_version_raw" \
+    | sed -n 's/^TrueNAS-\(SCALE-\)\{0,1\}\([0-9]\{1,\}\.[0-9]\{1,\}\).*/\2/p')
+
+if [ -z "$_tc_version" ]; then
+    echo "WARNING: could not determine the TrueNAS version" \
+         "${_tc_version_raw:+(got '${_tc_version_raw}')}."
+    echo "WARNING: this patch requires TrueNAS SCALE ${MIN_TRUENAS} or newer. Continuing anyway."
+    echo ""
+elif [ "$(printf '%s\n%s\n' "$MIN_TRUENAS" "$_tc_version" | sort -V | head -1)" != "$MIN_TRUENAS" ]; then
+    echo "ERROR: TrueNAS ${_tc_version} is too old — this patch requires ${MIN_TRUENAS} or newer." >&2
+    echo "" >&2
+    echo "  TrueCloud Backup does not exist before ${MIN_TRUENAS}, so there is nothing" >&2
+    echo "  here for the patch to extend. Upgrade TrueNAS first." >&2
+    exit 1
+else
+    echo "TrueNAS ${_tc_version} (minimum ${MIN_TRUENAS}) — ok"
+fi
+
 if ! command -v midclt &>/dev/null; then
     echo "ERROR: midclt not found. Run this script on TrueNAS SCALE." >&2
     exit 1

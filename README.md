@@ -1,5 +1,14 @@
 # truenas-truecloud-patch
 
+> ### Requires **TrueNAS SCALE 24.10 or newer**
+>
+> TrueCloud Backup — the feature this patch extends — **does not exist before
+> 24.10**. There is nothing here to install on an older release, and `install.sh`
+> will refuse.
+>
+> Verified on **24.10**, **25.04** and **25.10**. Not yet compatible with the
+> unreleased **26.0** (see [TrueNAS compatibility](#truenas-compatibility)).
+
 Extends TrueNAS SCALE's **TrueCloud Backup** feature to:
 
 - work with S3-compatible providers and native Backblaze B2, instead of Storj only;
@@ -436,9 +445,20 @@ Two different things must survive two different events:
    so nothing registered there can run before it.
 2. **Pools import** (`ix-zfs.service`), making `/mnt/<pool>` — and this
    repository — available.
-3. **`apply.sh` runs** (`ix-preinit.service`): mounts the writable overlay
-   (upper layer in `/run`), patches `b2.py` and `restic.py` on disk inside it,
-   patches the UI bundle, and writes `apply.log` and `hook_status.json`.
+3. **`apply.sh` runs** (`ix-preinit.service`). Before it patches anything it runs
+   the **compatibility preflight** ([`tools/compat.py`](tools/compat.py)) against
+   the middlewared that is *actually installed*, and **any module whose assumptions
+   no longer hold is not applied** — see [TrueNAS
+   compatibility](#truenas-compatibility). What survives that check gets applied:
+   it mounts the writable overlay (upper layer in `/run`), patches `b2.py` and
+   `restic.py` on disk inside it, patches the UI bundle, and writes `apply.log` and
+   `hook_status.json`.
+
+   An incompatible module is skipped **for this boot only**. It is not the kill
+   switch: install a release that supports your TrueNAS and the patch re-applies
+   itself on the next boot, with no manual step. (The kill switch is permanent and
+   is set only when TrueNAS has made the patch *unnecessary* — a different
+   situation, and the opposite conclusion.)
 4. **A deferred restart is scheduled.** The middlewared that is running
    imported the stock modules in step 1 and never re-imports, so the on-disk
    patch alone is not enough. `apply.sh` detects it was invoked by middlewared
@@ -476,7 +496,7 @@ then run `install.sh` from there:
 
 ```bash
 # Replace /mnt/tank with your pool name
-git clone https://github.com/sudolulo/truenas-truecloud-patch.git \
+git clone https://git.onetick.ninja/flan/truenas-truecloud-patch.git \
     /mnt/tank/truenas-truecloud-patch
 cd /mnt/tank/truenas-truecloud-patch
 bash install.sh
@@ -560,7 +580,7 @@ detonate on the next reboot. That is not hypothetical: **v0.0.4 shipped exactly
 such a bug and took all 54 apps on a box down.**
 
 The manual step *is* the safety gate. If you want convenience, watch the
-[releases feed](https://github.com/sudolulo/truenas-truecloud-patch/releases);
+[releases feed](https://git.onetick.ninja/flan/truenas-truecloud-patch/releases);
 don't automate the pull.
 
 ## Update alerts
@@ -579,6 +599,17 @@ system raises an INFO alert; a release with a `### Security` section raises a
 WARNING. The CHANGELOG's own section headings are the signal, and a security fix
 anywhere in the range escalates the whole span — a docs-only release on top of a
 security fix still reports as security.
+
+**Release candidates never alert.** They are invisible to `update.sh` and to the
+alert, which both take the newest plain `vX.Y.Z` tag. That is what lets debugging
+happen in `-rc` tags instead of in your notification bell — see
+[Releasing](#releasing).
+
+The changelog is read from whichever forge `origin` points at, derived from the
+remote rather than hard-coded. That is not cosmetic: when the changelog cannot be
+read, the alert deliberately fires **anyway** rather than risk hiding a security
+fix — so a wrong URL would not silence the alert, it would make it fire on *every*
+release, including the documentation-only ones this section promises to suppress.
 
 ### How it works, and why it's built this way
 
@@ -720,7 +751,8 @@ python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify
 | What you see | What it means |
 |---|---|
 | `[OK] providers`, `[OK]`/`[SKIP] nested_snapshots` | Fine. Nothing to do. |
-| `WARNING: … pattern not found` (UI) | The Angular bundle changed. The UI dropdown reverts to Storj-only, but **backups keep working** — create tasks with `create_task.py` meanwhile, and [open an issue](https://github.com/sudolulo/truenas-truecloud-patch/issues) with your TrueNAS version. |
+| `WARNING: … pattern not found` (UI) | The Angular bundle changed. The UI dropdown reverts to Storj-only, but **backups keep working** — create tasks with `create_task.py` meanwhile, and [open an issue](https://git.onetick.ninja/flan/truenas-truecloud-patch/issues) with your TrueNAS version. |
+| `WARNING: truecloud-patch is NOT COMPATIBLE with this TrueNAS version` | This TrueNAS changed middleware underneath the patch, and the named module was **deliberately not applied** — see `incompatible.json` for exactly which assumption broke. TrueNAS is left stock, so nothing is half-patched. Check [TrueNAS compatibility](#truenas-compatibility), then `bash update.sh` once a release supports your version; it re-applies itself on the next boot. This is **not** the kill switch and needs no manual reset. |
 | `[FAIL] providers` | **Your B2/S3 backups will not run.** middlewared is fine, but the credential/URL handling is gone. Open an issue with your version. |
 | `[FAIL] nested_snapshots` | The stock guard is back, so tasks with `snapshot = true` on a nested dataset will fail validation. Turn the option off on those tasks until it's fixed. |
 
@@ -842,7 +874,7 @@ If a module shows `[FAIL]`:
    risk.
 4. **If the detail says the module doesn't exist**, a TrueNAS update renamed
    or restructured the internal API.
-   [Open an issue](https://github.com/sudolulo/truenas-truecloud-patch/issues)
+   [Open an issue](https://git.onetick.ninja/flan/truenas-truecloud-patch/issues)
    with your TrueNAS version number and the full verify output.
 
 ---

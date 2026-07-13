@@ -97,6 +97,14 @@ worse than no alert, because one day it carries a security fix.
 
 ### Changed
 
+- **The minimum supported TrueNAS is stated, and enforced: 24.10.** TrueCloud Backup
+  does not exist before it — `plugins/cloud_backup/` is simply absent — so the patch
+  had nothing to attach to and would have done nothing at all, silently, while the
+  user believed their backups were configured. `install.sh` now reads
+  `system.version` and refuses, naming the reason. A version it cannot *parse* is a
+  warning, not a refusal: declining to install over a string we failed to read would
+  be a worse failure than the one being prevented.
+
 - **A stable release may not leave work stranded under `## Unreleased`.** Either it
   is finished and belongs in the release, or the release is premature. Candidates
   are exempt: an rc may legitimately have work queued behind it.
