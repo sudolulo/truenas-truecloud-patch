@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.4.2 — 2026-07-13
+
+### Docs
+
+- **The Updating section never said how to *get* `update.sh`.** It ships inside the
+  patch, so a clone older than v0.4.0 doesn't have it — the docs told you to run a
+  script you didn't have. There is now an explicit bootstrap step (`git pull &&
+  bash install.sh`, once), including the fix for the *"insufficient permission for
+  adding an object to repository database"* failure that past `sudo git pull`s
+  cause.
+
+- **`After a TrueNAS update` rewritten.** It didn't explain that the patch
+  re-applies itself at every boot (so you never reinstall), and it didn't say what
+  each failure actually costs you. "Fail-safe" means *the box stays up* — not that
+  your backups keep running. A `[FAIL] providers` is a **broken backup**, and the
+  docs now say so rather than implying everything degrades gracefully.
+
+- Added a repo map. `patch/mw_patch.py` and `tools/release_notes.py` were
+  documented nowhere.
+
+- `Development` told you to run `ruff check patch tests`, which misses `tools/`.
+
+- Every command and file path in the README is now verified to exist and run.
+
 ## v0.4.1 — 2026-07-13
 
 ### Fixed

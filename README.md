@@ -46,6 +46,22 @@ The patch is two independent modules — **providers** (B2/S3) and **nested**
 (snapshots on nested datasets) — and each retires on its own once TrueNAS ships
 that capability natively. See [Native support](#if-truenas-adds-native-support).
 
+## What's in the repo
+
+| Path | What it is |
+|---|---|
+| `install.sh` | Registers the PREINIT boot hook, applies the patch, restarts middlewared. Also `--enable/--disable-nested-snapshots`. |
+| `update.sh` | Fetch a newer **release** and apply it. `--check`, `--rollback`, `--to`, `--main`. |
+| `uninstall.sh` | Remove everything: boot hook, patched files, UI bundle, staging mounts. |
+| `recover.sh` | Emergency: set the kill switch and restart middlewared against stock files. |
+| `patch/apply.sh` | The PREINIT script. Runs at **every boot**; re-applies the patch into a fresh overlay. |
+| `patch/mw_patch.py` | The one implementation of apply/revert for the `TRUECLOUD_PATCH` blocks. Used by `apply.sh` *and* `uninstall.sh`. |
+| `patch/truecloud_nested.py` | Nested-dataset staging: plan, mount, verify, tear down, sweep snapshots. Also `… cleanup` as a CLI. |
+| `patch/patch_ui.py` | Widens the Angular credential dropdown. Refuses to write a bundle whose parens it unbalanced. |
+| `patch/create_task.py` | Create TrueCloud tasks with S3/B2 credentials; `verify` the patch state. |
+| `patch/wait_restart.sh` | Waits for boot to actually settle before restarting middlewared. |
+| `tools/release_notes.py` | Extracts a version's CHANGELOG section; enforces version consistency. Used by CI. |
+
 ## Development
 
 Parts of this project were written with AI assistance (Claude). All of it is
@@ -54,14 +70,24 @@ make that review meaningful. Bugs are mine.
 
 ```bash
 pip install pytest ruff
-ruff check patch tests
+ruff check patch tests tools
 pytest tests
 ```
 
-CI runs shellcheck, `bash -n`, ruff, and pytest on Python 3.11–3.13. The tests
-include a pass that `compile()`s the `*_BLOCK` strings in `patch/apply.sh` —
-those are Python source appended into live `middlewared` modules, so a syntax
-error there would break the box at boot.
+CI runs shellcheck, `bash -n`, ruff, and pytest on Python 3.11–3.13. Two checks
+are worth calling out, because nothing else would catch what they catch:
+
+- The tests **`compile()` the `*_BLOCK` strings** in `patch/apply.sh`. Those are
+  Python source appended into live `middlewared` modules — a syntax error there
+  breaks the box at boot, and they're string literals, so nothing else type-checks
+  them.
+- CI asserts **every script declares the same version**, and that it matches the
+  newest CHANGELOG entry. `VERSION=` had silently drifted to three different
+  values across the scripts before anything checked.
+
+Releases are automated: push a `vX.Y.Z` tag and the workflow runs the full suite,
+verifies the version matches, and cuts a GitHub release whose body **is** the
+matching `CHANGELOG.md` section — one source of truth for release notes.
 
 ---
 
@@ -342,27 +368,70 @@ Refresh your browser. S3 and B2 credentials now appear in the
 ## Updating
 
 ```bash
+cd /mnt/tank/truenas-truecloud-patch
 bash update.sh              # to the newest release, with a confirmation
-bash update.sh --check      # show what would happen; change nothing
-bash update.sh --rollback   # undo the last update
 ```
 
-It preserves your nested-snapshot opt-in setting, shows you the commits and
-release notes you don't have yet, and asks before changing anything. It records
-the previous revision *before* moving, so `--rollback` works even if `install.sh`
-dies halfway.
+| | |
+|---|---|
+| `bash update.sh` | Update to the newest release tag. Shows what's coming, asks first. |
+| `bash update.sh --check` | Show what *would* happen. Changes nothing. |
+| `bash update.sh --rollback` | Undo the last update. |
+| `bash update.sh --to v0.3.5` | Go to a specific tag or commit. |
+| `bash update.sh --main` | Track **unreleased** `main`. You're on your own. |
+| `bash update.sh --yes` | Skip the confirmation (for a scripted, *attended* run). |
 
-**Run it by hand. Never from cron or a systemd timer.** This patch injects Python
-into `middlewared` and re-applies itself at every boot, so an unattended pull would
-let any bad upstream commit reach your box with no human in the loop and take
-effect on the next reboot. v0.0.4 shipped exactly such a bug and took every app on
-the box down. The manual step *is* the safety gate — if you want convenience, watch
-the [releases](https://github.com/sudolulo/truenas-truecloud-patch/releases) feed,
+Run it as **root** — it calls `install.sh`, which needs to reload middlewared.
+
+### First time: bootstrapping `update.sh`
+
+`update.sh` ships *inside* the patch, so a clone older than v0.4.0 doesn't have it
+yet. Bootstrap it once with git:
+
+```bash
+cd /mnt/tank/truenas-truecloud-patch
+git pull                 # or: git checkout v0.4.1
+bash install.sh
+```
+
+Every update after that is just `bash update.sh`.
+
+> If a plain `git pull` fails with *"insufficient permission for adding an object
+> to repository database"*, past `sudo git pull`s left root-owned objects in
+> `.git`. Fix it once as root: `chown -R <you>:<you> .git`. (`update.sh` repairs
+> this automatically from then on.)
+
+### What it does for you
+
+- **Preserves your nested-snapshot opt-in setting** — updating never flips it.
+- **Shows the commits and release notes you don't have**, then asks before moving.
+- **Records the previous revision *before* checking out**, so `--rollback` works
+  even if `install.sh` dies halfway through.
+- **Refuses to run over a dirty working tree**, rather than merging across
+  hand-edited or scp'd files and losing them.
+- **Detects untracked files that would be clobbered** by the checkout and names
+  them, instead of dying on a raw git error mid-update.
+- **Repairs `.git` ownership** left root-owned by past `sudo git pull`s.
+
+It updates to the newest **release tag**, not `main`. `main` can be mid-refactor;
+a tag is the tested artifact, and CI gates every release. Pre-release tags
+(`-rc`, `-beta`) are skipped — `--to` them explicitly if you want one.
+
+After updating, the checkout is pinned to a release tag (detached HEAD). That is
+what you want for a deployment: plain `git pull` no longer applies, and
+`update.sh` is the supported path.
+
+### Why there is no auto-update
+
+**Never put this in cron or a systemd timer.** This patch injects Python into
+`middlewared` and re-applies itself at *every boot*, so an unattended pull would
+let any bad upstream commit reach your box with no human in the loop — and
+detonate on the next reboot. That is not hypothetical: **v0.0.4 shipped exactly
+such a bug and took all 54 apps on a box down.**
+
+The manual step *is* the safety gate. If you want convenience, watch the
+[releases feed](https://github.com/sudolulo/truenas-truecloud-patch/releases);
 don't automate the pull.
-
-It updates to the newest **release tag**, not `main` — `main` can be mid-refactor,
-and a tag is the tested artifact. `--main` exists if you want unreleased code, and
-says so loudly.
 
 ## Creating a task via CLI
 
@@ -460,12 +529,34 @@ tail -20 /mnt/tank/truenas-truecloud-patch/apply.log
 
 ## After a TrueNAS update
 
-1. Check the log: `cat /mnt/tank/truenas-truecloud-patch/apply.log | tail -30`
-2. If you see "WARNING: … pattern not found", the UI patch needs updating.
-   [Open an issue](https://github.com/sudolulo/truenas-truecloud-patch/issues)
-   with your TrueNAS version number.
-3. The backend patch (B2 support + URL fix) is more stable — check that a
-   B2 backup job still completes successfully after any update.
+A TrueNAS update replaces `/usr/` wholesale, wiping the patch. You do **not** need
+to reinstall: `patch/apply.sh` runs at every boot and re-applies itself from your
+clone. But it targets internal APIs with no stability contract, so an update *can*
+break it — and the failure is quiet by design (middlewared starts fine; the patch
+just doesn't).
+
+**Check the log after any TrueNAS update:**
+
+```bash
+tail -30 /mnt/tank/truenas-truecloud-patch/apply.log
+python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify
+```
+
+| What you see | What it means |
+|---|---|
+| `[OK] providers`, `[OK]`/`[SKIP] nested_snapshots` | Fine. Nothing to do. |
+| `WARNING: … pattern not found` (UI) | The Angular bundle changed. The UI dropdown reverts to Storj-only, but **backups keep working** — create tasks with `create_task.py` meanwhile, and [open an issue](https://github.com/sudolulo/truenas-truecloud-patch/issues) with your TrueNAS version. |
+| `[FAIL] providers` | **Your B2/S3 backups will not run.** middlewared is fine, but the credential/URL handling is gone. Open an issue with your version. |
+| `[FAIL] nested_snapshots` | The stock guard is back, so tasks with `snapshot = true` on a nested dataset will fail validation. Turn the option off on those tasks until it's fixed. |
+
+"Fail-safe" means *the box stays up* — not that your backups keep running. A
+`[FAIL] providers` is a broken backup, so check the log rather than assume.
+
+Then update the patch itself if a newer release fixes it:
+
+```bash
+bash /mnt/tank/truenas-truecloud-patch/update.sh
+```
 
 ---
 
