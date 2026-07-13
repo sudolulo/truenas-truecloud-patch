@@ -1,7 +1,7 @@
 # Changelog
 
 Work lands under **Unreleased** and stays there until a release promotes it. That
-is deliberate: see [Releasing](README.md#releasing). Twelve releases were cut on
+is deliberate: see [Releasing](docs/releasing.md). Twelve releases were cut on
 2026-07-13, several of them fixing the release before — and with the update alert
 live, every one of those interrupts every user. An alert people learn to ignore is
 worse than no alert, because one day it carries a security fix.

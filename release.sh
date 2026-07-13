@@ -138,12 +138,23 @@ run_gates() {
 
 # ── tests, because a tag that fails its own tests is not a release ───────────
 
+# The interpreter that actually has the dev deps. A bare `python3` is usually the
+# system one with no pytest -- and "No module named pytest" would read as "tests
+# fail", i.e. the gate blocking a release for a reason that is not true.
+PY=python3
+[ -x .venv/bin/python ] && PY=.venv/bin/python
+
+RUFF=""
+if [ -x .venv/bin/ruff ]; then RUFF=.venv/bin/ruff
+elif command -v ruff >/dev/null 2>&1; then RUFF=ruff
+fi
+
 run_tests() {
   note "running the suite"
-  python3 -m pytest tests -q || die "tests fail. Fix them; do not release around them."
-  if command -v ruff >/dev/null 2>&1; then
-    ruff check patch tests tools || die "lint fails"
-  fi
+  "$PY" -c 'import pytest' 2>/dev/null || die "no pytest in $PY. Install the dev deps:
+       python3 -m venv .venv && .venv/bin/pip install pytest ruff"
+  "$PY" -m pytest tests -q || die "tests fail. Fix them; do not release around them."
+  [ -n "$RUFF" ] && { "$RUFF" check patch tests tools || die "lint fails"; }
   local f
   while IFS= read -r f; do
     bash -n "$f" || die "bash syntax error in $f"

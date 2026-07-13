@@ -1,40 +1,54 @@
 # truenas-truecloud-patch
 
-> ### Requires **TrueNAS SCALE 24.10 or newer**
->
-> TrueCloud Backup — the feature this patch extends — **does not exist before
-> 24.10**. There is nothing here to install on an older release, and `install.sh`
-> will refuse.
->
-> Verified on **24.10**, **25.04** and **25.10**. The unreleased **26.0** is not yet
-> supported for nested snapshots — see [TrueNAS
-> compatibility](#truenas-compatibility). Nothing breaks if you upgrade: the patch
-> checks, and declines.
+Extends TrueNAS SCALE's **TrueCloud Backup** to:
 
-Extends TrueNAS SCALE's **TrueCloud Backup** feature to:
+- back up to **Backblaze B2 and any S3-compatible provider**, not just Storj;
+- snapshot **datasets that have child datasets** — which is every box running Apps.
 
-- work with S3-compatible providers and native Backblaze B2, instead of Storj only;
-- take **consistent snapshots of datasets that have child datasets** — which is
-  every box running Apps (see [Nested-dataset snapshots](#nested-dataset-snapshots)).
+**Requires TrueNAS SCALE 24.10 or newer.** TrueCloud Backup does not exist before
+that, and `install.sh` will refuse.
+
+> Storj raised the price of their TrueNAS-integrated tier from **$5/month to
+> $50/month** in 2026. TrueCloud Backup is the only native TrueNAS feature that gives
+> you pre-backup ZFS snapshots, restic dedup, scheduled tasks with UI progress, and
+> dataset-lock integration. Running restic by hand loses all of it. This gets the
+> feature back with storage you already pay for.
 
 ---
 
-## Why this exists
+## Install
 
-In 2026, Storj raised the price of their TrueNAS-integrated storage tier from
-**$5/month to $50/month** — a 10× increase. For many home lab and small-office
-users, the TrueCloud Backup feature became unaffordable overnight.
+Clone it onto a **pool** (not the boot device — that is wiped on TrueNAS upgrades),
+then run `install.sh` as root:
 
-TrueCloud Backup is the only native TrueNAS mechanism that provides:
-- Integrated ZFS snapshot support before each backup
-- Restic-based incremental deduplication
-- Scheduled tasks with progress and log tracking in the UI
-- Dataset lock integration
+```bash
+git clone https://git.onetick.ninja/flan/truenas-truecloud-patch.git \
+    /mnt/tank/truenas-truecloud-patch          # replace `tank` with your pool
+cd /mnt/tank/truenas-truecloud-patch
+sudo bash install.sh
+```
 
-Running restic manually is possible but loses all of the above.
-This patch restores access to the TrueCloud Backup feature for users who
-need a provider other than Storj, with storage they already pay for or that
-costs a fraction of the new Storj price.
+That registers a PREINIT boot hook, patches middleware in a volatile overlay, and
+restarts middlewared. **It survives TrueNAS updates** — the patch is re-applied at
+every boot, never written to the system dataset.
+
+Nested-dataset snapshots are **opt-in**:
+
+```bash
+sudo bash install.sh --enable-nested-snapshots
+```
+
+Then create a TrueCloud Backup task in the UI with a B2 or S3 credential, or from
+[the CLI](docs/cli.md).
+
+**Check it worked:**
+
+```bash
+sudo python3 patch/create_task.py verify
+```
+
+If something is wrong, the reason is in `apply.log` — start at
+[Recovery](docs/recovery.md).
 
 ---
 
@@ -60,553 +74,34 @@ source. It does not mean a human ran a backup on it — that is the
 **Hardware-verified** column, which is filled in by hand and only by doing it.
 <!-- END COMPAT MATRIX -->
 
-The table above is **regenerated daily by CI** — it is not a claim somebody typed
-once and forgot. **TrueCloud Backup does not exist before 24.10**, so earlier
-versions are absent rather than "unsupported".
+The table is **regenerated daily by CI** against iXsystems' actual middleware source
+— it is not a claim somebody typed once and forgot.
 
-### TrueNAS 26 — nested snapshots are not supported yet
-
-**You do not need to do anything, and upgrading will not break your backups.** On
-26, `apply.sh` finds that the nested module's assumptions no longer hold and **does
-not apply it**. TrueNAS is left stock: B2/S3 backups keep running (the providers
-module is unaffected), datasets nested under the target are simply not included, and
-the reason is named in `apply.log`. A broken backup is worse than a missing feature.
-
-TrueNAS 26 changes three things underneath this module, and each one alone is
-backup-breaking:
-
-| what changed | what it would have done |
-| --- | --- |
-| `cloud_backup` rewritten **async → synchronous** | an `async def` wrapper hands `sync.py` a coroutine where it unpacks a tuple |
-| `get_dataset_recursive()` **deleted** from `plugins/cloud/snapshot.py` | `NameError` — the injected block called it out of the host module's namespace |
-| `plugins/zfs_/dataset.py` and `zfs_/snapshot.py` **deleted** | `zfs.dataset.query`, `zfs.snapshot.query` and `zfs.snapshot.delete` all vanish. 26 uses `filesystem.statfs` and `zfs.resource.*` instead |
-
-The first two are fixed: the patch now reads which flavour of `cloud_backup` your box
-declares and injects the wrapper that matches (one implementation of the real logic,
-two thin wrappers), and it carries its own copy of the deleted helper.
-
-The third is **not** fixed, and is why 26 still reports BROKEN. Porting it means
-rewriting the module's ZFS calls onto 26's new API, and there is no single API that
-spans 24.10 through 26 — so it needs a real 26 box to verify against, not a
-plausible-looking diff. **Shipping a port nobody has run is exactly the failure this
-project exists to avoid.** The third row is also the one that would have hurt most:
-`zfs.snapshot.delete` is what sweeps the recursive snapshot, and without it every run
-would orphan one snapshot per descendant dataset — 250 on a real pool — forever.
-
-`master` (development after 26) reports BROKEN too: iXsystems are still reshaping
-these functions there, renaming `middleware` → `context` and `cloud_backup` →
-`entry`, and adding a required `credentials` parameter. That is a moving target and
-is deliberately not chased; the check keeps reporting it until it settles into a
-beta, which is when it becomes worth fixing.
-
-### How this is kept honest
-
-[`tools/compat.py`](tools/compat.py) is the single written-down record of what each
-module assumes about middleware. It is checked in two places:
-
-- **[CI](.github/workflows/compat.yml), daily** — against iXsystems' source at every
-  release line, *including `master` and the current BETA/RC*. When an unreleased
-  version breaks the patch, it files a bug report automatically. The point is to
-  find out while it is still a beta, rather than after it ships to you.
-- **`apply.sh`, at every boot** — against the middleware installed on your machine.
-  A module whose assumptions no longer hold is not applied.
-
-Regenerate the table with:
-
-```bash
-python3 tools/compat.py --matrix              # human-readable
-python3 tools/compat.py --matrix --markdown   # the table above
-python3 tools/compat.py --ref master          # one version, with reasons
-```
+**TrueNAS 26: nested snapshots are not supported yet, and upgrading will not break
+you.** 26 rewrites `cloud_backup` and deletes the ZFS methods this module calls. On
+26 `apply.sh` finds that the assumptions no longer hold and **does not apply the
+module**: TrueNAS is left stock, B2/S3 keeps working, nested datasets are simply not
+covered, and the reason is named in `apply.log`. A broken backup is worse than a
+missing feature. Details: [How it works](docs/how-it-works.md#truenas-26).
 
 ---
-
-## Before you install
-
-This project is unofficial and not affiliated with iXsystems. A few things worth
-knowing:
-
-- It targets **internal middleware APIs** with no stability contract, so a
-  TrueNAS update can break it. Every patch is fail-safe: if it can't apply,
-  middlewared starts normally and the reason is logged to `apply.log`. Check the
-  log after an update. See [TrueNAS compatibility](#truenas-compatibility) for
-  which versions currently work.
-- If you file a TrueNAS bug report, **remove the patch first** and reproduce on a
-  stock system.
-- **Test your restores.** True of any backup, but it matters more here — see
-  [Verifying it works](#verifying-it-works).
-- Provided as-is, no warranty. See LICENSE.
-
-The patch is two independent modules — **providers** (B2/S3) and **nested**
-(snapshots on nested datasets) — and each retires on its own once TrueNAS ships
-that capability natively. See [Native support](#if-truenas-adds-native-support).
-
-## What's in the repo
-
-| Path | What it is |
-|---|---|
-| `install.sh` | Registers the PREINIT boot hook, applies the patch, restarts middlewared. Also `--enable/--disable-nested-snapshots`. |
-| `update.sh` | Fetch a newer **release** and apply it. `--check`, `--rollback`, `--to`, `--main`. |
-| `uninstall.sh` | Remove everything: boot hook, patched files, UI bundle, staging mounts. |
-| `recover.sh` | Emergency: set the kill switch and restart middlewared against stock files. |
-| `patch/apply.sh` | The PREINIT script. Runs at **every boot**; re-applies the patch into a fresh overlay. |
-| `patch/mw_patch.py` | The one implementation of apply/revert for the `TRUECLOUD_PATCH` blocks. Used by `apply.sh` *and* `uninstall.sh`. |
-| `patch/truecloud_nested.py` | Nested-dataset staging: plan, mount, verify, tear down, sweep snapshots. Also `… cleanup` as a CLI. |
-| `patch/patch_ui.py` | Widens the Angular credential dropdown. Refuses to write a bundle whose parens it unbalanced. |
-| `patch/create_task.py` | Create TrueCloud tasks with S3/B2 credentials; `verify` the patch state. |
-| `patch/alert_source.py` | The TrueNAS alert for "an update is available". Installed into `middlewared/alert/source/`. |
-| `patch/wait_restart.sh` | Waits for boot to actually settle before restarting middlewared. |
-| `release.sh` | Cut a release. Two stages, and the second is refused without the first. See [Releasing](#releasing). |
-| `tools/compat.py` | What each module assumes about middlewared — and the checker. Run by CI daily *and* by `apply.sh` at every boot. |
-| `tools/release_notes.py` | Extracts a version's CHANGELOG section; enforces version consistency. |
-| `tools/release_gate.py` | The barrier: a stable release must have been a release candidate on the same commit. |
-
-## Development
-
-Parts of this project were written with AI assistance (Claude). All of it is
-reviewed and tested before release; the test suite and CI exist in large part to
-make that review meaningful. Bugs are mine.
-
-```bash
-pip install pytest ruff
-ruff check patch tests tools
-pytest tests
-```
-
-CI runs shellcheck, `bash -n`, ruff, and pytest on Python 3.11–3.13. Two checks
-are worth calling out, because nothing else would catch what they catch:
-
-- The tests **`compile()` the `*_BLOCK` strings** in `patch/apply.sh`. Those are
-  Python source appended into live `middlewared` modules — a syntax error there
-  breaks the box at boot, and they're string literals, so nothing else type-checks
-  them.
-- CI asserts **every script declares the same version**, and that it matches the
-  newest CHANGELOG entry. `VERSION=` had silently drifted to three different
-  values across the scripts before anything checked.
-
-The project is hosted on **Gitea** (`git.onetick.ninja/flan/truenas-truecloud-patch`)
-and mirrored to GitHub. Both run the same workflows — Gitea reads
-`.github/workflows/` too — so a change is checked twice, on two independent runners.
-
----
-
-## Releasing
-
-**Every release interrupts every user.** An update alert fires on each installed
-box (see [Update alerts](#update-alerts)), so a release that exists only to fix the
-last release teaches people to dismiss the alert — and one day that alert will be
-carrying a security fix. This project cut twelve releases in a single day once.
-Never again, and not by good intentions: by a gate.
-
-### The rule
-
-> A stable `vX.Y.Z` may only be published if a `vX.Y.Z-rcN` tag points at the
-> **same commit**.
-
-Release candidates are **invisible to users**: `update.sh` and the update alert both
-take the newest plain `vX.Y.Z` tag, so an `-rc` is never offered as an update. All
-the debugging therefore happens across `rc1`, `rc2`, `rc3` — at nobody's expense —
-instead of across `v0.5.0`, `v0.5.1`, `v0.5.2`, at everybody's.
-
-"The candidate passed, then I pushed one more little fix" is refused **by name**.
-That is not hypothetical; it is exactly how v0.5.1 happened.
-
-### Day to day
-
-You don't touch the release machinery. Write your changes under `## Unreleased` in
-`CHANGELOG.md` and push to `main`. `main` is a work surface — it is allowed to be
-mid-thought. Releasing is a separate, deliberate act.
-
-### Cutting a release
-
-```bash
-bash release.sh 0.6.0 --check      # what would ship? what is the next rc?
-
-bash release.sh 0.6.0 --rc         # promotes `## Unreleased` -> v0.6.0, stamps every
-                                   # VERSION=, tags v0.6.0-rc1, pushes. Users see nothing.
-
-#   ... install it on a real box. Exercise it. Break it. ...
-#   Found a bug? Fix it on main, then `bash release.sh 0.6.0 --rc` again -> rc2.
-
-bash release.sh 0.6.0 --promote    # publishes v0.6.0. REFUSED unless an rc points here.
-```
-
-### The gates, and where they live
-
-The logic is Python so it can be unit-tested; CI is the enforcement boundary
-because it is the only actor holding the token that publishes. `release.sh` runs the
-**same** code locally so you fail in 200 ms instead of after a push.
-
-| gate | enforces | where |
-| --- | --- | --- |
-| [`release_notes.py check`](tools/release_notes.py) | every script's `VERSION=` matches the tag; the CHANGELOG section exists and is non-empty; **nothing is stranded under `## Unreleased`** | `release.sh` + CI |
-| [`release_gate.py`](tools/release_gate.py) | **an rc points at this exact commit** | `release.sh` + CI |
-| the full suite | ruff, pytest, shellcheck, `bash -n` — re-run against the *tagged* commit | CI |
-
-A release's body **is** its `CHANGELOG.md` section — there is no second place to
-write release notes, and therefore no second place for them to go stale. Releases
-are published on both forges.
-
-### Why the alert doesn't nag
-
-A release whose CHANGELOG contains only a `### Docs` section changed no code, and
-raises **no alert**. Candidates raise no alert either. So the only thing that ever
-interrupts a user is a real, complete change — which is the entire point.
-
----
-
-## What is actually patched
-
-**Nothing in TrueNAS's persistent database or configuration is modified**
-(other than the boot-hook entry itself). On every boot, `patch/apply.sh` runs
-as a PREINIT script. It mounts a writable
-[overlayfs](https://docs.kernel.org/filesystems/overlayfs.html) over the
-relevant directories in `/usr/` (upper layer in `/run` tmpfs), then patches
-`b2.py` and `restic.py` inside that overlay. The overlay is volatile — it
-exists only for the current boot — but the PREINIT script recreates it
-automatically on every subsequent boot. Nothing in `/usr/` is written to
-directly.
-
-PREINIT scripts are executed *by* middlewared, which by then has already
-imported the stock modules — so after patching, `apply.sh` schedules a single
-detached middlewared restart (transient systemd unit `truecloud-mw-restart`
-running `patch/wait_restart.sh`) that loads the patched modules once boot has
-*actually* settled: the script waits for the systemd boot job queue to drain
-and for the docker/apps state machine to reach a terminal state before
-restarting. Expect one middlewared restart shortly after every boot; the UI
-and API are briefly unavailable while it happens, and running services are
-not affected.
-
-| Module | What changes | Technique |
-|---|---|---|
-| **providers** | `B2RcloneRemote` gains `get_restic_config()` — skipped automatically if TrueNAS already provides one on the class. `restic.py` URL builder is fixed: strips the stray leading slash and converts the slash separator to a colon (`b2:bucket:path`), which is the format restic 0.16.x expects. URL wrapper is a no-op if the URL is already correctly formed. | File patch applied inside the overlayfs upper layer |
-| **providers** (UI) | The Angular bundle's `filterByProviders` binding is widened from `["STORJ_IX"]` to `["STORJ_IX","S3","B2"]` | In-place text replacement in the compiled JS chunk; original is backed up before patching |
-| **nested** (opt-in) | `_truecloud_nested.py` is installed into `plugins/cloud/`, and `plugins/cloud/{snapshot,crud}.py` + `plugins/cloud_backup/sync.py` are patched so `snapshot = true` works on a dataset that has child datasets. See [below](#nested-dataset-snapshots). | New module + file patches inside the overlayfs upper layer |
-
-All changes are **fail-safe**: if a patch cannot be applied (e.g. TrueNAS
-restructured the relevant code), middlewared starts normally, the affected module
-is simply inactive, and the reason is logged to `apply.log` in your repo root. The
-two modules are independent — one failing or going native does not disable the
-other.
-
-## Nested-dataset snapshots
-
-**Opt-in, off by default.** It changes how backups read their source data, so it
-is never enabled implicitly:
-
-```bash
-bash install.sh --enable-nested-snapshots
-bash install.sh --disable-nested-snapshots
-```
-
-With neither flag `install.sh` leaves the setting alone, so `git pull && bash
-install.sh` won't flip it. The providers module is unaffected either way.
-
-Validated end to end on a live 252-dataset pool: an unattended scheduled backup
-of `/mnt/Tap` built a 173-mount staging tree, completed in **18m14s**, and left
-**zero** orphaned snapshots and **zero** stale mounts behind. The same backup
-previously stalled at 74% for over 12 hours reading live files.
-
-Still: verify your own first run actually contains child-dataset data before you
-rely on it — see [Verifying it works](#verifying-it-works). That advice is not
-boilerplate; it is the specific thing this feature exists to make true.
-
-TrueCloud Backup's **Take Snapshot** option makes restic read from a frozen ZFS
-snapshot instead of live files. Without it the backup reads data *while apps are
-writing to it* — databases get captured mid-write, and an app that rewrites its
-files continuously can stall a backup indefinitely as restic chases a moving
-target.
-
-Stock TrueNAS refuses to enable it on most real-world paths:
-
-```
-[EINVAL] cloud_backup_update.snapshot:
-  This option is only available for datasets that have no further nesting
-```
-
-That rules out **any pool running Apps** — every app is its own dataset, usually
-with `config`/`pgdata` children of its own. On a typical box that is 100+ nested
-datasets, so the feature is effectively unusable exactly where it matters most.
-
-### Why stock refuses
-
-The guard is **correct**. `plugins/cloud/snapshot.py` already takes a *recursive*
-ZFS snapshot — but it then points restic at the **parent** dataset's
-`.zfs/snapshot/<snap>/` directory, and ZFS does not expose child datasets
-through a parent's snapshot directory:
-
-```
-/mnt/Tap/.zfs/snapshot/<snap>/apps/                 ->  0 entries  (children invisible)
-/mnt/Tap/apps/lidarr/config/.zfs/snapshot/<snap>/   ->  the real data
-```
-
-So if you just remove the validation, restic walks a near-empty tree, reports
-SUCCESS, and uploads almost nothing — a green backup job protecting no data. iX
-gate the config rather than ship a backup that lies about succeeding.
-
-That is worth spelling out, because deleting those four lines in
-`plugins/cloud/crud.py` is the obvious "fix" and it is the wrong one. The guard
-is load-bearing: it has to be *replaced* with a working traversal, not removed.
-
-### What this patch does instead
-
-After the (already recursive) snapshot is taken, every descendant dataset's own
-`.zfs/snapshot/<snap>` is bind-mounted into a **staging tree** that mirrors the
-original layout, and restic is pointed at the staging root — a complete,
-consistent, point-in-time view of the whole subtree. Only then is the guard
-relaxed.
-
-Safety properties, in order of importance:
-
-- **Staging failure is loud.** If any descendant cannot be staged, the backup
-  *fails*. A silently-incomplete backup is precisely what the stock guard exists
-  to prevent, and it would be worse than not having the feature at all.
-- **Post-mount verification** asserts every planned target really is a mountpoint
-  and the staging root is non-empty — so this cannot regress into the empty
-  backup it exists to fix.
-- **The guard is relaxed last.** `apply.sh` installs the traversal, patches
-  `snapshot.py`, then `sync.py`, and only then `crud.py`. Any partial failure
-  leaves the guard intact and the option merely unavailable — never
-  "guard removed, traversal missing".
-- Datasets that cannot contribute to a file tree (`mountpoint=none|legacy`,
-  unmounted, locked/encrypted) are skipped and **reported to the log** — never
-  dropped silently.
-- Scoped to **cloud_backup only**. Cloud Sync (rclone) shares the same
-  validation mixin but has no staging teardown wired in, so its guard is
-  deliberately left in place.
-
-Side benefit: the staging root is a **stable path per task**, so restic can find
-its parent snapshot between runs. Stock's `.zfs/snapshot/<name>-<timestamp>/`
-path changes every run, defeating restic's parent detection and forcing a full
-re-scan each time.
-
-### Snapshot lifecycle
-
-`zfs.snapshot.delete` defaults to **`recursive=False`**, and stock
-`restic_backup()` calls it with no options. Stock is safe only because its
-validation means a *recursive* snapshot never actually happens in the field.
-Enabling nested datasets makes them real: on a 250-dataset pool,
-`zfs snapshot -r` creates **250 snapshots**, and stock's delete removes only the
-parent — orphaning **249 on every successful run** (measured, not theorised).
-
-So the patch owns the whole lifecycle:
-
-- **Sweeps the parent and every child**, and is idempotent against stock's
-  `finally` winning the race once the mounts are released.
-- **Records the snapshot in a sidecar file before mounting anything**, so a
-  middlewared restart mid-backup cannot orphan the tree (this patch *schedules*
-  a restart at boot, so that is not hypothetical).
-- **Reclaims the tree left by a crashed run** instead of overwriting the record.
-- **Deletes the tree when staging fails** — sync.py's own `finally` deletes
-  *nothing* in that case, because its `snapshot` local never gets assigned.
-- **Enumerates datasets *after* the snapshot, never before.** A list read
-  beforehand can miss a dataset created in the gap, which the recursive snapshot
-  *would* capture but the staging plan would not — a silent omission.
-
-**Expected log noise:** stock's delete fails with `EBUSY` while the staging
-mounts pin the snapshot. You will see one benign `Error deleting snapshot ...`
-warning per run; the patch then unmounts and deletes the tree for real.
-
-### Verifying it works
-
-This feature exists because a backup can report SUCCESS while containing
-nothing, so check the contents rather than the exit status:
-
-```bash
-# 1. Does the restic snapshot actually contain child-dataset data?
-#    Pick a path that lives in a CHILD dataset (e.g. an app's config).
-midclt call cloud_backup.list_snapshots <task_id> | head
-
-# 2. List a child-dataset path inside the newest restic snapshot.
-#    If this is empty, the staging tree did not work and you are backing up NOTHING.
-midclt call cloud_backup.list_snapshot_directory <task_id> "<snapshot_id>" "/apps/lidarr/config"
-```
-
-You should see the app's real files (`lidarr.db`, `config.xml`, …). An empty
-listing means the child datasets were not staged; disable the feature and open an
-issue.
-
-```bash
-# 3. No snapshots may be left behind after a run.
-zfs list -t snapshot -r <pool> | grep -c cloud_backup-   # expect 0 between runs
-
-# 4. No staging mounts may be left behind.
-mount | grep truecloud-nested                            # expect no output
-```
-
-### Troubleshooting
-
-| Symptom | Cause |
-|---|---|
-| `This option is only available for datasets that have no further nesting` | Feature not enabled. Run `install.sh --enable-nested-snapshots`, then restart middlewared. |
-| Backup fails: `dataset '…' has no snapshot '…'; refusing to back up an incomplete tree` | Working as designed — a descendant dataset was not covered by the snapshot. The backup is refused rather than silently omitting that data. |
-| Backup fails: `snapshot '…' cannot be read (Permission denied)` | The snapshot exists but is unreadable. Middleware runs as root, so this indicates a real permissions problem, not a missing snapshot. |
-| `cloud_backup-*` snapshots accumulating | The sweep is not running. Check `apply.log` for the nested patch applying, and confirm `sync.py` carries the `TRUECLOUD_PATCH` block. |
-| Web UI blank after a patch | A bad pattern unbalanced the bundle. `apply.sh` now refuses to write in that case, but if you hit it on an older version: restore `chunk-*.js.pre-truecloud-patch` over the live chunk, then re-run `install.sh`. (`MARKER` makes an already-patched file skip, so the patch cannot heal a corrupted bundle by itself.) |
-| Stale mounts under `/run/truecloud-nested` | A crashed run. The next backup tears them down. To clear them now: `python3 patch/truecloud_nested.py cleanup` (also run by `uninstall.sh` and `recover.sh`). It names any ZFS snapshot an interrupted run left pinned. |
-
-## Supported providers after patching
-
-| Provider | Credential type in TrueNAS |
-|---|---|
-| Backblaze B2 (native B2 API) | `B2` |
-| AWS S3, Wasabi, Cloudflare R2, MinIO, and any S3-compatible endpoint | `S3` |
-| Storj (unchanged) | `STORJ_IX` |
-
-## How persistence works
-
-Two different things must survive two different events:
-
-| Event | What would be lost | What makes it survive |
-|---|---|---|
-| **Reboot** | The overlay holding the patched files lives in `/run` (tmpfs) and vanishes | The PREINIT hook re-runs `apply.sh` on every boot and schedules one middlewared restart to load the result |
-| **TrueNAS update** | `/usr/` is replaced entirely; custom files in `/etc/` are wiped with the new boot environment | This repo lives on your **data pool**, and the hook registration lives in the **TrueNAS config database** — both survive updates. The first boot after an update is just a normal boot |
-
-### What happens on every boot
-
-1. **middlewared starts** with the stock (unpatched) modules. This is
-   unavoidable: PREINIT scripts are executed *by* middlewared
-   (`ix-preinit.service` → `midclt call initshutdownscript.execute_init_tasks`),
-   so nothing registered there can run before it.
-2. **Pools import** (`ix-zfs.service`), making `/mnt/<pool>` — and this
-   repository — available.
-3. **`apply.sh` runs** (`ix-preinit.service`). Before it patches anything it runs
-   the **compatibility preflight** ([`tools/compat.py`](tools/compat.py)) against
-   the middlewared that is *actually installed*, and **any module whose assumptions
-   no longer hold is not applied** — see [TrueNAS
-   compatibility](#truenas-compatibility). What survives that check gets applied:
-   it mounts the writable overlay (upper layer in `/run`), patches `b2.py` and
-   `restic.py` on disk inside it, patches the UI bundle, and writes `apply.log` and
-   `hook_status.json`.
-
-   An incompatible module is skipped **for this boot only**. It is not the kill
-   switch: install a release that supports your TrueNAS and the patch re-applies
-   itself on the next boot, with no manual step. (The kill switch is permanent and
-   is set only when TrueNAS has made the patch *unnecessary* — a different
-   situation, and the opposite conclusion.)
-4. **A deferred restart is scheduled.** The middlewared that is running
-   imported the stock modules in step 1 and never re-imports, so the on-disk
-   patch alone is not enough. `apply.sh` detects it was invoked by middlewared
-   and creates a transient systemd unit (`truecloud-mw-restart`, via
-   `systemd-run --no-block`) running `patch/wait_restart.sh` — detached so it
-   cannot disrupt the remainder of the boot sequence.
-5. **Once boot has settled, middlewared restarts once** and imports the
-   patched modules from the overlay. `wait_restart.sh` holds the restart until
-   the systemd boot job queue has drained (so in-flight `ix-*` units like
-   `ix-reporting` finish first) *and* middlewared's docker/apps startup has
-   reached a terminal state — plain unit ordering cannot see either, and
-   restarting middlewared while they run kills apps and dashboard reporting
-   for the whole boot. S3/B2 backup support is then active until the next
-   reboot, when the cycle repeats.
-
-What you will observe: one middlewared restart shortly after every boot (a
-brief web UI/API blip; running services are unaffected). Between steps 3
-and 5 there is a short window — typically well under a minute — where the UI
-already shows S3/B2 (the JS bundle is read from disk per request) but the
-backend is still stock. A backup job that fires inside that window fails once
-with `NotImplementedError` and succeeds on its next run; see
-[Troubleshooting](#troubleshooting) if it persists beyond boot.
-
-Manual runs of `bash patch/apply.sh` never trigger the restart — that only
-happens in boot context. `install.sh` and `recover.sh` perform their own
-explicit restarts instead, which is why a manual re-apply must be followed by
-`systemctl restart middlewared`.
-
----
-
-## Install
-
-Clone the repository to a **persistent ZFS pool** so it survives OS updates,
-then run `install.sh` from there:
-
-```bash
-# Replace /mnt/tank with your pool name
-git clone https://git.onetick.ninja/flan/truenas-truecloud-patch.git \
-    /mnt/tank/truenas-truecloud-patch
-cd /mnt/tank/truenas-truecloud-patch
-bash install.sh
-```
-
-The directory you clone into becomes the **permanent install location**. The
-PREINIT boot hook is registered with the exact path you chose, and TrueNAS will
-call that path on every boot.
-
-> **Do not delete or move the repository after install.**
-> If you need to relocate it, run `bash uninstall.sh` first, move the directory,
-> then run `bash install.sh` again from the new location. Deleting the repo
-> without uninstalling leaves a dangling PREINIT hook in the TrueNAS database —
-> if that happens, see [Emergency recovery](#emergency-recovery) below.
-
-Refresh your browser. S3 and B2 credentials now appear in the
-**Data Protection → TrueCloud Backup → Add** credential dropdown.
 
 ## Updating
 
 ```bash
 cd /mnt/tank/truenas-truecloud-patch
-bash update.sh              # to the newest release, with a confirmation
+sudo bash update.sh              # newest release
+sudo bash update.sh --check      # what would change?
+sudo bash update.sh --rollback   # back to the previous version
 ```
 
-| | |
-|---|---|
-| `bash update.sh` | Update to the newest release tag. Shows what's coming, asks first. |
-| `bash update.sh --check` | Show what *would* happen. Changes nothing. |
-| `bash update.sh --rollback` | Undo the last update. |
-| `bash update.sh --to v0.3.5` | Go to a specific tag or commit. |
-| `bash update.sh --main` | Track **unreleased** `main`. You're on your own. |
-| `bash update.sh --yes` | Skip the confirmation (for a scripted, *attended* run). |
+`update.sh` refuses to run on a dirty checkout, pins you to a release tag, and keeps
+the previous revision so a rollback is one command. **There is no auto-update**: this
+patches system internals as root, and a bad commit reaching your box unattended would
+detonate on the next reboot — v0.0.4 shipped exactly such a bug and took 54 apps
+down. The manual step *is* the safety gate.
 
-Run it as **root** — it calls `install.sh`, which needs to reload middlewared.
-
-### First time: bootstrapping `update.sh`
-
-`update.sh` ships *inside* the patch, so a clone older than v0.4.0 doesn't have it
-yet. Bootstrap it once with git:
-
-```bash
-cd /mnt/tank/truenas-truecloud-patch
-git pull                 # or: git checkout v0.4.1
-bash install.sh
-```
-
-Every update after that is just `bash update.sh`.
-
-> If a plain `git pull` fails with *"insufficient permission for adding an object
-> to repository database"*, past `sudo git pull`s left root-owned objects in
-> `.git`. Fix it once as root: `chown -R <you>:<you> .git`. (`update.sh` repairs
-> this automatically from then on.)
-
-### What it does for you
-
-- **Preserves your nested-snapshot opt-in setting** — updating never flips it.
-- **Shows the commits and release notes you don't have**, then asks before moving.
-- **Records the previous revision *before* checking out**, so `--rollback` works
-  even if `install.sh` dies halfway through.
-- **Refuses to run over a dirty working tree**, rather than merging across
-  hand-edited or scp'd files and losing them.
-- **Detects untracked files that would be clobbered** by the checkout and names
-  them, instead of dying on a raw git error mid-update.
-- **Repairs `.git` ownership** left root-owned by past `sudo git pull`s.
-
-It updates to the newest **release tag**, not `main`. `main` can be mid-refactor;
-a tag is the tested artifact, and CI gates every release. Pre-release tags
-(`-rc`, `-beta`) are skipped — `--to` them explicitly if you want one.
-
-After updating, the checkout is pinned to a release tag (detached HEAD). That is
-what you want for a deployment: plain `git pull` no longer applies, and
-`update.sh` is the supported path.
-
-### Why there is no auto-update
-
-**Never put this in cron or a systemd timer.** This patch injects Python into
-`middlewared` and re-applies itself at *every boot*, so an unattended pull would
-let any bad upstream commit reach your box with no human in the loop — and
-detonate on the next reboot. That is not hypothetical: **v0.0.4 shipped exactly
-such a bug and took all 54 apps on a box down.**
-
-The manual step *is* the safety gate. If you want convenience, watch the
-[releases feed](https://git.onetick.ninja/flan/truenas-truecloud-patch/releases);
-don't automate the pull.
+---
 
 ## Update alerts
 
@@ -628,7 +123,7 @@ security fix still reports as security.
 **Release candidates never alert.** They are invisible to `update.sh` and to the
 alert, which both take the newest plain `vX.Y.Z` tag. That is what lets debugging
 happen in `-rc` tags instead of in your notification bell — see
-[Releasing](#releasing).
+[Releasing](docs/releasing.md).
 
 The changelog is read from whichever forge `origin` points at, derived from the
 remote rather than hard-coded. That is not cosmetic: when the changelog cannot be
@@ -662,46 +157,7 @@ TrueNAS polls it itself, so there is no cron job and no systemd timer.
 - **Removed by `uninstall.sh`.**
 
 It only *tells* you. It never updates anything — see
-[Why there is no auto-update](#why-there-is-no-auto-update).
-
-## Creating a task via CLI
-
-If the UI still shows only Storj after refreshing (e.g. the JS bundle pattern
-changed in a new TrueNAS version), create tasks directly. Run this **on the
-TrueNAS host** — it talks to the local middleware via `midclt`, so it needs no
-host address or API key:
-
-```bash
-# Replace /mnt/tank/truenas-truecloud-patch with your clone path
-
-# List your cloud credentials to find the right ID
-python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py list-credentials
-
-# Create a task with a B2 credential (id=3).
-# The restic repo password is read from stdin, so it never lands in your shell
-# history — nor in any process's argv, where `ps` would expose it.
-printf '%s' 'restic-repo-password' | \
-python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py create \
-    --name "tank-to-b2" \
-    --path /mnt/tank/data \
-    --credential 3 \
-    --bucket my-bucket \
-    --folder backups/tank \
-    --password-stdin \
-    --cache-path /mnt/tank/.restic-cache \
-    --keep-last 14
-```
-
-Omit `--password-stdin` and you'll be prompted for the password instead. `--password
-<secret>` still works but warns: that password is the encryption key for the whole
-repository, and a CLI argument persists in your shell history forever.
-
-> **Always pass `--cache-path`.** Without it TrueNAS runs restic with `--no-cache`,
-> which re-fetches all repo metadata from the provider every run — glacially slow
-> on large repos. Point it at a writable dir on a pool with free space.
-
-> Versions ≤ 0.1.0 used the `/api/v2.0` REST API with `--host`/`--api-key`; those
-> flags are now accepted-but-ignored (REST is removed in TrueNAS 26.04).
+[Updating](#updating).
 
 ---
 
@@ -717,253 +173,39 @@ and restores the original UI bundle from backup.
 
 ---
 
-## If TrueNAS adds native support
+## Documentation
 
-The patch is **two independent modules**, and each retires on its own — TrueNAS
-is likely to ship one of these natively long before the other, and a module
-going native must not take the other one down with it.
-
-| Module | What it does | Detected as native when |
-|---|---|---|
-| **providers** | B2/S3 credentials for TrueCloud Backup (`b2.py`, `restic.py`, UI dropdown) | `B2RcloneRemote` carries a real `get_restic_config()` |
-| **nested** | Snapshots on datasets with child datasets (`plugins/cloud/*`) | the *"no further nesting"* validation is gone from `plugins/cloud/crud.py` |
-
-At every boot `apply.sh` checks both:
-
-- **One module goes native** → that module is skipped and logged; the other keeps
-  working, and the patch stays installed.
-- **Both are done** (native, or nested was never enabled) → the kill switch
-  (`disabled` file) is set, overlays are unmounted, and `apply.log` tells you to
-  run `uninstall.sh`.
-
-So on a box using only the provider patch, native B2 support retires the whole
-thing as before. On a box that also uses nested snapshots, native B2 support
-retires *just* that half.
-
-Check the log after any TrueNAS update:
-```bash
-tail -20 /mnt/tank/truenas-truecloud-patch/apply.log
-```
-
-`hook_status.json` reports each module separately (`module.providers`,
-`module.nested_snapshots`) with an `active` flag and a reason.
-
-**Scenarios where the auto-detect may not fire** (manual check needed):
-
-| Scenario | What happens | Action |
-|---|---|---|
-| B2 support added to a **base class** (not `B2RcloneRemote` directly) | `__dict__` check misses it; our method shadows native | Uninstall manually |
-| B2 **credential schema changed** (e.g. `provider["account"]` renamed) | `KeyError` on first backup | Uninstall or update the patch |
-| **URL builder** fixed but B2 class unchanged | URL wrapper becomes a no-op; no harm, but patch is dead weight | Uninstall at your convenience |
-
----
-
-## After a TrueNAS update
-
-A TrueNAS update replaces `/usr/` wholesale, wiping the patch. You do **not** need
-to reinstall: `patch/apply.sh` runs at every boot and re-applies itself from your
-clone. But it targets internal APIs with no stability contract, so an update *can*
-break it — and the failure is quiet by design (middlewared starts fine; the patch
-just doesn't).
-
-**Check the log after any TrueNAS update:**
-
-```bash
-tail -30 /mnt/tank/truenas-truecloud-patch/apply.log
-python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify
-```
-
-| What you see | What it means |
+| | |
 |---|---|
-| `[OK] providers`, `[OK]`/`[SKIP] nested_snapshots` | Fine. Nothing to do. |
-| `WARNING: … pattern not found` (UI) | The Angular bundle changed. The UI dropdown reverts to Storj-only, but **backups keep working** — create tasks with `create_task.py` meanwhile, and [open an issue](https://git.onetick.ninja/flan/truenas-truecloud-patch/issues) with your TrueNAS version. |
-| `WARNING: truecloud-patch is NOT COMPATIBLE with this TrueNAS version` | This TrueNAS changed middleware underneath the patch, and the named module was **deliberately not applied** — see `incompatible.json` for exactly which assumption broke. TrueNAS is left stock, so nothing is half-patched. Check [TrueNAS compatibility](#truenas-compatibility), then `bash update.sh` once a release supports your version; it re-applies itself on the next boot. This is **not** the kill switch and needs no manual reset. |
-| `[FAIL] providers` | **Your B2/S3 backups will not run.** middlewared is fine, but the credential/URL handling is gone. Open an issue with your version. |
-| `[FAIL] nested_snapshots` | The stock guard is back, so tasks with `snapshot = true` on a nested dataset will fail validation. Turn the option off on those tasks until it's fixed. |
+| [Nested-dataset snapshots](docs/nested-snapshots.md) | Why stock refuses, what this does instead, and **how to verify your backups actually contain the data** |
+| [How it works](docs/how-it-works.md) | What is patched, how it survives updates, the boot sequence, and what happens when TrueNAS goes native |
+| [Recovery](docs/recovery.md) | middlewared won't start, blank web UI, `verify` shows FAIL |
+| [CLI](docs/cli.md) | Creating tasks with `create_task.py` |
+| [Development](docs/releasing.md) | Tests, CI, and the release process |
 
-"Fail-safe" means *the box stays up* — not that your backups keep running. A
-`[FAIL] providers` is a broken backup, so check the log rather than assume.
+## What's in the repo
 
-Then update the patch itself if a newer release fixes it:
-
-```bash
-bash /mnt/tank/truenas-truecloud-patch/update.sh
-```
-
----
-
-## Emergency recovery
-
-### middlewared won't start
-
-Run this from the TrueNAS shell (local console, SSH, or the debug shell in
-the UI):
-
-```bash
-bash /mnt/tank/truenas-truecloud-patch/recover.sh
-```
-
-Replace the path with your clone location. This creates a kill-switch file
-(`disabled`) in the repo root, unmounts the overlay so the original files are
-visible immediately, then restarts middlewared. No reboot required.
-
-If you cannot run a script and only have a bare shell prompt:
-
-```bash
-touch /mnt/tank/truenas-truecloud-patch/disabled
-systemctl restart middlewared
-```
-
-If you don't remember where you cloned the repo (midclt won't work while middlewared is
-down), find the path two ways:
-
-```bash
-# Option 1 — search the filesystem:
-find /mnt -name "recover.sh" -path "*/truenas-truecloud-patch/*" 2>/dev/null
-
-# Option 2 — query the TrueNAS database directly:
-sqlite3 /data/freenas-v1.db \
-    "SELECT script FROM initshutdownscript WHERE comment = 'TrueCloud provider patch (S3/B2)';"
-```
-
-The `script` column shows the full path to `patch/apply.sh`; your clone root is one
-level up (strip `/patch/apply.sh` from the end). Then run the `touch` command above
-with that path.
-
-If middlewared **still** won't start after the kill switch is set, the problem
-is unrelated to this patch. Check:
-
-```bash
-journalctl -u middlewared -n 50
-```
-
-To re-enable the patch once you have investigated:
-
-```bash
-rm /mnt/tank/truenas-truecloud-patch/disabled
-bash /mnt/tank/truenas-truecloud-patch/patch/apply.sh
-systemctl restart middlewared   # manual apply.sh runs never restart for you
-```
-
----
-
-### Web UI is blank or broken
-
-If the TrueNAS web interface loads blank or shows JavaScript errors, the
-Angular bundle may have been interrupted mid-write (e.g. power cut during
-boot). The original bundle is always backed up before patching, so recovery
-is straightforward:
-
-```bash
-# Find the backup (the path varies by TrueNAS version):
-find /usr/share/truenas /usr/share/truenas-ui /var/www/truenas -name "*.js.pre-truecloud-patch" 2>/dev/null
-
-# Restore it — substitute the actual path from the find output:
-mv /usr/share/truenas/webui/main.XXXXXXXX.js.pre-truecloud-patch \
-   /usr/share/truenas/webui/main.XXXXXXXX.js
-```
-
-Refresh your browser. The UI will return to normal (Storj-only until the
-patch re-runs at next reboot, or you run
-`bash /mnt/tank/truenas-truecloud-patch/patch/apply.sh` manually).
-
----
-
-### Backend verify shows FAIL
-
-```bash
-python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify
-```
-
-`verify` reports one line per module:
-
-| Label | Meaning |
+| Path | What it is |
 |---|---|
-| `[OK  ]` | Module is active and applied. |
-| `[SKIP]` | Module is inactive — either TrueNAS now does it natively, or it is opt-in and switched off. **Not a failure.** `nested_snapshots` shows SKIP on a default install. |
-| `[FAIL]` | Module is needed but did not apply. |
+| `install.sh` | Register the boot hook, patch, restart middlewared. Also `--enable/--disable-nested-snapshots`. |
+| `update.sh` | Fetch and apply a newer release. `--check`, `--rollback`, `--to`, `--main`. |
+| `uninstall.sh` | Remove everything. |
+| `recover.sh` | Emergency: kill switch + restart against stock files. |
+| `patch/apply.sh` | The PREINIT script. Runs at **every boot**. |
+| `patch/truecloud_nested.py` | Nested-dataset staging: plan, mount, verify, tear down, sweep snapshots. |
+| `patch/create_task.py` | Create tasks with S3/B2 credentials; `verify` the patch state. |
+| `tools/compat.py` | What the patch assumes about middlewared — and the checker. Run daily by CI *and* at every boot. |
+| `release.sh` | Cut a release. Two stages, and the second is refused without the first. |
 
-If a module shows `[FAIL]`:
+## Before you install
 
-1. **Check the apply log** for errors during the last boot:
-   ```bash
-   tail -40 /mnt/tank/truenas-truecloud-patch/apply.log
-   ```
-2. **Check middlewared's own log** for Python tracebacks:
-   ```bash
-   grep -i "truecloud\|traceback\|error" /var/log/middlewared.log 2>/dev/null | tail -30
-   journalctl -u middlewared -n 50
-   ```
-3. **A FAIL is non-fatal.** middlewared runs normally and the other module is
-   unaffected; the failed one is simply inactive. Existing backups are not at
-   risk.
-4. **If the detail says the module doesn't exist**, a TrueNAS update renamed
-   or restructured the internal API.
-   [Open an issue](https://git.onetick.ninja/flan/truenas-truecloud-patch/issues)
-   with your TrueNAS version number and the full verify output.
+- This is **unofficial** and not affiliated with iXsystems.
+- It patches **internal middleware APIs** with no stability contract. Every patch is
+  fail-safe: if it cannot apply, middlewared starts normally and the reason is logged.
+- **Test your restores.** True of any backup; more so here. See [Verifying it
+  works](docs/nested-snapshots.md#verifying-it-works).
+- Filing a TrueNAS bug? **Remove the patch first** and reproduce on a stock system.
+- Provided as-is, no warranty. See LICENSE.
 
----
-
-## Troubleshooting
-
-**Backups fail with `NotImplementedError` after a reboot**
-
-The traceback ends in `rclone/base.py` → `raise NotImplementedError` and
-contains no `_tc_` frames: the running middlewared is executing stock code.
-Either the deferred restart never fired, or the patch never landed on disk
-this boot. Diagnose in this order:
-
-```bash
-# Did apply.sh run this boot, at which version, and did it schedule the restart?
-tail -40 /mnt/tank/truenas-truecloud-patch/apply.log
-
-# Full check — compares the running process against the patch timestamp
-python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify
-
-# Did the deferred restart unit run, fail, or never get created?
-systemctl status truecloud-mw-restart.service
-journalctl -u truecloud-mw-restart.service --no-pager | tail -20
-```
-
-- `verify` reports the process started **before** the patch → the restart
-  didn't happen. `systemctl restart middlewared` fixes it immediately; the
-  journal output above tells you why it was missed.
-- `apply.log` shows the kill switch is active → `rm .../disabled`, then
-  `bash install.sh`.
-- `apply.log` has no entry for this boot → the hook didn't run; re-run
-  `bash install.sh` to re-register it.
-- `apply.log` header shows `[v0.0.3]` or older → update:
-  `git pull && bash install.sh` (v0.0.4 fixed patches not loading after
-  reboot).
-
-**Apply log** (check after each reboot or install):
-```bash
-cat /mnt/tank/truenas-truecloud-patch/apply.log
-```
-
-**Verify backend patch is loaded** (while middlewared is running):
-```bash
-python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify
-```
-Reads `hook_status.json` written by `apply.sh` at boot **and** checks that the
-running middlewared process started *after* the patches were applied — an
-on-disk patch that middlewared has not loaded yet is reported as FAIL with
-instructions. Does not require `--host` or `--api-key`.
-
-**Middlewared log:**
-```bash
-grep truecloud-patch /var/log/middlewared.log 2>/dev/null | tail -20
-journalctl -u middlewared -n 100 2>/dev/null | grep truecloud-patch
-```
-
-**Verify the UI patch** (should print your TrueNAS version):
-```bash
-grep -c 'STORJ_IX.*S3.*B2' \
-    $(find /usr/share/truenas -name '*.js' 2>/dev/null) 2>/dev/null \
-    | grep -v ':0'
-```
-
-**`create_task.py` — "midclt not found" or permission errors**
-`create_task.py` now talks to the local middleware via `midclt`, so run it **on
-the TrueNAS host** (not remotely) as a user with middleware access (root). There
-is no HTTPS/API-key call anymore, so there is no TLS certificate to configure.
+Parts of this project were written with AI assistance (Claude); all of it is reviewed
+and tested before release. Bugs are mine.
