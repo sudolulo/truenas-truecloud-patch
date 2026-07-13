@@ -34,8 +34,9 @@ WEBUI_CANDIDATES = [
 # Each entry is (compiled_regex, replacement_string).
 _PATTERNS = [
     # TrueNAS 25.x+: Angular emits a pureFunction call instead of a literal array.
-    (re.compile(r'("filterByProviders",)\w+\(\d+,\w+,\w+\.CloudSyncProviderName\.Storj\)'),
+    (re.compile(r'("filterByProviders",)\w+\(\d+,\w+,\w+\.CloudSyncProviderName\.Storj\)\)'),
      r'\1["STORJ_IX","S3","B2"])'),
+
 
     # TrueNAS 24.x and earlier: static inline array.
     (re.compile(r'("filterByProviders",)\["STORJ_IX"\]'),
