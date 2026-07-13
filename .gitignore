@@ -5,6 +5,9 @@
 /hook_status.json
 /disabled
 /nested_snapshots_enabled
+# Written by apply.sh when a module's assumptions no longer fit the installed
+# middlewared (see tools/compat.py). Evidence for the alert; not source.
+/incompatible.json
 
 # Python
 __pycache__/

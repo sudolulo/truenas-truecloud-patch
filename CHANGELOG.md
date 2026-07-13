@@ -37,6 +37,55 @@ worse than no alert, because one day it carries a security fix.
   detached HEAD, and `release.sh` now recognises that and says so, rather than
   emitting a confusing branch error.
 
+- **TrueNAS compatibility is now checked, not hoped for.**
+  [`tools/compat.py`](tools/compat.py) is a written-down record of everything each
+  module assumes about middlewared, checked in two places:
+
+  - **CI, daily** — against iXsystems' source at every release line *including
+    `master` and the current BETA/RC_. When an unreleased TrueNAS breaks the patch
+    it files a bug report automatically, so there is time to fix it before that
+    version reaches anyone. It also refreshes the README's support matrix, so the
+    table cannot quietly become a false promise.
+  - **`apply.sh`, at every boot** — against the middleware actually installed on the
+    box. **A module whose assumptions no longer hold is not applied.** Stock TrueNAS
+    without a feature beats TrueNAS with a broken backup.
+
+  This immediately found a real one: **TrueNAS 26 rewrites the entire `cloud_backup`
+  path from async to synchronous.** Every block the nested module injects is an
+  `async def` wrapping an `await`ed original, so on 26 it hands `sync.py` a coroutine
+  where it unpacks a tuple. Nobody would have found out until a restore failed. On
+  TrueNAS 26 the nested module now simply stays off.
+
+### Changed
+
+- **A stable release may not leave work stranded under `## Unreleased`.** Either it
+  is finished and belongs in the release, or the release is premature. Candidates
+  are exempt: an rc may legitimately have work queued behind it.
+
+- **`release.sh` refuses to run on an installed box.** The whole repo is cloned onto
+  every box, so this file is there too; `update.sh` pins the checkout to a tag in
+  detached HEAD, and `release.sh` now recognises that and says so, rather than
+  emitting a confusing branch error.
+
+- **Gitea (`git.onetick.ninja/flan/truenas-truecloud-patch`) is now canonical**, with
+  GitHub as a mirror. Both forges run the same workflows and publish the same
+  releases. The update alert now **derives the changelog URL from the `origin`
+  remote** instead of hard-coding GitHub — which matters more than it sounds: when
+  the changelog cannot be read, the alert deliberately fires *anyway* rather than
+  risk hiding a security fix, so a stale URL would not have disabled the alert, it
+  would have made it nag on every release including documentation-only ones.
+
+### Security
+
+- **Workflow expressions are no longer interpolated into shell.**
+  `echo "${{ steps.report.outputs.body }}"` pasted the compatibility report into the
+  script text, and the report is full of backticks — bash ran `create-snapshot`,
+  `def` and `async` as commands. Since that report is built from iXsystems' source,
+  anything landing in their tree would have executed on the runner. `inputs.tag` on
+  `workflow_dispatch` had the same shape, and that one is attacker-chosen. Data now
+  moves through files and scalars through `env:`; a test enforces it across every
+  workflow.
+
 ### Internal
 
 - Static-analysis annotations in `patch/alert_source.py` (`# noqa` placement). No

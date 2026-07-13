@@ -129,6 +129,35 @@ jobs:
       - name: matrix
         run: cat /tmp/matrix.md
 
+      # Keep the README's table true. A support matrix that quietly goes stale is not
+      # a stale doc -- it is a false promise to somebody deciding whether to trust
+      # this with their backups.
+      #
+      # Only ever touches the block between the COMPAT MATRIX markers, and only on
+      # the canonical host (Gitea) so the two forges cannot race each other. The
+      # `paths:` trigger above does not include README.md, so this cannot re-trigger
+      # itself; and a README change is documentation-only, which by design raises no
+      # update alert on anyone's box.
+      - name: refresh the README matrix
+        if: ${{ github.event_name == 'schedule' && !contains(github.server_url, 'github.com') }}
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          sys.path.insert(0, "tools")
+          import compat
+          with open("/tmp/matrix.json") as fh:
+              rows = json.load(fh)
+          print("changed" if compat.update_readme(rows) else "unchanged")
+          PY
+
+          if ! git diff --quiet -- README.md; then
+            git config user.name  "truecloud-patch bot"
+            git config user.email "bot@onetick.ninja"
+            git add README.md
+            git commit -m "docs: refresh the TrueNAS compatibility matrix"
+            git push origin HEAD:main
+          fi
+
       # A broken SHIPPED release is an outage: users are on it right now.
       - name: fail if a shipped release is broken
         if: ${{ steps.check.outputs.shipped_broken != '0' }}
