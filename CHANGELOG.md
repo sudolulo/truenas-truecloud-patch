@@ -101,6 +101,24 @@ worse than no alert, because one day it carries a security fix.
   `get_dataset_recursive` is carried as our own copy — removing the dependency on both
   versions instead of asserting it.
 
+- **The patch no longer reaches into CloudSync tasks it has no business touching.**
+  `create_snapshot` is module-global in `plugins/cloud/snapshot.py` and is imported by
+  **`cloud_sync.py` as well as `cloud_backup/sync.py`** — so the wrapper sat in the
+  path of every rclone/Storj **CloudSync** task with `snapshot=true`, and issued a
+  `zfs.dataset.query` before deciding it had nothing to do. That added a brand-new
+  failure mode to jobs that worked fine before this patch was installed, and worse: a
+  CloudSync task that ever *did* get staged would **never be torn down**, because the
+  teardown is wired into `cloud_backup`'s `restic_backup` and `CRUD_BLOCK`
+  deliberately leaves CloudSync's nesting guard intact — the bind mounts would pin the
+  ZFS snapshot forever. The staging path now bails out immediately unless the snapshot
+  is named `cloud_backup-*`, before any middleware call.
+
+- **Teardown warnings are no longer silently swallowed on TrueNAS ≤ 25.10.** The async
+  wrapper's `finally` dropped the `logger=` kwarg that the sync one passes, so a
+  cleanup that failed to unmount a bind mount *or* to delete a snapshot tree logged
+  **nothing at all** — on the only platform anyone actually runs. `run_in_thread`
+  forwards `**kwargs` via `functools.partial`; it was a regression, not a limitation.
+
 - **`do_delete` is recognised as `delete`.** TrueNAS 24.10 and 25.04 declare
   `do_delete` (the `CRUDService` convention); 25.10 renamed it to `delete`. Both
   answer to `zfs.snapshot.delete`. Accepting only the literal name reported both older

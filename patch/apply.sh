@@ -526,6 +526,28 @@ if _tc_nested is not None:
 
     def _tc_stage(middleware, path, name, snapshot, snap_path):
         # Synchronous, and always called from a worker thread (see above).
+        #
+        # ONLY cloud_backup. Bail out before touching anything otherwise.
+        #
+        # create_snapshot is module-global in plugins/cloud/snapshot.py and is
+        # imported by cloud_sync.py as well as cloud_backup/sync.py -- so this
+        # wrapper sits in the path of every rclone/Storj CloudSync task with
+        # snapshot=true, not just ours. Two consequences, and the second is worse:
+        #
+        #   * everything below is a NEW failure mode for tasks that worked before we
+        #     were installed. A `zfs.dataset.query` that errors would break a
+        #     CloudSync job we have no business touching.
+        #   * if a CloudSync task ever were staged, nothing would ever tear it down:
+        #     the teardown is wired into cloud_backup's restic_backup finally, and
+        #     CRUD_BLOCK deliberately leaves CloudSync's nesting guard intact. The
+        #     bind mounts would pin the snapshot forever.
+        #
+        # cloud_backup names its snapshot "cloud_backup-<id>"; cloud_sync names it
+        # "cloud_sync-<id>"; the stock default is "cloud_task-onetime". Anything that
+        # is not ours gets stock behaviour, untouched, with no extra middleware call.
+        if not name.startswith("cloud_backup"):
+            return snapshot, snap_path
+
         _logger = getattr(middleware, "logger", None)
         try:
             # Enumerate datasets AFTER the snapshot, never before. The snapshot is

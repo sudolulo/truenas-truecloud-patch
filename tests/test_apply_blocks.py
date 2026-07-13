@@ -407,3 +407,39 @@ class TestTheTwoNativeProbesCannotDrift:
         assert static_native == expect_native, (
             f"compat.py says native={static_native} for {src!r}"
         )
+
+
+class TestOnlyOurOwnTasksAreTouched:
+    """create_snapshot is module-global, and cloud_sync.py imports it too.
+
+    plugins/cloud/snapshot.py::create_snapshot is imported by BOTH
+    cloud_backup/sync.py and cloud_sync.py, so our wrapper sits in the path of every
+    rclone/Storj CloudSync task with snapshot=true -- tasks this patch has no business
+    touching. Two consequences, the second much worse than the first:
+
+      * every middleware call we add is a NEW failure mode for a job that worked
+        before we were installed;
+      * a staged CloudSync task would NEVER be torn down. The teardown is wired into
+        cloud_backup's restic_backup finally, and CRUD_BLOCK deliberately leaves
+        CloudSync's nesting guard intact -- so the bind mounts would pin the ZFS
+        snapshot forever.
+
+    cloud_backup names its snapshot "cloud_backup-<id>", cloud_sync "cloud_sync-<id>",
+    and stock's default is "cloud_task-onetime".
+    """
+
+    @pytest.mark.parametrize("name", ["SNAPSHOT_ASYNC", "SNAPSHOT_SYNC"])
+    def test_the_staging_path_is_gated_on_cloud_backup(self, name):
+        block = extract_blocks()[name]
+        assert 'if not name.startswith("cloud_backup"):' in block
+
+    @pytest.mark.parametrize("name", ["SNAPSHOT_ASYNC", "SNAPSHOT_SYNC"])
+    def test_the_bail_out_precedes_every_middleware_call(self, name):
+        # The point is to add NO new failure mode to a CloudSync task. If any
+        # middleware call happened before the bail-out, we would already have broken
+        # the thing we are trying not to touch.
+        block = extract_blocks()[name]
+        gate = block.index('if not name.startswith("cloud_backup"):')
+        for call in ("middleware.call_sync(", "_tc_nested.stage_nested(",
+                     "_tc_nested.delete_snapshot_tree("):
+            assert gate < block.index(call), f"{call} runs before the cloud_backup gate"
