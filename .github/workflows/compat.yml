@@ -170,7 +170,7 @@ jobs:
         if: ${{ steps.report.outputs.broken == '1' && contains(github.server_url, 'github.com') }}
         env:
           GH_TOKEN: ${{ github.token }}
-          TITLE: "Incompatible with upcoming TrueNAS: ${{ steps.report.outputs.refs }}"
+          TITLE: "TrueNAS compatibility: the patch's assumptions no longer hold"
         run: |
           # One issue per set of broken refs, reopened/updated rather than duplicated
           # daily -- a bot that files the same issue every morning gets muted, and
@@ -191,7 +191,7 @@ jobs:
         env:
           TOKEN: ${{ secrets.GITEA_TOKEN || github.token }}
           API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
-          TITLE: "Incompatible with upcoming TrueNAS: ${{ steps.report.outputs.refs }}"
+          TITLE: "TrueNAS compatibility: the patch's assumptions no longer hold"
         run: |
           # python3, not jq: jq is not guaranteed on a self-hosted runner, and a bug
           # report that dies on a missing tool is a warning system that does not warn.
