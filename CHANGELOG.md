@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.5.1 — 2026-07-13
+
+### Fixed
+
+- **The update alert could have broken middlewared at startup.** middlewared's
+  `alert.load()` imports every file in `alert/source/` with **no try/except**, and
+  it runs during setup — so a module that raises on import takes middlewared down
+  with it. `apply.sh` now **compiles the substituted alert source and refuses to
+  write it** if it does not parse. An uninstalled alert is a missing convenience;
+  a broken one is a broken box.
+
+- **`@PATCH_DIR@` is substituted with `repr()`**, so a repository path containing
+  a quote or a backslash produces a valid Python literal instead of a syntax error
+  in the installed module.
+
+- **The alert source no longer mutates `sys.path`.** It loaded
+  `tools/release_notes.py` via `sys.path.insert(0, …)`, which shadows the stdlib
+  for that interpreter — and `ThreadedAlertSource` runs in middlewared's thread
+  pool, so mutating `sys.path` is a race. It now loads the module by file path with
+  `importlib`.
+
+### Notes
+
+Timing, for the record: `process_alerts` is `@periodic(60)` and
+`alert_source_last_run` is in-memory, so the check runs **within 60 seconds of any
+middlewared restart** (which this patch performs at every boot) and otherwise
+**within 24 hours** of a release.
+
 ## v0.5.0 — 2026-07-13
 
 ### Added

@@ -32,7 +32,7 @@
 # Derive PATCH_DIR from this script's location (parent of the patch/ directory).
 PATCH_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="$PATCH_DIR/apply.log"
-VERSION="0.5.0"
+VERSION="0.5.1"
 
 # Rotate log at 512 KB to avoid unbounded growth on a system volume.
 # Keep two prior generations (.1 and .2) so the last three boots are always available.
@@ -602,15 +602,26 @@ else:
     try:
         with open(alert_src, encoding='utf-8') as fh:
             _body = fh.read()
-        # PATCH_DIR is baked in: the alert source must find the repo it belongs to.
+
+        # repr() so ANY path becomes a valid Python literal -- a directory
+        # containing a quote or backslash would otherwise produce a syntax error.
+        _body = _body.replace('"@PATCH_DIR@"', repr(_patch_dir))
+
+        # COMPILE BEFORE WRITING. middlewared's alert.load() imports every file in
+        # alert/source/ with NO try/except, and it runs at startup -- a module that
+        # raises on import takes middlewared's setup down with it. An uninstalled
+        # alert is a missing convenience; a broken one is a broken box.
+        compile(_body, alert_dst, 'exec')
+
         with open(alert_dst, 'w', encoding='utf-8') as fh:
-            fh.write(_body.replace('@PATCH_DIR@', _patch_dir))
+            fh.write(_body)
         alert_ok = True
         alert_detail = 'update alert installed'
         print(f'OK: Installed update alert → {alert_dst}')
     except Exception as e:
         alert_detail = f'not applied: {e}'
         print(f'WARNING: could not install update alert: {e}')
+        print('WARNING: no update alert; everything else is unaffected.')
 
 patches = {
     'providers': {

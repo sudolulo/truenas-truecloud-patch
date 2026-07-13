@@ -20,11 +20,11 @@ the way a `git fetch` from middlewared (running as root) would.
 """
 
 import datetime
+import importlib.util
 import logging
 import os
 import re
 import subprocess
-import sys
 import urllib.request
 
 from middlewared.alert.base import (
@@ -102,11 +102,10 @@ class TrueCloudPatchUpdateAlertSource(ThreadedAlertSource):
         if not latest:
             return None
 
-        sys.path.insert(0, os.path.join(PATCH_DIR, "tools"))
-        try:
-            from release_notes import significance, version_tuple
-        finally:
-            sys.path.pop(0)
+        rn = self._release_notes()
+        if rn is None:
+            return None
+        significance, version_tuple = rn.significance, rn.version_tuple
 
         if version_tuple(latest) <= version_tuple(current):
             return None
@@ -135,6 +134,22 @@ class TrueCloudPatchUpdateAlertSource(ThreadedAlertSource):
             else TrueCloudPatchUpdateAlertClass
         )
         return Alert(klass, args, key=[current, latest])
+
+    def _release_notes(self):
+        """Load tools/release_notes.py by path.
+
+        NOT via sys.path: prepending would shadow the stdlib for this interpreter,
+        and this runs in middlewared's thread pool, so mutating sys.path is a race.
+        """
+        path = os.path.join(PATCH_DIR, "tools", "release_notes.py")
+        try:
+            spec = importlib.util.spec_from_file_location("_tc_release_notes", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+        except Exception:
+            logger.debug("could not load release_notes", exc_info=True)
+            return None
 
     def _installed_version(self):
         """The version of the patch actually checked out here."""
