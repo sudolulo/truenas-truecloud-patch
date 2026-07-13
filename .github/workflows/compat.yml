@@ -175,9 +175,10 @@ jobs:
           # One issue per set of broken refs, reopened/updated rather than duplicated
           # daily -- a bot that files the same issue every morning gets muted, and
           # then it is not a warning system any more.
+          # Lowest-numbered match, for the same reason as the Gitea step below.
           existing="$(gh issue list --state all --search "$TITLE" \
                         --json number,title \
-                        --jq '.[] | select(.title == env.TITLE) | .number' | head -1)"
+                        --jq '[.[] | select(.title == env.TITLE) | .number] | min // empty')"
 
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body-file /tmp/issue.md
@@ -214,8 +215,16 @@ jobs:
           # Same title => same issue. Comment on it rather than filing a new one every
           # morning: a bot that duplicates itself daily gets muted, and then it is not
           # a warning system any more.
+          # LOWEST-numbered match, not "whichever the API returns first". Two issues
+          # with the same title already existed once (the old title embedded the ref
+          # list, so the identity changed when that set changed), and an
+          # order-dependent pick would have alternated between them, reopening one and
+          # commenting on the other. Lowest number is stable no matter what the API
+          # sorts by.
           issues = call(f"{api}/issues?state=all&type=issues", "GET")
-          match = next((i for i in issues if i["title"] == title), None)
+          matches = sorted((i for i in issues if i["title"] == title),
+                           key=lambda i: i["number"])
+          match = matches[0] if matches else None
 
           if match:
               n = match["number"]
