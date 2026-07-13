@@ -188,6 +188,55 @@ def snapshot_service(middleware):
     return name
 
 
+class _Snapshots:
+    """This module's entire interface to snapshots, in one object.
+
+    "READ the truth from ZFS, MAKE CHANGES through middleware" is the rule the whole
+    module rests on. It used to live in a comment, while `middleware` and the ZFS
+    reader were threaded through five functions **as a pair** -- and the namespace was
+    re-resolved in each of them. That is one collaborator, not two, so it is one
+    object; the rule is now structural rather than remembered.
+
+    Deliberately private and constructed inside the public functions: `apply.sh`
+    injects calls to those functions into middlewared itself, so their signatures are
+    a boot-time contract with a live NAS and are not worth churning for tidiness.
+    """
+
+    def __init__(self, middleware, list_snapshots=None):
+        self._mw = middleware
+        self._list = list_snapshots or list_snapshot_names
+        self._service = None
+
+    @property
+    def service(self):
+        """The namespace we delete through. Resolved once, on first use.
+
+        Lazy on purpose: resolving it raises when middleware has no usable delete,
+        and the read-only paths must not blow up over a mutation they never make.
+        """
+        if self._service is None:
+            self._service = snapshot_service(self._mw)
+        return self._service
+
+    def names(self, dataset):
+        """Every snapshot at or under `dataset`, from ZFS. Raises if it cannot be read.
+
+        Never from middleware: its snapshot query hides the internal datasets
+        (205 of 274 on the test box), and a snapshot the sweep cannot SEE is a
+        snapshot nothing will ever collect.
+        """
+        return self._list(dataset)
+
+    def delete(self, name, recursive=False):
+        """Delete one snapshot -- through middleware, so its bookkeeping stays right.
+
+        An exact-name delete works even on a dataset the query hides; it is only
+        enumeration that lies.
+        """
+        options = ({"recursive": True},) if recursive else ()
+        return self._mw.call_sync(f"{self.service}.delete", name, *options)
+
+
 class ZfsError(Exception):
     """`zfs list` failed. Enumeration is unreliable, so the caller must not guess."""
 
@@ -787,8 +836,7 @@ def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
     snapshots hit this, and before the fix they were orphaned permanently.
     """
     dataset, _, snapname = snapshot.partition("@")
-    svc = snapshot_service(middleware)
-    list_snapshots = list_snapshots or list_snapshot_names
+    snaps = _Snapshots(middleware, list_snapshots)
 
     # Release ZFS's own automounts first, or `zfs destroy` refuses with EBUSY on
     # everything restic read in the last few minutes.
@@ -802,7 +850,7 @@ def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
     # through 252 sequential deletes leaves exactly the orphans this function
     # exists to prevent.
     try:
-        middleware.call_sync(f"{svc}.delete", snapshot, {"recursive": True})
+        snaps.delete(snapshot, recursive=True)
         return []
     except Exception as e:  # noqa: BLE001 - fall through to the explicit sweep
         # "Parent already gone" is the EXPECTED race (stock's finally won, once our
@@ -829,7 +877,7 @@ def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
         # An empty result means the tree is already gone -- delete nothing, and
         # do not fall back to the parent, which would only log a spurious
         # "does not exist" warning on every clean run.
-        names = snapshot_tree_names(snapshot, list_snapshots(dataset))
+        names = snapshot_tree_names(snapshot, snaps.names(dataset))
     except Exception as e:  # noqa: BLE001 - fall back to at least the parent
         if logger:
             logger.warning(
@@ -850,7 +898,7 @@ def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
         if not failed:
             return []
         try:
-            live = set(list_snapshots(dataset))
+            live = set(snaps.names(dataset))
         except Exception:  # noqa: BLE001 - cannot refine; trust the delete's verdict
             return list(failed)
         return [n for n in failed if n in live]
@@ -861,7 +909,7 @@ def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
         failed = []
         for name in remaining:
             try:
-                middleware.call_sync(f"{svc}.delete", name)
+                snaps.delete(name)
             except Exception as e:  # noqa: BLE001 - busy, or already gone; sorted below
                 # KEEP the reason. This used to discard it and then report every
                 # survivor as "(still busy?)" -- which names the one cause that is
@@ -926,13 +974,12 @@ def gc_stale_snapshots(middleware, task_name, current_snapshot, logger=None,
     """
     dataset = current_snapshot.partition("@")[0]
     now = now or datetime.datetime.now(datetime.UTC)
-    svc = snapshot_service(middleware)
-    list_snapshots = list_snapshots or list_snapshot_names
+    snaps = _Snapshots(middleware, list_snapshots)
 
     try:
         # From ZFS: middleware's snapshot query hides internal datasets, and an
         # orphan it cannot see is an orphan nothing will ever collect.
-        all_names = list_snapshots(dataset)
+        all_names = snaps.names(dataset)
     except Exception as e:  # noqa: BLE001 - cannot enumerate; collect nothing
         if logger:
             logger.warning(
@@ -957,7 +1004,7 @@ def gc_stale_snapshots(middleware, task_name, current_snapshot, logger=None,
     remaining = []
     for name in stale:
         try:
-            middleware.call_sync(f"{svc}.delete", name)
+            snaps.delete(name)
         except Exception as e:  # noqa: BLE001 - busy, or gone; either way, next run
             remaining.append(name)
             if logger:
