@@ -164,27 +164,45 @@ jobs:
             *-rc*|*-beta*|*-alpha*) prerelease=true ;;
           esac
 
-          # jq -Rs so the notes are JSON-encoded properly: the changelog is full of
-          # quotes, backticks and newlines, and hand-built JSON would mangle them.
-          body="$(jq -Rs . < /tmp/notes.md)"
-          payload="$(printf '{"tag_name":%s,"name":%s,"body":%s,"prerelease":%s}' \
-            "$(printf '%s' "$TAG" | jq -Rs .)" \
-            "$(printf '%s' "$TAG" | jq -Rs .)" \
-            "$body" "$prerelease")"
+          # python3, not jq. The changelog is full of quotes, backticks and newlines,
+          # so the body must be properly JSON-encoded -- but `jq` is not guaranteed on
+          # a self-hosted Gitea runner, and a publish step that dies on a missing tool
+          # leaves a tag with no release behind it. python3 is guaranteed: setup-python
+          # ran above.
+          python3 - "$TAG" "$API" "$TOKEN" "$prerelease" <<'PY'
+          import json, sys, urllib.error, urllib.request
 
-          existing="$(curl -sf -H "Authorization: token $TOKEN" \
-            "$API/releases/tags/$TAG" 2>/dev/null || true)"
+          tag, api, token, prerelease = sys.argv[1:5]
+          with open("/tmp/notes.md", encoding="utf-8") as fh:
+              body = fh.read()
 
-          if [ -n "$existing" ]; then
-            id="$(printf '%s' "$existing" | jq -r .id)"
-            echo "Release $TAG exists (id=$id) — updating notes."
-            curl -sS -X PATCH "$API/releases/$id" \
-              -H "Authorization: token $TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "$payload" -o /dev/null -w 'PATCH -> %{http_code}\n'
-          else
-            curl -sS -X POST "$API/releases" \
-              -H "Authorization: token $TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "$payload" -o /dev/null -w 'POST -> %{http_code}\n'
-          fi
+          payload = {
+              "tag_name": tag, "name": tag, "body": body,
+              "prerelease": prerelease == "true",
+          }
+          headers = {
+              "Authorization": f"token {token}",
+              "Content-Type": "application/json",
+          }
+
+          def call(url, method, data=None):
+              req = urllib.request.Request(
+                  url, method=method, headers=headers,
+                  data=json.dumps(data).encode() if data else None)
+              with urllib.request.urlopen(req) as r:  # noqa: S310
+                  return r.status, json.load(r) if r.length != 0 else {}
+
+          try:
+              _, existing = call(f"{api}/releases/tags/{tag}", "GET")
+          except urllib.error.HTTPError as e:
+              if e.code != 404:
+                  raise
+              existing = None
+
+          if existing:
+              status, _ = call(f"{api}/releases/{existing['id']}", "PATCH", payload)
+              print(f"updated release {tag} -> {status}")
+          else:
+              status, _ = call(f"{api}/releases", "POST", payload)
+              print(f"created release {tag} (prerelease={payload['prerelease']}) -> {status}")
+          PY

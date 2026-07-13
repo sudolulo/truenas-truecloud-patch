@@ -193,24 +193,36 @@ jobs:
           API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
           TITLE: "Incompatible with upcoming TrueNAS: ${{ steps.report.outputs.refs }}"
         run: |
-          body="$(jq -Rs . < /tmp/issue.md)"
-          title="$(printf '%s' "$TITLE" | jq -Rs .)"
+          # python3, not jq: jq is not guaranteed on a self-hosted runner, and a bug
+          # report that dies on a missing tool is a warning system that does not warn.
+          python3 - <<'PY'
+          import json, os, urllib.error, urllib.request
 
-          # Same title => same issue. Comment on it instead of filing a new one.
-          number="$(curl -sf -H "Authorization: token $TOKEN" \
-            "$API/issues?state=all&type=issues" \
-            | jq -r --arg t "$TITLE" '.[] | select(.title == $t) | .number' | head -1)"
+          api, token, title = os.environ["API"], os.environ["TOKEN"], os.environ["TITLE"]
+          with open("/tmp/issue.md", encoding="utf-8") as fh:
+              body = fh.read()
+          headers = {"Authorization": f"token {token}",
+                     "Content-Type": "application/json"}
 
-          if [ -n "$number" ]; then
-            curl -sS -X POST "$API/issues/$number/comments" \
-              -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
-              -d "$(printf '{"body":%s}' "$body")" -o /dev/null -w 'comment -> %{http_code}\n'
-            curl -sS -X PATCH "$API/issues/$number" \
-              -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
-              -d '{"state":"open"}' -o /dev/null -w 'reopen -> %{http_code}\n'
-          else
-            curl -sS -X POST "$API/issues" \
-              -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
-              -d "$(printf '{"title":%s,"body":%s}' "$title" "$body")" \
-              -o /dev/null -w 'create -> %{http_code}\n'
-          fi
+          def call(url, method, data=None):
+              req = urllib.request.Request(
+                  url, method=method, headers=headers,
+                  data=json.dumps(data).encode() if data else None)
+              with urllib.request.urlopen(req) as r:  # noqa: S310
+                  return json.load(r) if r.length != 0 else {}
+
+          # Same title => same issue. Comment on it rather than filing a new one every
+          # morning: a bot that duplicates itself daily gets muted, and then it is not
+          # a warning system any more.
+          issues = call(f"{api}/issues?state=all&type=issues", "GET")
+          match = next((i for i in issues if i["title"] == title), None)
+
+          if match:
+              n = match["number"]
+              call(f"{api}/issues/{n}/comments", "POST", {"body": body})
+              call(f"{api}/issues/{n}", "PATCH", {"state": "open"})
+              print(f"commented on and reopened issue #{n}")
+          else:
+              made = call(f"{api}/issues", "POST", {"title": title, "body": body})
+              print(f"filed issue #{made['number']}")
+          PY

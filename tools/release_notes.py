@@ -107,10 +107,15 @@ def changelog_versions(text: str) -> list[str]:
 def extract_notes(text: str, version: str) -> str:
     """The body of one version's section, without its heading.
 
+    A release candidate resolves to its BASE version: v0.6.0-rc2 ships the same code
+    as v0.6.0 and therefore the same notes, and the CHANGELOG only ever has the one
+    section. Without this, the release workflow cut the tag, passed every gate, and
+    then died extracting the body -- so the candidate existed but was never published.
+
     Raises KeyError if the version has no section -- a release with an empty or
     wrong body is worse than a failed release.
     """
-    want = normalise(version)
+    want = base_version(version)
     lines = text.splitlines()
 
     start = None

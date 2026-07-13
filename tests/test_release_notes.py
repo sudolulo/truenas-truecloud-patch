@@ -205,3 +205,31 @@ class TestSignificance:
         assert version_tuple("0.4.2") > version_tuple("0.4.1")
         # Pre-release suffixes are dropped, not ranked above the release.
         assert version_tuple("v0.5.0-rc1") == version_tuple("v0.5.0")
+
+
+class TestCandidateNotesResolveToTheBaseVersion:
+    """`notes v0.6.0-rc1` must return v0.6.0's section.
+
+    A candidate ships the same code as the release it is a candidate for, and the
+    CHANGELOG only ever has the one section. Without this, the release workflow cut
+    v0.6.0-rc1, passed every gate, and then died extracting the body -- so the tag
+    existed but nothing was ever published. Caught in an rc, which is the entire
+    point of having them.
+    """
+
+    CHANGELOG = "# C\n\n## v0.6.0 — 2026-07-13\n\n### Added\n- the thing\n\n## v0.5.1 — 2026-07-13\n\n- older\n"
+
+    def test_an_rc_resolves_to_its_base_version(self):
+        body = extract_notes(self.CHANGELOG, "v0.6.0-rc1")
+        assert "the thing" in body
+        assert "older" not in body
+
+    def test_rc10_too(self):
+        assert "the thing" in extract_notes(self.CHANGELOG, "v0.6.0-rc10")
+
+    def test_the_plain_version_still_works(self):
+        assert "the thing" in extract_notes(self.CHANGELOG, "v0.6.0")
+
+    def test_a_genuinely_missing_section_still_raises(self):
+        with pytest.raises(KeyError):
+            extract_notes(self.CHANGELOG, "v9.9.9-rc1")
