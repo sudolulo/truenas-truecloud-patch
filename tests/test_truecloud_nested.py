@@ -209,9 +209,16 @@ class FakeMiddleware:
         if method == "zfs.snapshot.query":
             return [{"name": n} for n in self.snapshots]
         if method == "zfs.snapshot.delete":
-            if args[0] not in self.snapshots:
+            name = args[0]
+            opts = args[1] if len(args) > 1 else {}
+            if name not in self.snapshots:
                 raise RuntimeError("does not exist")
-            self.snapshots.remove(args[0])
+            if opts.get("recursive"):
+                # Real `zfs destroy -r` takes the parent and every child snapshot.
+                for n in snapshot_tree_names(name, list(self.snapshots)):
+                    self.snapshots.remove(n)
+            else:
+                self.snapshots.remove(name)
             return True
         raise AssertionError(f"unexpected call {method}")
 
@@ -233,24 +240,35 @@ class TestDeleteSnapshotTree:
         asyncio.run(delete_snapshot_tree(mw, "Tap@snap"))
         assert mw.snapshots == []
 
-    def test_survives_query_failure_by_deleting_at_least_the_parent(self):
+    def test_uses_a_single_recursive_delete_not_252_individual_ones(self):
+        # 252 sequential deletes are slow AND not atomic: a run killed part-way
+        # through leaves exactly the orphans this function exists to prevent.
+        mw = FakeMiddleware(["Tap@snap", "Tap/apps@snap", "Tap/apps/lidarr@snap"])
+        asyncio.run(delete_snapshot_tree(mw, "Tap@snap"))
+        assert mw.snapshots == []
+        deletes = [a for m, a in mw.calls if m == "zfs.snapshot.delete"]
+        assert len(deletes) == 1, "should be ONE recursive call, not one per snapshot"
+        assert deletes[0][1] == {"recursive": True}
+        assert not [m for m, _a in mw.calls if m == "zfs.snapshot.query"], (
+            "no enumeration needed on the fast path"
+        )
+
+    def test_survives_recursive_and_query_failure_by_deleting_the_parent(self):
         class Broken(FakeMiddleware):
             async def call(self, method, *args):
                 if method == "zfs.snapshot.query":
                     raise RuntimeError("boom")
+                if method == "zfs.snapshot.delete" and len(args) > 1:
+                    raise RuntimeError("recursive delete unavailable")
                 return await super().call(method, *args)
 
         mw = Broken(["Tap@snap"])
         asyncio.run(delete_snapshot_tree(mw, "Tap@snap"))
         assert mw.snapshots == []
 
-    def test_attempts_no_delete_when_the_tree_is_already_gone(self):
-        # A successful query returning nothing means there is nothing to do.
-        # Falling back to the parent here would log a spurious "does not exist"
-        # warning on every clean run.
+    def test_leaves_unrelated_snapshots_alone_when_the_tree_is_gone(self):
         mw = FakeMiddleware(["Tap@unrelated"])
         asyncio.run(delete_snapshot_tree(mw, "Tap@snap"))
-        assert [m for m, _a in mw.calls if m == "zfs.snapshot.delete"] == []
         assert mw.snapshots == ["Tap@unrelated"]
 
 

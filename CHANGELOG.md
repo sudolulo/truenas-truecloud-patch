@@ -165,6 +165,17 @@
   middlewared; there is now a regression test that executes apply.sh's own probe
   code against the real wrapped source.
 
+### Changed (production audit)
+
+- **`delete_snapshot_tree` now uses a single recursive delete.** It previously
+  removed the parent and each child snapshot one at a time — 252 sequential
+  middleware calls on a real pool. That is slow, but the real problem is that it
+  is **not atomic**: a run killed part-way through the sweep leaves exactly the
+  orphaned snapshots the function exists to prevent. It now issues one
+  `zfs.snapshot.delete(..., {"recursive": True})` and falls back to the
+  name-by-name sweep only when that fails (e.g. stock's `finally` already removed
+  the parent, which leaves the children behind).
+
 ### Refactored
 
 - Staging teardown had been copy-pasted into `uninstall.sh` and `recover.sh` —

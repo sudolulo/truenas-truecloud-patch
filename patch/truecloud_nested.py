@@ -371,6 +371,20 @@ async def delete_snapshot_tree(middleware, snapshot, logger=None):
     """
     dataset = snapshot.partition("@")[0]
 
+    # Fast path: ONE recursive delete removes the parent and every child that
+    # `zfs snapshot -r` created (252 on a real pool). Deleting them individually
+    # also works, but it is neither cheap nor atomic -- a run killed part-way
+    # through 252 sequential deletes leaves exactly the orphans this function
+    # exists to prevent.
+    try:
+        await middleware.call("zfs.snapshot.delete", snapshot, {"recursive": True})
+        return
+    except Exception:  # noqa: BLE001 - fall through to the explicit sweep
+        pass
+
+    # The parent may already be gone -- stock's `finally` can win the race once
+    # our mounts are released -- which fails the recursive delete while the
+    # children survive. Sweep them by name.
     try:
         snaps = await middleware.call(
             "zfs.snapshot.query", [["name", "^", dataset]], {"select": ["name"]}
