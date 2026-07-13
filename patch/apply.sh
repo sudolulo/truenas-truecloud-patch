@@ -535,7 +535,7 @@ if _tc_nested is not None:
         # snapshot=true, not just ours. Two consequences, and the second is worse:
         #
         #   * everything below is a NEW failure mode for tasks that worked before we
-        #     were installed. A `zfs.dataset.query` that errors would break a
+        #     were installed. A `pool.dataset.query` that errors would break a
         #     CloudSync job we have no business touching.
         #   * if a CloudSync task ever were staged, nothing would ever tear it down:
         #     the teardown is wired into cloud_backup's restic_backup finally, and
@@ -556,9 +556,12 @@ if _tc_nested is not None:
             # our staging plan would not -- silently omitting it from the backup.
             # Read afterwards, an unsnapshotted dataset instead trips the isdir()
             # check in plan_staging and fails the run loudly. Loud beats silent.
-            datasets = middleware.call_sync(
-                "zfs.dataset.query", [["type", "=", "FILESYSTEM"]]
-            )
+            # query_filesystems() reads ZFS directly. It deliberately does NOT use
+            # pool.dataset.query: that applies a visibility policy and hides
+            # TrueNAS-internal datasets (ix-apps/*, .system/*, .ix-virt/*) -- 84 of
+            # 270 on a real pool, including live app data. Staging from the filtered
+            # view omits them silently, which is the one thing this must never do.
+            datasets = _tc_nested.query_filesystems(middleware)
             # OUR copy of get_dataset_recursive, not the host module's: TrueNAS 26
             # deleted that helper (create_snapshot uses filesystem.statfs now), so
             # calling it out of the module namespace is a NameError there.

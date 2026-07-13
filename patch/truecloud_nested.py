@@ -34,7 +34,7 @@ feature exists to prevent, and it would be worse than not having the feature.
 
 Snapshot lifecycle -- read this before changing anything
 --------------------------------------------------------
-``zfs.snapshot.delete`` defaults to ``recursive=False``, and stock
+The snapshot delete call defaults to ``recursive=False``, and stock
 ``restic_backup()`` calls it with no options. Stock gets away with that because
 its validation means ``recursive`` is never actually True in the field. Enabling
 nested datasets makes recursive snapshots real, so the parent
@@ -62,17 +62,24 @@ import subprocess
 import time
 
 __all__ = [
+    "SNAPSHOT_SERVICES",
     "STAGING_BASE",
     "StagingError",
+    "ZfsError",
     "apply_plan",
     "cleanup_all",
     "cleanup_task",
     "current_mounts_under",
     "delete_snapshot_tree",
     "gc_stale_snapshots",
+    "list_snapshot_names",
     "mounted_snapshots",
+    "normalise_dataset",
+    "pick_snapshot_service",
     "plan_staging",
+    "query_filesystems",
     "sidecar_for",
+    "snapshot_service",
     "snapshot_tree_names",
     "stage_nested",
     "stale_snapshot_names",
@@ -80,6 +87,204 @@ __all__ = [
     "teardown",
     "verify_staged",
 ]
+
+
+# ── how this module talks to the system ──────────────────────────────────────
+#
+#   READ the truth from ZFS.  MAKE CHANGES through middleware.
+#
+# That split is not stylistic. It was forced by finding, on a real TrueNAS 26 box,
+# that middleware's query APIs apply a VISIBILITY POLICY:
+#
+#   zfs list                 274 datasets      205 from pool.dataset.query
+#   zfs list -t snapshot     274 snapshots     205 from pool.snapshot.query
+#
+# The missing 69 are the datasets TrueNAS considers its own -- `ix-apps/*`,
+# `.system/*`, `.ix-virt/*` -- and on the real pool that is 84 of 270, including
+# `ix-apps`, which holds live application data. Enumerating from that view would
+# have silently omitted every one of them from the staging plan and from the
+# snapshot sweep: a green backup missing data, and one orphaned snapshot per
+# hidden dataset on every run. Both are exactly what this module exists to
+# prevent.
+#
+# This went unnoticed because the patch used to call the PRIVATE `zfs.dataset.query`
+# and `zfs.snapshot.query`, which return everything. TrueNAS 26 deleted them, and
+# the public replacements are NOT like-for-like -- they are filtered. So
+# enumeration now reads ZFS directly, which no policy can filter and which behaves
+# identically on every release.
+#
+# MUTATION still goes through middleware, so TrueNAS's own bookkeeping stays
+# consistent -- and an exact-name delete works fine even on a dataset the query
+# hides. The one wrinkle is that no single snapshot namespace spans every
+# supported release, so it is resolved at runtime rather than pinned:
+#
+#   24.10, 25.04   `zfs.snapshot`  (public back then; `pool.snapshot` does not exist)
+#   25.10          both -- `pool.snapshot` public, `zfs.snapshot` demoted to private
+#   26             `pool.snapshot` only -- `plugins/zfs_/` is gone
+#
+#: Snapshot CRUD namespaces, best first. `tools/compat.py` checks this exact list
+#: (MiddlewareCall.also), so what CI verifies and what runs cannot drift apart.
+SNAPSHOT_SERVICES = ("pool.snapshot", "zfs.snapshot")
+
+
+def pick_snapshot_service(has_service):
+    """First namespace in SNAPSHOT_SERVICES that this middleware exposes.
+
+    Pure: `has_service(name) -> bool`. Returns None if middleware has none of
+    them, which is a middleware we have never seen and must not guess about.
+    """
+    for name in SNAPSHOT_SERVICES:
+        if has_service(name):
+            return name
+    return None
+
+
+def _has_service(middleware, name):
+    try:
+        middleware.get_service(name)
+    except Exception:
+        # get_service raises KeyError for an unregistered namespace. Anything
+        # else here is equally a "cannot use it", and guessing YES on a service
+        # that is not really there would fail later, mid-backup, holding a
+        # snapshot -- the worst possible moment.
+        return False
+    return True
+
+
+def snapshot_service(middleware):
+    """The snapshot CRUD namespace this middleware actually has."""
+    name = pick_snapshot_service(lambda n: _has_service(middleware, n))
+    if name is None:
+        raise StagingError(
+            "middleware exposes neither " + " nor ".join(SNAPSHOT_SERVICES)
+            + ". Refusing to stage a nested backup, because the snapshot it "
+            "creates could not then be swept."
+        )
+    return name
+
+
+def normalise_dataset(row):
+    """A `pool.dataset.query` row -> the shape this module's planner speaks.
+
+    The planner does not consume this any more -- :func:`query_filesystems` reads
+    ZFS directly, because the middleware query is filtered (see the note above).
+    It is kept because it is the safe way to consume a middleware dataset row if
+    anything ever needs to, and because the two traps below are not obvious and
+    cost real debugging to find:
+
+    * `mountpoint` is a plain string there, not ``{"value": ...}``.
+    * `mounted` is still a property dict, but its ``value`` is ``"YES"``/``"NO"``
+      -- UPPERCASE, where the old API said ``"yes"``. The planner tests
+      ``== "no"``, so an unmounted dataset would read as mounted and the planner
+      would try to stage a snapdir that is not there. Read ``parsed``, which is a
+      real bool, and only fall back to the string.
+    """
+    mounted = row.get("mounted")
+    if isinstance(mounted, dict):
+        parsed = mounted.get("parsed")
+        if isinstance(parsed, bool):
+            is_mounted = parsed
+        else:
+            is_mounted = str(mounted.get("value", "yes")).lower() != "no"
+    elif isinstance(mounted, bool):
+        is_mounted = mounted
+    else:
+        # Absent means the caller did not ask for the property. Assume mounted:
+        # the planner's own snapdir probe is the real check, and assuming
+        # UNmounted would silently drop datasets that hold data.
+        is_mounted = True
+
+    mountpoint = row.get("mountpoint")
+    if isinstance(mountpoint, dict):            # tolerate the old shape too
+        mountpoint = mountpoint.get("value", "")
+
+    return {
+        "name": row["name"],
+        "properties": {
+            "mountpoint": {"value": mountpoint or ""},
+            "mounted": {"value": "yes" if is_mounted else "no"},
+        },
+    }
+
+
+class ZfsError(Exception):
+    """`zfs list` failed. Enumeration is unreliable, so the caller must not guess."""
+
+
+def _zfs_lines(args, runner=None):
+    """`zfs <args>` as a list of tab-split rows. Raises ZfsError if it fails.
+
+    Never returns a partial or empty list on failure: a caller that cannot tell
+    "no datasets" from "the command broke" will happily stage nothing, or sweep
+    nothing, and report success.
+    """
+    runner = runner or _run
+    r = runner(["zfs", *args])
+    if r.returncode != 0:
+        raise ZfsError((r.stderr or "").strip() or f"zfs {' '.join(args)} failed")
+    return [ln.split("\t") for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def query_filesystems(middleware=None, runner=None):
+    """Every FILESYSTEM dataset, in the shape the planner speaks -- read from ZFS.
+
+    NOT from `pool.dataset.query`, and this is the single most important decision
+    in this file.
+
+    middleware's dataset query applies a VISIBILITY POLICY: it hides the datasets
+    TrueNAS considers its own -- `ix-apps/*`, `.system/*`, `.ix-virt/*`. That is
+    **84 of 270 datasets** on the real pool, and `ix-apps` holds live application
+    data. Building the staging plan from that view would silently omit every one of
+    them. Worse, `plan_staging()` would never even SEE them, so they would not turn
+    up in its `skipped` list either -- no warning, no failure, just a green backup
+    quietly missing data. That is exactly the failure this whole module exists to
+    prevent, and it is the failure the cardinal rule at the top of this file is
+    about.
+
+    It worked before only because the patch called the PRIVATE `zfs.dataset.query`,
+    which returned everything. TrueNAS 26 deleted it. The public replacement is not
+    a like-for-like: it is a filtered view.
+
+    So: **read the truth from ZFS, make changes through middleware.** ZFS cannot
+    apply a policy to what it reports, and `zfs list` behaves identically on every
+    release -- which also means one code path instead of a version conditional.
+
+    `middleware` is accepted and ignored, so callers need not care where the data
+    comes from.
+    """
+    rows = _zfs_lines(
+        ["list", "-H", "-p", "-o", "name,mountpoint,mounted", "-t", "filesystem"],
+        runner=runner,
+    )
+    return [
+        {
+            "name": name,
+            "properties": {
+                "mountpoint": {"value": mountpoint},
+                # `zfs list` prints yes/no; the planner already speaks that.
+                "mounted": {"value": mounted},
+            },
+        }
+        for name, mountpoint, mounted in (r for r in rows if len(r) == 3)
+    ]
+
+
+def list_snapshot_names(dataset, runner=None):
+    """Every snapshot at or under `dataset` -- read from ZFS, for the same reason.
+
+    `pool.snapshot.query` filters exactly like the dataset query does: on this box
+    it returned 205 of 274 snapshots, hiding the internal datasets' snapshots. A
+    sweep built on that view leaves one orphan per hidden dataset, on every run,
+    forever -- which is the bug this module was written to fix in the first place.
+
+    (An EXACT-name delete still works on a hidden dataset, so mutations may keep
+    going through middleware. It is only enumeration that lies.)
+    """
+    rows = _zfs_lines(
+        ["list", "-H", "-o", "name", "-t", "snapshot", "-r", dataset],
+        runner=runner,
+    )
+    return [r[0] for r in rows]
 
 #: Where staging trees are assembled. tmpfs; bind mounts consume no space.
 STAGING_BASE = "/run/truecloud-nested"
@@ -560,7 +765,7 @@ def get_dataset_recursive(datasets, directory):
 
 
 def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
-                         sleep=time.sleep):
+                         sleep=time.sleep, list_snapshots=None):
     """Delete the parent snapshot AND every child created by ``zfs snapshot -r``.
 
     Returns the snapshots it could NOT delete -- callers must not throw that away.
@@ -578,6 +783,8 @@ def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
     snapshots hit this, and before the fix they were orphaned permanently.
     """
     dataset, _, snapname = snapshot.partition("@")
+    svc = snapshot_service(middleware)
+    list_snapshots = list_snapshots or list_snapshot_names
 
     # Release ZFS's own automounts first, or `zfs destroy` refuses with EBUSY on
     # everything restic read in the last few minutes.
@@ -591,7 +798,7 @@ def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
     # through 252 sequential deletes leaves exactly the orphans this function
     # exists to prevent.
     try:
-        middleware.call_sync("zfs.snapshot.delete", snapshot, {"recursive": True})
+        middleware.call_sync(f"{svc}.delete", snapshot, {"recursive": True})
         return []
     except Exception as e:  # noqa: BLE001 - fall through to the explicit sweep
         # Usually just "parent already gone" (stock's finally won the race once our
@@ -608,13 +815,14 @@ def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
     # our mounts are released -- which fails the recursive delete while the
     # children survive. Sweep them by name.
     try:
-        snaps = middleware.call_sync(
-            "zfs.snapshot.query", [["name", "^", dataset]], {"select": ["name"]}
-        )
+        # From ZFS, not middleware: the snapshot query hides internal datasets'
+        # snapshots (205 of 274 on the test box), and a sweep that cannot see them
+        # orphans one per hidden dataset on every run. See list_snapshot_names().
+        #
         # An empty result means the tree is already gone -- delete nothing, and
         # do not fall back to the parent, which would only log a spurious
         # "does not exist" warning on every clean run.
-        names = snapshot_tree_names(snapshot, [s["name"] for s in snaps])
+        names = snapshot_tree_names(snapshot, list_snapshots(dataset))
     except Exception as e:  # noqa: BLE001 - fall back to at least the parent
         if logger:
             logger.warning(
@@ -635,12 +843,9 @@ def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
         if not failed:
             return []
         try:
-            live = middleware.call_sync(
-                "zfs.snapshot.query", [["name", "^", dataset]], {"select": ["name"]}
-            )
+            live = set(list_snapshots(dataset))
         except Exception:  # noqa: BLE001 - cannot refine; trust the delete's verdict
             return list(failed)
-        live = {s["name"] for s in live}
         return [n for n in failed if n in live]
 
     remaining = list(names)
@@ -648,7 +853,7 @@ def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
         failed = []
         for name in remaining:
             try:
-                middleware.call_sync("zfs.snapshot.delete", name)
+                middleware.call_sync(f"{svc}.delete", name)
             except Exception:  # noqa: BLE001 - busy, or already gone; sorted out below
                 failed.append(name)
 
@@ -694,7 +899,7 @@ def mounted_snapshots(mounts_file="/proc/self/mounts"):
 
 
 def gc_stale_snapshots(middleware, task_name, current_snapshot, logger=None,
-                       now=None, mounts_file="/proc/self/mounts"):
+                       now=None, mounts_file="/proc/self/mounts", list_snapshots=None):
     """Delete snapshots this task left behind in an earlier run. Returns what remains.
 
     The backstop for when the RECORD is gone, not just the snapshots: the sidecar lives
@@ -707,11 +912,13 @@ def gc_stale_snapshots(middleware, task_name, current_snapshot, logger=None,
     """
     dataset = current_snapshot.partition("@")[0]
     now = now or datetime.datetime.now(datetime.UTC)
+    svc = snapshot_service(middleware)
+    list_snapshots = list_snapshots or list_snapshot_names
 
     try:
-        snaps = middleware.call_sync(
-            "zfs.snapshot.query", [["name", "^", dataset]], {"select": ["name"]}
-        )
+        # From ZFS: middleware's snapshot query hides internal datasets, and an
+        # orphan it cannot see is an orphan nothing will ever collect.
+        all_names = list_snapshots(dataset)
     except Exception as e:  # noqa: BLE001 - cannot enumerate; collect nothing
         if logger:
             logger.warning(
@@ -720,7 +927,7 @@ def gc_stale_snapshots(middleware, task_name, current_snapshot, logger=None,
         return []
 
     stale = stale_snapshot_names(
-        task_name, current_snapshot, [s["name"] for s in snaps], now,
+        task_name, current_snapshot, all_names, now,
         in_use=mounted_snapshots(mounts_file),
     )
     if not stale:
@@ -736,7 +943,7 @@ def gc_stale_snapshots(middleware, task_name, current_snapshot, logger=None,
     remaining = []
     for name in stale:
         try:
-            middleware.call_sync("zfs.snapshot.delete", name)
+            middleware.call_sync(f"{svc}.delete", name)
         except Exception as e:  # noqa: BLE001 - busy, or gone; either way, next run
             remaining.append(name)
             if logger:

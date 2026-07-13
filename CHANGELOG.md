@@ -6,6 +6,54 @@ is deliberate: see [Releasing](docs/releasing.md). Twelve releases were cut on
 live, every one of those interrupts every user. An alert people learn to ignore is
 worse than no alert, because one day it carries a security fix.
 
+## Unreleased
+### Added
+
+- **TrueNAS 26 support, verified on a real TrueNAS 26 install.** 26 deletes
+  `plugins/zfs_/` outright, taking the private `zfs.dataset.query`,
+  `zfs.snapshot.query` and `zfs.snapshot.delete` with it. Every one of those was on
+  the nested module's critical path, so nested snapshots were **BROKEN** on 26 and
+  `apply.sh` correctly refused to apply the module there.
+
+  Snapshot **deletion** now resolves its namespace at runtime — `pool.snapshot` on
+  25.10 and 26, `zfs.snapshot` on 24.10 and 25.04, because no single namespace spans
+  every supported release. `tools/compat.py` checks the same list the runtime uses,
+  so what CI verifies and what runs cannot drift apart.
+
+  Hardware-verified on TrueNAS 26.0.0-BETA.1: a 274-snapshot recursive backup of a
+  292-dataset pool, then a **byte-identical restore of a four-level-deep child
+  dataset**.
+
+### Fixed
+
+- **Enumeration no longer trusts middleware's dataset and snapshot queries — they
+  are filtered.** This is the important one, and it is the bug that a test VM caught
+  and no amount of source analysis ever could have.
+
+  The obvious port of the deleted private `zfs.dataset.query` was the public
+  `pool.dataset.query`. It exists, it is documented, it is covered by iX's
+  deprecation policy — and it is **not a like-for-like replacement**. It applies a
+  *visibility policy*: it hides the datasets TrueNAS considers its own — `ix-apps/*`,
+  `.system/*`, `.ix-virt/*`. On a real pool that is **84 of 270 datasets**, and
+  `ix-apps` holds **live application data**.
+
+  Staging from that view would have silently omitted every one of them. Worse,
+  `plan_staging()` would never have seen them, so they would not have appeared in its
+  `skipped` list either — no warning, no failure, just a green backup quietly missing
+  data. That is precisely the failure this module exists to prevent. The snapshot
+  query lies the same way (205 of 274), so the sweep would have orphaned one snapshot
+  per hidden dataset, on every run, forever.
+
+  The module now **reads the truth from ZFS and makes changes through middleware**:
+  enumeration is `zfs list`, which no policy can filter and which behaves identically
+  on every release; mutation stays a middleware call, so TrueNAS's own bookkeeping
+  stays consistent. A failing `zfs list` raises rather than returning an empty list —
+  "no datasets" and "the command broke" must never look the same.
+
+  **No shipped release is affected.** v0.6.1 and earlier call the *private*
+  `zfs.dataset.query`, which returns all 270 datasets. The bug existed only in the
+  unreleased TrueNAS 26 port.
+
 ## v0.6.1 — 2026-07-13
 ### Fixed
 

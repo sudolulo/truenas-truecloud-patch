@@ -438,8 +438,22 @@ class TestOnlyOurOwnTasksAreTouched:
         # The point is to add NO new failure mode to a CloudSync task. If any
         # middleware call happened before the bail-out, we would already have broken
         # the thing we are trying not to touch.
+        #
+        # Checked against whichever interactions the block ACTUALLY contains, not a
+        # fixed list: the dataset query moved behind `_tc_nested.query_filesystems()`
+        # when it switched to the public pool.* API, and a hardcoded
+        # `middleware.call_sync(` simply stopped being found -- a test that silently
+        # stops testing is worse than no test.
         block = extract_blocks()[name]
         gate = block.index('if not name.startswith("cloud_backup"):')
-        for call in ("middleware.call_sync(", "_tc_nested.stage_nested(",
-                     "_tc_nested.delete_snapshot_tree("):
+
+        interactions = [
+            "middleware.call_sync(",
+            "_tc_nested.query_filesystems(",
+            "_tc_nested.stage_nested(",
+            "_tc_nested.delete_snapshot_tree(",
+        ]
+        present = [c for c in interactions if c in block]
+        assert present, "found no middleware interaction at all -- the test is vacuous"
+        for call in present:
             assert gate < block.index(call), f"{call} runs before the cloud_backup gate"

@@ -204,18 +204,52 @@ class FakeMiddleware:
     truecloud_nested.py. TrueNAS <= 25.10 reaches it through
     `await middleware.run_in_thread(...)` and TrueNAS 26 calls it directly, but the
     logic below the boundary is the same code either way, so it is tested once.
+
+    `snapshot_ns` picks which middleware GENERATION this is, because they do not
+    agree on what the snapshot service is called:
+
+        pool.snapshot   25.10 and 26      (26 has ONLY this -- plugins/zfs_/ is gone)
+        zfs.snapshot    24.10 and 25.04   (pool.snapshot does not exist yet)
+
+    A method in the namespace this box does NOT have raises, exactly as middleware
+    does ("Method does not exist"). That is what makes the runtime picker testable:
+    a module that guessed wrong would blow up here instead of silently orphaning
+    snapshots on somebody's NAS.
     """
 
-    def __init__(self, snapshots=None):
+    def __init__(self, snapshots=None, snapshot_ns="pool.snapshot"):
         self.snapshots = list(snapshots or [])
         self.calls = []
         self.logger = None
+        self.snapshot_ns = snapshot_ns
+
+    def get_service(self, name):
+        if name != self.snapshot_ns:
+            raise KeyError(name)      # middleware raises KeyError for an unknown ns
+        return object()
+
+    def list_snapshots(self, dataset):
+        """Stands in for `zfs list -t snapshot -r <dataset>`.
+
+        Enumeration comes from ZFS now, NOT from middleware -- middleware's query
+        hides internal datasets, and a sweep that cannot see a snapshot can never
+        collect it. Passed in as `list_snapshots=` so the seam is explicit.
+        """
+        return [
+            n for n in self.snapshots
+            if n.split("@")[0] == dataset or n.startswith(dataset + "/")
+        ]
 
     def call_sync(self, method, *args):
         self.calls.append((method, args))
-        if method == "zfs.snapshot.query":
+        namespace, _, op = method.rpartition(".")
+
+        if namespace != self.snapshot_ns:
+            raise RuntimeError("Method does not exist")
+
+        if op == "query":
             return [{"name": n} for n in self.snapshots]
-        if method == "zfs.snapshot.delete":
+        if op == "delete":
             name = args[0]
             opts = args[1] if len(args) > 1 else {}
             if name not in self.snapshots:
@@ -265,44 +299,44 @@ class TestDeleteSnapshotTree:
         mw = FakeMiddleware([
             "Tap@snap", "Tap/apps@snap", "Tap/apps/lidarr@snap", "Tap@keepme",
         ])
-        delete_snapshot_tree(mw, "Tap@snap")
+        delete_snapshot_tree(mw, "Tap@snap", list_snapshots=mw.list_snapshots)
         assert mw.snapshots == ["Tap@keepme"]
 
     def test_is_idempotent_when_stock_already_removed_the_parent(self):
         # Stock's finally can win the race once our mounts are released.
         mw = FakeMiddleware(["Tap/apps@snap", "Tap/apps/lidarr@snap"])
-        delete_snapshot_tree(mw, "Tap@snap")
+        delete_snapshot_tree(mw, "Tap@snap", list_snapshots=mw.list_snapshots)
         assert mw.snapshots == []
 
     def test_uses_a_single_recursive_delete_not_252_individual_ones(self):
         # 252 sequential deletes are slow AND not atomic: a run killed part-way
         # through leaves exactly the orphans this function exists to prevent.
         mw = FakeMiddleware(["Tap@snap", "Tap/apps@snap", "Tap/apps/lidarr@snap"])
-        delete_snapshot_tree(mw, "Tap@snap")
+        delete_snapshot_tree(mw, "Tap@snap", list_snapshots=mw.list_snapshots)
         assert mw.snapshots == []
-        deletes = [a for m, a in mw.calls if m == "zfs.snapshot.delete"]
+        deletes = [a for m, a in mw.calls if m.endswith(".delete")]
         assert len(deletes) == 1, "should be ONE recursive call, not one per snapshot"
         assert deletes[0][1] == {"recursive": True}
-        assert not [m for m, _a in mw.calls if m == "zfs.snapshot.query"], (
+        assert not [m for m, _a in mw.calls if m.endswith(".query")], (
             "no enumeration needed on the fast path"
         )
 
     def test_survives_recursive_and_query_failure_by_deleting_the_parent(self):
         class Broken(FakeMiddleware):
             def call_sync(self, method, *args):
-                if method == "zfs.snapshot.query":
+                if method.endswith(".query"):
                     raise RuntimeError("boom")
-                if method == "zfs.snapshot.delete" and len(args) > 1:
+                if method.endswith(".delete") and len(args) > 1:
                     raise RuntimeError("recursive delete unavailable")
                 return super().call_sync(method, *args)
 
         mw = Broken(["Tap@snap"])
-        delete_snapshot_tree(mw, "Tap@snap")
+        delete_snapshot_tree(mw, "Tap@snap", list_snapshots=mw.list_snapshots)
         assert mw.snapshots == []
 
     def test_leaves_unrelated_snapshots_alone_when_the_tree_is_gone(self):
         mw = FakeMiddleware(["Tap@unrelated"])
-        delete_snapshot_tree(mw, "Tap@snap")
+        delete_snapshot_tree(mw, "Tap@snap", list_snapshots=mw.list_snapshots)
         assert mw.snapshots == ["Tap@unrelated"]
 
 
@@ -692,7 +726,7 @@ class BusyMiddleware(FakeMiddleware):
         self.attempts = 0
 
     def call_sync(self, method, *args):
-        if method == "zfs.snapshot.delete":
+        if method.endswith(".delete"):
             name = args[0]
             opts = args[1] if len(args) > 1 else {}
             if opts.get("recursive"):
@@ -713,7 +747,7 @@ class TestDeleteRetriesAndReportsSurvivors:
             ["Tap@snap", "Tap/apps@snap", "Tap/apps/prometheus@snap"],
             busy=["Tap/apps/prometheus@snap"], busy_for=1,
         )
-        survivors = tn.delete_snapshot_tree(mw, "Tap@snap", sleep=lambda _s: None)
+        survivors = tn.delete_snapshot_tree(mw, "Tap@snap", sleep=lambda _s: None, list_snapshots=mw.list_snapshots)
         assert survivors == []
         assert mw.snapshots == []
 
@@ -725,7 +759,7 @@ class TestDeleteRetriesAndReportsSurvivors:
             ["Tap@snap", "Tap/apps/prometheus@snap"],
             busy=["Tap/apps/prometheus@snap"], busy_for=99,
         )
-        survivors = tn.delete_snapshot_tree(mw, "Tap@snap", sleep=lambda _s: None)
+        survivors = tn.delete_snapshot_tree(mw, "Tap@snap", sleep=lambda _s: None, list_snapshots=mw.list_snapshots)
         assert survivors == ["Tap/apps/prometheus@snap"]
         assert mw.snapshots == ["Tap/apps/prometheus@snap"]
 
@@ -742,7 +776,7 @@ class TestDeleteRetriesAndReportsSurvivors:
             return real(method, *args)
 
         mw.call_sync = spy
-        tn.delete_snapshot_tree(mw, "Tap@snap", sleep=lambda _s: None)
+        tn.delete_snapshot_tree(mw, "Tap@snap", sleep=lambda _s: None, list_snapshots=mw.list_snapshots)
         assert order[0] == ("release", "snap"), order
 
 
@@ -1002,6 +1036,7 @@ class TestGarbageCollectorExecution:
         remaining = tn.gc_stale_snapshots(
             mw, "cloud_backup-5", "Tap@cloud_backup-5-20260714115900",
             now=now, mounts_file=str(mounts),
+            list_snapshots=mw.list_snapshots,
         )
         assert remaining == []
         assert mw.snapshots == [
@@ -1026,6 +1061,7 @@ class TestGarbageCollectorExecution:
         remaining = tn.gc_stale_snapshots(
             mw, "cloud_backup-5", "Tap@cloud_backup-5-20260714115900",
             now=now, mounts_file=str(mounts),
+            list_snapshots=mw.list_snapshots,
         )
         assert remaining == [orphan]
 
@@ -1039,7 +1075,7 @@ class TestGarbageCollectorExecution:
 
         class Broken(FakeMiddleware):
             def call_sync(self, method, *args):
-                if method == "zfs.snapshot.query":
+                if method.endswith(".query"):
                     raise RuntimeError("middleware is having a day")
                 return super().call_sync(method, *args)
 
@@ -1049,3 +1085,96 @@ class TestGarbageCollectorExecution:
             now=dt.datetime(2026, 7, 14, 12, 0, 0, tzinfo=dt.UTC),
             mounts_file=str(mounts),
         ) == []
+
+
+class TestEnumerationComesFromZfsNotMiddleware:
+    """The bug that a source check can never catch, found only by running it.
+
+    Porting the deleted private `zfs.dataset.query` to the public
+    `pool.dataset.query` looked obviously right: the method exists, it is
+    documented, iX will not delete it. Every test passed and `compat.py` went green
+    on TrueNAS 26.
+
+    It was wrong. The public query applies a VISIBILITY POLICY -- on a real box it
+    returns 205 of 274 datasets, hiding `ix-apps/*`, `.system/*` and `.ix-virt/*`.
+    On the production pool that is 84 of 270, and `ix-apps` holds LIVE APPLICATION
+    DATA. The staging plan would have omitted every one of them, and `plan_staging`
+    would never have seen them, so they would not even appear in `skipped`. A green
+    backup, silently missing data -- the precise failure this module exists to
+    prevent.
+
+    The snapshot query lies the same way, so the sweep would orphan one snapshot per
+    hidden dataset, forever.
+
+    Hence: READ from ZFS, MUTATE through middleware. These tests hold that line.
+    """
+
+    def test_query_filesystems_shells_out_to_zfs(self):
+        import truecloud_nested as tn
+
+        seen = []
+
+        class R:
+            returncode = 0
+            stdout = (
+                "scratch\t/mnt/scratch\tyes\n"
+                "scratch/ix-apps\t/mnt/scratch/ix-apps\tyes\n"   # middleware HIDES this one
+                "scratch/.system\tlegacy\tno\n"
+            )
+            stderr = ""
+
+        def runner(cmd):
+            seen.append(cmd)
+            return R()
+
+        rows = tn.query_filesystems(runner=runner)
+
+        assert seen and seen[0][0] == "zfs", "must read ZFS, not call middleware"
+        names = [r["name"] for r in rows]
+        assert "scratch/ix-apps" in names, (
+            "ix-apps is exactly what pool.dataset.query hides, and exactly what "
+            "holds live app data. If it is not here the backup omits it silently."
+        )
+        # ...and it still speaks the shape the planner expects.
+        row = next(r for r in rows if r["name"] == "scratch/.system")
+        assert row["properties"]["mountpoint"]["value"] == "legacy"
+        assert row["properties"]["mounted"]["value"] == "no"
+
+    def test_a_failing_zfs_raises_rather_than_returning_an_empty_list(self):
+        # The whole failure class in one assertion. "No datasets" and "the command
+        # broke" must never look the same: a caller that cannot tell them apart
+        # stages nothing, sweeps nothing, and reports success.
+        import truecloud_nested as tn
+
+        class R:
+            returncode = 1
+            stdout = ""
+            stderr = "cannot open 'scratch': no such pool"
+
+        with pytest.raises(tn.ZfsError, match="no such pool"):
+            tn.query_filesystems(runner=lambda cmd: R())
+
+        with pytest.raises(tn.ZfsError):
+            tn.list_snapshot_names("scratch", runner=lambda cmd: R())
+
+    def test_list_snapshot_names_reads_the_whole_tree_from_zfs(self):
+        import truecloud_nested as tn
+
+        seen = []
+
+        class R:
+            returncode = 0
+            stdout = "scratch@s\nscratch/ix-apps@s\n"
+            stderr = ""
+
+        def runner(cmd):
+            seen.append(cmd)
+            return R()
+
+        names = tn.list_snapshot_names("scratch", runner=runner)
+        assert names == ["scratch@s", "scratch/ix-apps@s"]
+        assert "-t" in seen[0] and "snapshot" in seen[0] and "-r" in seen[0]
+        assert "scratch/ix-apps@s" in names, (
+            "pool.snapshot.query hides this; a sweep that cannot see it orphans it "
+            "on every single run, forever"
+        )
