@@ -109,7 +109,7 @@ If a module shows `[FAIL]`:
    risk.
 4. **If the detail says the module doesn't exist**, a TrueNAS update renamed
    or restructured the internal API.
-   [Open an issue](https://git.onetick.ninja/flan/truenas-truecloud-patch/issues)
+   [Open an issue](https://github.com/sudolulo/truenas-truecloud-patch/issues)
    with your TrueNAS version number and the full verify output.
 
 ---

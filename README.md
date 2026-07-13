@@ -22,7 +22,7 @@ Clone it onto a **pool** (not the boot device — that is wiped on TrueNAS upgra
 then run `install.sh` as root:
 
 ```bash
-git clone https://git.onetick.ninja/flan/truenas-truecloud-patch.git \
+git clone https://github.com/sudolulo/truenas-truecloud-patch.git \
     /mnt/tank/truenas-truecloud-patch          # replace `tank` with your pool
 cd /mnt/tank/truenas-truecloud-patch
 sudo bash install.sh

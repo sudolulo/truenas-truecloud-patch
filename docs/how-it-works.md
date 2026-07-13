@@ -158,7 +158,7 @@ python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify
 | What you see | What it means |
 |---|---|
 | `[OK] providers`, `[OK]`/`[SKIP] nested_snapshots` | Fine. Nothing to do. |
-| `WARNING: … pattern not found` (UI) | The Angular bundle changed. The UI dropdown reverts to Storj-only, but **backups keep working** — create tasks with `create_task.py` meanwhile, and [open an issue](https://git.onetick.ninja/flan/truenas-truecloud-patch/issues) with your TrueNAS version. |
+| `WARNING: … pattern not found` (UI) | The Angular bundle changed. The UI dropdown reverts to Storj-only, but **backups keep working** — create tasks with `create_task.py` meanwhile, and [open an issue](https://github.com/sudolulo/truenas-truecloud-patch/issues) with your TrueNAS version. |
 | `WARNING: truecloud-patch is NOT COMPATIBLE with this TrueNAS version` | This TrueNAS changed middleware underneath the patch, and the named module was **deliberately not applied** — see `incompatible.json` for exactly which assumption broke. TrueNAS is left stock, so nothing is half-patched. Check [TrueNAS compatibility](../README.md#truenas-compatibility), then `bash update.sh` once a release supports your version; it re-applies itself on the next boot. This is **not** the kill switch and needs no manual reset. |
 | `[FAIL] providers` | **Your B2/S3 backups will not run.** middlewared is fine, but the credential/URL handling is gone. Open an issue with your version. |
 | `[FAIL] nested_snapshots` | The stock guard is back, so tasks with `snapshot = true` on a nested dataset will fail validation. Turn the option off on those tasks until it's fixed. |
