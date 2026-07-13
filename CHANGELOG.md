@@ -12,10 +12,11 @@ worse than no alert, because one day it carries a security fix.
 
 - **`release.sh` — a two-stage release process, and a barrier that enforces it.**
   A stable `vX.Y.Z` tag is now only publishable if a `vX.Y.Z-rcN` tag points at the
-  **same commit** and that candidate's CI run passed. Candidates are invisible to
-  users — `update.sh` and the update alert both take the newest plain `vX.Y.Z` tag —
-  so debugging happens across rc1, rc2, rc3 at nobody's expense, instead of across
-  v0.5.0, v0.5.1, v0.5.2 at everybody's.
+  **same commit**, and the release job re-runs the entire suite against that tagged
+  commit before publishing. Candidates are invisible to users — `update.sh` and the
+  update alert both take the newest plain `vX.Y.Z` tag — so debugging happens across
+  rc1, rc2, rc3 at nobody's expense, instead of across v0.5.0, v0.5.1, v0.5.2 at
+  everybody's.
 
       bash release.sh 0.6.0 --rc        # candidate. Invisible to users.
       bash release.sh 0.6.0 --promote   # stable. Refused unless an rc passed HERE.
