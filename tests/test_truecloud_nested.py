@@ -783,3 +783,113 @@ class TestSidecarSurvivesAnIncompleteSweep:
         monkeypatch.setattr(tn, "delete_snapshot_tree", lambda m, s, logger=None: [])
         tn.cleanup_task(FakeMiddleware(), "cloud_backup-5")
         assert not os.path.exists(sidecar_for(root))
+
+
+class TestTheSidecarCarriesEveryPendingTree:
+    """The sidecar holds a LIST, and that is a bug fix, not a generalisation.
+
+    It used to hold ONE snapshot. So a run that reclaimed an older tree, FAILED to
+    finish reclaiming it, and then recorded its own snapshot would **overwrite the only
+    record of the survivor** — orphaning it permanently, via the exact code written to
+    prevent orphans.
+
+    Observed live: a snapshot survived one run; the next run's reclaim also failed
+    (ZFS's 300s automount window had not elapsed, because the two runs were minutes
+    apart); the record was overwritten; the snapshot was orphaned for good.
+    """
+
+    def test_round_trips_a_list(self, tmp_path):
+        import truecloud_nested as tn
+        root = str(tmp_path / "cloud_backup-5")
+        tn._write_sidecar(root, ["Tap@a", "Tap@b"])
+        assert tn._read_sidecar(root) == ["Tap@a", "Tap@b"]
+
+    def test_reads_the_old_single_line_format(self, tmp_path):
+        # Boxes upgrading from an older version have a one-line sidecar on disk.
+        import truecloud_nested as tn
+        root = str(tmp_path / "cloud_backup-5")
+        os.makedirs(os.path.dirname(sidecar_for(root)), exist_ok=True)
+        with open(sidecar_for(root), "w", encoding="utf-8") as fh:
+            fh.write("Tap@legacy")
+        assert tn._read_sidecar(root) == ["Tap@legacy"]
+
+    def test_a_failed_reclaim_is_carried_forward_not_overwritten(
+        self, tmp_path, monkeypatch
+    ):
+        # THE bug. stage_nested reclaims an old tree, cannot finish, then records its
+        # own snapshot -- the survivor must still be in the sidecar afterwards.
+        import truecloud_nested as tn
+
+        monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
+        root = tn.staging_root_for("cloud_backup-5")
+        os.makedirs(os.path.dirname(root), exist_ok=True)
+        tn._write_sidecar(root, ["Tap@old"])
+
+        # The reclaim of Tap@old leaves one snapshot behind (still busy).
+        monkeypatch.setattr(
+            tn, "delete_snapshot_tree",
+            lambda m, s, logger=None: ["Tap/apps/x@old"] if s == "Tap@old" else [],
+        )
+        stub_core(monkeypatch, tn, plan=([("/src", root)], []))
+
+        tn.stage_nested(FakeMiddleware(), "/mnt/Tap", "Tap@new", "Tap", "/mnt/Tap",
+                        "cloud_backup-5", DATASETS)
+
+        recorded = tn._read_sidecar(root)
+        assert "Tap/apps/x@old" in recorded, (
+            "the failed reclaim's survivor was dropped — orphaned forever"
+        )
+        assert "Tap@new" in recorded, "our own snapshot must also be recorded"
+
+    def test_cleanup_sweeps_every_pending_tree_and_records_only_survivors(
+        self, tmp_path, monkeypatch
+    ):
+        import truecloud_nested as tn
+
+        monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
+        root = tn.staging_root_for("cloud_backup-5")
+        os.makedirs(root, exist_ok=True)
+        tn._write_sidecar(root, ["Tap@old", "Tap@new"])
+
+        swept = []
+
+        def fake_delete(m, s, logger=None):
+            swept.append(s)
+            return ["Tap/apps/x@new"] if s == "Tap@new" else []
+
+        monkeypatch.setattr(tn, "delete_snapshot_tree", fake_delete)
+        tn.cleanup_task(FakeMiddleware(), "cloud_backup-5")
+
+        assert swept == ["Tap@old", "Tap@new"], "both pending trees must be swept"
+        # Only the SURVIVOR is written back -- re-recording Tap@old would make every
+        # future run re-sweep a tree that is already gone.
+        assert tn._read_sidecar(root) == ["Tap/apps/x@new"]
+
+    def test_a_fully_clean_sweep_removes_the_sidecar(self, tmp_path, monkeypatch):
+        import truecloud_nested as tn
+
+        monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
+        root = tn.staging_root_for("cloud_backup-5")
+        os.makedirs(root, exist_ok=True)
+        tn._write_sidecar(root, ["Tap@a", "Tap@b"])
+        monkeypatch.setattr(tn, "delete_snapshot_tree", lambda m, s, logger=None: [])
+
+        tn.cleanup_task(FakeMiddleware(), "cloud_backup-5")
+        assert not os.path.exists(sidecar_for(root))
+
+    def test_cleanup_all_reports_each_pending_snapshot_on_its_own_line(self, tmp_path):
+        # It formats them for a human during uninstall. A list rendered into an
+        # f-string would print "['Tap@a', 'Tap@b']" at them.
+        import truecloud_nested as tn
+        root = str(tmp_path / "cloud_backup-5")
+        tn._write_sidecar(root, ["Tap@a", "Tap@b"])
+
+        lines, _errors = tn.cleanup_all(
+            base=str(tmp_path),
+            glob_fn=lambda _p: [sidecar_for(root)],
+            mounts_file=os.devnull,
+        )
+        notes = [ln for ln in lines if "left snapshot" in ln]
+        assert len(notes) == 2
+        assert "'Tap@a'" in notes[0] and "'Tap@b'" in notes[1]
+        assert "[" not in "".join(notes)

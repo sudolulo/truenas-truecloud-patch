@@ -90,6 +90,14 @@ worse than no alert, because one day it carries a security fix.
     one no-op delete on the next run, while a sidecar removed while the tree still
     exists is unrecoverable. Survivors are reclaimed by the next run.
 
+  **Expect the occasional straggler, and expect it to clean itself up.** On a
+  256-snapshot tree this reliably sweeps ~255 immediately and may leave **one**: it is
+  whatever restic read last, so its 300-second window has barely opened. That one is
+  logged, its sidecar is kept, and the next run reclaims it before doing anything else.
+  The leak is bounded at a single cycle rather than growing without limit — which is
+  the property that actually matters. Blocking a backup job for five minutes to chase
+  the last snapshot would be a worse trade, so it is not made.
+
 - **Installing the patch permanently blocked updating it.** `install.sh` does
   `chmod +x update.sh`, and git recorded `update.sh` as `100644` — so the chmod was a
   *tracked modification*, and `update.sh` refuses to run over a dirty tree. Install

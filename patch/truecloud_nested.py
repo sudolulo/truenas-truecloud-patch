@@ -114,21 +114,39 @@ def sidecar_for(staging_root: str) -> str:
     return staging_root + ".snapshot"
 
 
-def _write_sidecar(staging_root: str, snapshot: str) -> None:
-    """Record the pinned snapshot on disk. Blocking; call via run_in_thread."""
+def _write_sidecar(staging_root: str, snapshots) -> None:
+    """Record every snapshot tree this task still owns. One per line.
+
+    A LIST, not a single name -- and that is not over-engineering, it is a bug fix.
+
+    The sidecar used to hold one snapshot, so a run that reclaimed an older tree,
+    FAILED to finish reclaiming it, and then recorded its own snapshot would
+    **overwrite the only record of the survivor** -- orphaning it permanently, which is
+    exactly the outcome the sidecar exists to prevent. Observed live: a snapshot
+    survived one run, the next run's reclaim also failed (ZFS's 300s automount window
+    had not elapsed, because the runs were minutes apart), and the record was
+    destroyed anyway.
+
+    Now every still-pending tree is carried forward until it is actually gone.
+    """
+    if isinstance(snapshots, str):
+        snapshots = [snapshots]
     with contextlib.suppress(OSError):
         os.makedirs(os.path.dirname(staging_root), exist_ok=True)
         with open(sidecar_for(staging_root), "w", encoding="utf-8") as fh:
-            fh.write(snapshot)
+            fh.write("\n".join(dict.fromkeys(snapshots)))   # de-duped, order kept
 
 
-def _read_sidecar(staging_root: str) -> str | None:
-    """The snapshot a previous run recorded here, if any."""
+def _read_sidecar(staging_root: str):
+    """Every snapshot tree a previous run recorded here. [] if none.
+
+    Tolerates the old single-line format, which is just a one-element list.
+    """
     try:
         with open(sidecar_for(staging_root), encoding="utf-8") as fh:
-            return fh.read().strip() or None
+            return [ln.strip() for ln in fh if ln.strip()]
     except OSError:
-        return None
+        return []
 
 
 def _remove_sidecar(staging_root: str) -> None:
@@ -606,24 +624,38 @@ def stage_nested(middleware, path, snapshot, base_dataset, base_mountpoint,
     # A previous run may have crashed mid-flight; never build on top of that.
     teardown(staging_root)
 
-    # ...and if it left a sidecar behind, that snapshot tree is still on disk and
-    # nothing else will ever reclaim it. Sweep it before we overwrite the record,
-    # or a single crashed run orphans 160+ snapshots permanently.
-    stale = _read_sidecar(staging_root)
-    if stale and stale != snapshot:
+    # ...and if it left snapshot trees behind, they are still on disk and nothing else
+    # will ever reclaim them. Sweep them before recording our own, or a single crashed
+    # run orphans 160+ snapshots permanently.
+    #
+    # Anything a reclaim FAILS to delete is carried forward, not dropped. Overwriting
+    # the sidecar with only our own snapshot is what destroyed the record of a survivor
+    # once already: the reclaim ran, hit ZFS's 300-second automount window (the runs
+    # were minutes apart), left one snapshot behind, and then the record of it was
+    # overwritten -- a permanent orphan, created by the very code meant to prevent one.
+    pending = []
+    for stale in _read_sidecar(staging_root):
+        if stale == snapshot:
+            continue
         if logger:
             logger.warning(
                 "truecloud-patch: reclaiming snapshot tree from an earlier "
-                "interrupted run: %s", stale,
+                "run: %s", stale,
             )
-        delete_snapshot_tree(middleware, stale, logger=logger)
+        pending.extend(delete_snapshot_tree(middleware, stale, logger=logger))
+
+    if pending and logger:
+        logger.warning(
+            "truecloud-patch: %d snapshot(s) from an earlier run are still busy; "
+            "carrying them forward to the next run", len(pending),
+        )
 
     # Record the snapshot BEFORE mounting anything, not after. middlewared can
     # die at any point (this patch even schedules a restart at boot), and the
     # sidecar is the only thing that survives it -- an in-process dict would take
     # the sole record of a 160-snapshot tree with it. Writing it after apply_plan
     # would leave exactly the crash window the sidecar exists to close.
-    _write_sidecar(staging_root, snapshot)
+    _write_sidecar(staging_root, [*pending, snapshot])
 
     try:
         mounts, skipped = plan_staging(
@@ -667,9 +699,9 @@ def cleanup_task(middleware, task_name, logger=None):
     Safe to call unconditionally: a no-op when the task was never staged.
     """
     staging_root = staging_root_for(task_name)
-    snapshot = _read_sidecar(staging_root)
+    pinned = _read_sidecar(staging_root)
 
-    if snapshot is None and not os.path.isdir(staging_root):
+    if not pinned and not os.path.isdir(staging_root):
         return  # never staged; nothing to do
 
     errors = teardown(staging_root)
@@ -677,11 +709,15 @@ def cleanup_task(middleware, task_name, logger=None):
         for err in errors:
             logger.warning("truecloud-patch: staging teardown: %s", err)
 
-    if snapshot is None:
+    if not pinned:
         _remove_sidecar(staging_root)
         return
 
-    survivors = delete_snapshot_tree(middleware, snapshot, logger=logger)
+    # Every tree this task still owns -- ours, plus anything an earlier run could not
+    # finish reclaiming.
+    survivors = []
+    for snapshot in pinned:
+        survivors.extend(delete_snapshot_tree(middleware, snapshot, logger=logger))
 
     # KEEP the sidecar if anything survived. It is the only record that those
     # snapshots exist, and removing it orphans them permanently.
@@ -698,10 +734,13 @@ def cleanup_task(middleware, task_name, logger=None):
     if survivors:
         if logger:
             logger.warning(
-                "truecloud-patch: %d snapshot(s) from %s could not be deleted; "
-                "keeping the sidecar so the next run reclaims them",
-                len(survivors), snapshot,
+                "truecloud-patch: %d snapshot(s) could not be deleted (still busy); "
+                "recording them so the next run reclaims them: %s",
+                len(survivors), ", ".join(survivors),
             )
+        # The SURVIVORS, not the trees we asked to delete. Writing the original list
+        # back would keep re-sweeping trees that are already gone.
+        _write_sidecar(staging_root, survivors)
         return
 
     _remove_sidecar(staging_root)
@@ -731,8 +770,7 @@ def cleanup_all(base=None, runner=_run, mounts_file="/proc/self/mounts",
     # a sidecar is the only record that an interrupted run's snapshot tree (one
     # snapshot per descendant dataset) is still on disk.
     for sc in sorted(glob_fn(os.path.join(base, "*.snapshot"))):
-        snap = read_sidecar(sc[: -len(".snapshot")])
-        if snap:
+        for snap in read_sidecar(sc[: -len(".snapshot")]):
             lines.append(f"  NOTE: an interrupted backup left snapshot '{snap}' behind.")
             lines.append(f"        Remove it and its children:  zfs destroy -r '{snap}'")
 

@@ -95,6 +95,25 @@ re-scan each time.
 
 ### Snapshot lifecycle
 
+> **A snapshot may survive a run, and that is expected.** ZFS **automounts**
+> `<dataset>/.zfs/snapshot/<snap>` the moment it is read, and holds it for
+> `zfs_expire_snapshot` seconds (**300** by default) after the last access. So
+> whatever restic read *last* is still pinned when we try to destroy it, and
+> `zfs destroy` refuses with `dataset is busy`.
+>
+> The patch unmounts those automounts itself and retries, which clears ~255 of 256 on
+> a real pool. The one that remains is **logged, its sidecar is kept, and the next run
+> reclaims it before doing anything else** — so the leak is bounded at a single cycle
+> instead of growing forever. Seeing one `could not delete snapshot … it will be
+> reclaimed on the next run` in the log is normal. Seeing the count *grow* run over run
+> is not, and would be a bug.
+>
+> This is why the sidecar is removed **only on a confirmed-clean sweep**: it is the
+> only record those snapshots exist, and a run that dropped it while they were still
+> around would orphan them permanently. That is precisely what happened before this was
+> fixed.
+
+
 `zfs.snapshot.delete` defaults to **`recursive=False`**, and stock
 `restic_backup()` calls it with no options. Stock is safe only because its
 validation means a *recursive* snapshot never actually happens in the field.
