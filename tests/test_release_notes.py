@@ -9,6 +9,7 @@ across install.sh / uninstall.sh / recover.sh / apply.sh and nothing noticed.
 """
 
 import os
+import re
 import sys
 
 import pytest
@@ -233,3 +234,60 @@ class TestCandidateNotesResolveToTheBaseVersion:
     def test_a_genuinely_missing_section_still_raises(self):
         with pytest.raises(KeyError):
             extract_notes(self.CHANGELOG, "v9.9.9-rc1")
+
+
+class TestTheChangelogIsStructurallySound:
+    """The release body IS this file, so a mangled section ships to every user.
+
+    It has been mangled once: an edit matched the literal `## Unreleased` inside a
+    backticked phrase in a prose bullet and spliced a whole new section into the middle
+    of it, splitting the sentence in half.
+    """
+
+    def changelog(self):
+        with open(os.path.join(REPO, "CHANGELOG.md"), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_no_version_section_is_empty(self):
+        text = self.changelog()
+        for v in changelog_versions(text):
+            assert extract_notes(text, v).strip(), f"v{v} has an empty section"
+
+    def test_versions_are_in_descending_order(self):
+        from release_notes import version_tuple
+        versions = changelog_versions(self.changelog())
+        assert versions == sorted(versions, key=version_tuple, reverse=True), (
+            "CHANGELOG versions are out of order — a section was spliced in wrong"
+        )
+
+    def test_headings_are_at_the_start_of_a_line_and_not_inside_prose(self):
+        # A `### Fixed` that ends up indented under a bullet is a section nobody sees.
+        for i, line in enumerate(self.changelog().splitlines(), 1):
+            if line.lstrip().startswith(("## ", "### ")) and line != line.lstrip():
+                raise AssertionError(
+                    f"line {i}: heading is indented, so it is inside a list item "
+                    f"rather than being a section: {line!r}"
+                )
+
+    def test_every_bullet_that_opens_a_bold_phrase_closes_it(self):
+        # The splice cut `- **A stable release ... under \`## Unreleased` in half,
+        # leaving an unterminated ** and a dangling sentence.
+        #
+        # A bullet is the `- ` line plus everything up to the next top-level bullet or
+        # heading -- bold phrases routinely wrap across lines, so a per-line check
+        # would flag every long bullet in the file.
+        text = self.changelog()
+        bullets = re.split(r"^(?=- |#{2,3} )", text, flags=re.M)
+        bad = []
+        for b in bullets:
+            if not b.startswith("- "):
+                continue
+            # Code spans are not markup: `*args, **kwargs` is a literal, not a bold
+            # phrase, and counting its ** would flag a perfectly well-formed bullet.
+            prose = re.sub(r"`[^`]*`", "", b)
+            if prose.count("**") % 2:
+                bad.append(b.splitlines()[0][:70])
+        assert not bad, (
+            "unbalanced ** in a bullet — a section was probably spliced into the "
+            "middle of it:\n  " + "\n  ".join(bad)
+        )

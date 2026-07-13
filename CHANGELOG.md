@@ -6,6 +6,36 @@ is deliberate: see [Releasing](docs/releasing.md). Twelve releases were cut on
 live, every one of those interrupts every user. An alert people learn to ignore is
 worse than no alert, because one day it carries a security fix.
 
+## Unreleased
+
+### Fixed
+
+- **A reboot mid-backup orphaned the entire snapshot tree, permanently.** The sidecar
+  is the record of which snapshots a run pinned — and it lives in `/run`, which is
+  **tmpfs**. A reboot (or a crash) between taking the recursive snapshot and cleaning
+  it up destroyed that record, leaving one snapshot per descendant dataset — **250+ on
+  a real pool** — with nothing left pointing at them. Nothing would ever have found
+  them again.
+
+  `gc_stale_snapshots()` is the backstop: it identifies leftovers **by name**, so it
+  works when the record is gone. It runs at the start of every backup, after the
+  sidecar reclaim — the recorded path stays authoritative, and the collector only ever
+  mops up what the record lost.
+
+  Because it deletes data on a *name match* — a weaker claim than a recorded fact — the
+  selection is a **pure function** with the harshest tests in the suite. A snapshot is
+  collected only if **all** of these hold:
+
+  | | |
+  | --- | --- |
+  | name is exactly `<dataset>@<task>-<YYYYMMDDHHMMSS>` | so `cloud_backup-5` never matches `cloud_backup-50`, an `auto-*` periodic snapshot, or anything a human made |
+  | it is not the current run's | parent *and* children are excluded |
+  | **nothing is mounted from it** | an in-flight run pins its own snapshots — this, not the age guard, is what protects a concurrent backup |
+  | it is **over an hour old** | covers the seconds-long window where a live run has snapshotted but not yet mounted |
+
+  Verified against the real pool: of **4,728** snapshots — including **2,341** periodic
+  ones — it selects exactly the orphans of the task being run, and nothing else.
+
 ## v0.6.0 — 2026-07-13
 ### Added
 
@@ -207,35 +237,7 @@ worse than no alert, because one day it carries a security fix.
   warning, not a refusal: declining to install over a string we failed to read would
   be a worse failure than the one being prevented.
 
-- **A stable release may not leave work stranded under `## Unreleased
-
-### Fixed
-
-- **A reboot mid-backup orphaned the entire snapshot tree, permanently.** The sidecar
-  is the record of which snapshots a run pinned — and it lives in `/run`, which is
-  **tmpfs**. A reboot (or a crash) between taking the recursive snapshot and cleaning
-  it up destroyed that record, leaving one snapshot per descendant dataset — **250+ on
-  a real pool** — with nothing left pointing at them. Nothing would ever have found
-  them again.
-
-  `gc_stale_snapshots()` is the backstop: it identifies leftovers **by name**, so it
-  works when the record is gone. It runs at the start of every backup, after the
-  sidecar reclaim — the recorded path stays authoritative, and the collector only ever
-  mops up what the record lost.
-
-  Because it deletes data on a *name match* — a weaker claim than a recorded fact — the
-  selection is a **pure function** with the harshest tests in the suite. A snapshot is
-  collected only if **all** of these hold:
-
-  | | |
-  | --- | --- |
-  | name is exactly `<dataset>@<task>-<YYYYMMDDHHMMSS>` | so `cloud_backup-5` never matches `cloud_backup-50`, an `auto-*` periodic snapshot, or anything a human made |
-  | it is not the current run's | parent *and* children are excluded |
-  | **nothing is mounted from it** | an in-flight run pins its own snapshots — this, not the age guard, is what protects a concurrent backup |
-  | it is **over an hour old** | covers the seconds-long window where a live run has snapshotted but not yet mounted |
-
-  Verified against the real pool: of **4,728** snapshots — including **2,341** periodic
-  ones — it selects exactly the orphans of the task being run, and nothing else.`.** Either it
+- **A stable release may not leave work stranded under `## Unreleased`.** Either it
   is finished and belongs in the release, or the release is premature. Candidates
   are exempt: an rc may legitimately have work queued behind it.
 
