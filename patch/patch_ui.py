@@ -9,8 +9,8 @@ in the minified JS in one of two forms depending on TrueNAS / Angular version:
   TrueNAS 24.x (static inline array):
       "filterByProviders",["STORJ_IX"]
 
-  TrueNAS 25.x+ (Angular pureFunction binding):
-      "filterByProviders",pe(115,Rn,i.CloudSyncProviderName.Storj)
+  TrueNAS 25.x+ (Angular pureFunction binding, inside a chained property call):
+      c(2,"filterByProviders",pe(115,Rn,i.CloudSyncProviderName.Storj))("required",!0)
 
 Both are replaced so the dropdown includes S3 and B2. The file is backed up
 before modification so uninstall.sh can restore it.
@@ -33,10 +33,20 @@ WEBUI_CANDIDATES = [
 # Patterns tried in order; the first match wins.
 # Each entry is (compiled_regex, replacement_string).
 _PATTERNS = [
-    # TrueNAS 25.x+: Angular emits a pureFunction call instead of a literal array.
+    # TrueNAS 25.x+: Angular emits a pureFunction call instead of a literal array,
+    # inside a CHAINED property binding — so the call is followed by two closing
+    # parens, one for pe(...) and one for the property(...) it sits in:
+    #
+    #     c(2,"filterByProviders",pe(115,Rn,i.CloudSyncProviderName.Storj))("required",!0)
+    #                                                                    ^^
+    # The pattern consumes both and re-emits one, leaving the paren balance
+    # unchanged. Getting that wrong is a syntax error in the bundle and the whole
+    # web UI goes blank — see tests/test_patch_ui.py.
+    #
+    # The minified names (pe / slot index / Rn / i) change across builds;
+    # CloudSyncProviderName.Storj is stable because it is a TypeScript enum name.
     (re.compile(r'("filterByProviders",)\w+\(\d+,\w+,\w+\.CloudSyncProviderName\.Storj\)\)'),
      r'\1["STORJ_IX","S3","B2"])'),
-
 
     # TrueNAS 24.x and earlier: static inline array.
     (re.compile(r'("filterByProviders",)\["STORJ_IX"\]'),
