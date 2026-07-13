@@ -12,7 +12,6 @@ Two rules are under test above all else:
    on EVERY run.
 """
 
-import asyncio
 import os
 import sys
 
@@ -199,12 +198,20 @@ class TestSnapshotTreeNames:
 
 
 class FakeMiddleware:
+    """middlewared as this module actually uses it: `call_sync`, from a thread.
+
+    The module is synchronous on purpose -- see the orchestration note in
+    truecloud_nested.py. TrueNAS <= 25.10 reaches it through
+    `await middleware.run_in_thread(...)` and TrueNAS 26 calls it directly, but the
+    logic below the boundary is the same code either way, so it is tested once.
+    """
+
     def __init__(self, snapshots=None):
         self.snapshots = list(snapshots or [])
         self.calls = []
         self.logger = None
 
-    async def call(self, method, *args):
+    def call_sync(self, method, *args):
         self.calls.append((method, args))
         if method == "zfs.snapshot.query":
             return [{"name": n} for n in self.snapshots]
@@ -222,8 +229,35 @@ class FakeMiddleware:
             return True
         raise AssertionError(f"unexpected call {method}")
 
-    async def run_in_thread(self, fn, *args):
-        return fn(*args)
+
+def stub_core(monkeypatch, tn, *, plan=None, order=None, plan_raises=None):
+    """Replace the blocking core (plan/apply/verify/teardown) with recorders.
+
+    stage_nested calls these directly now, so they are patched by NAME rather than
+    intercepted at a `run_in_thread` boundary that no longer exists.
+    """
+    def record(name, result):
+        def fn(*args, **kwargs):
+            if order is not None:
+                order.append(name)
+            if name == "plan_staging" and plan_raises is not None:
+                raise plan_raises
+            return result() if callable(result) else result
+        fn.__name__ = name
+        return fn
+
+    real_write = tn._write_sidecar
+
+    def write_sidecar(*args, **kwargs):
+        if order is not None:
+            order.append("_write_sidecar")
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(tn, "_write_sidecar", write_sidecar)
+    monkeypatch.setattr(tn, "plan_staging", record("plan_staging", plan or ([], [])))
+    monkeypatch.setattr(tn, "apply_plan", record("apply_plan", True))
+    monkeypatch.setattr(tn, "verify_staged", record("verify_staged", True))
+    monkeypatch.setattr(tn, "teardown", record("teardown", []))
 
 
 class TestDeleteSnapshotTree:
@@ -231,20 +265,20 @@ class TestDeleteSnapshotTree:
         mw = FakeMiddleware([
             "Tap@snap", "Tap/apps@snap", "Tap/apps/lidarr@snap", "Tap@keepme",
         ])
-        asyncio.run(delete_snapshot_tree(mw, "Tap@snap"))
+        delete_snapshot_tree(mw, "Tap@snap")
         assert mw.snapshots == ["Tap@keepme"]
 
     def test_is_idempotent_when_stock_already_removed_the_parent(self):
         # Stock's finally can win the race once our mounts are released.
         mw = FakeMiddleware(["Tap/apps@snap", "Tap/apps/lidarr@snap"])
-        asyncio.run(delete_snapshot_tree(mw, "Tap@snap"))
+        delete_snapshot_tree(mw, "Tap@snap")
         assert mw.snapshots == []
 
     def test_uses_a_single_recursive_delete_not_252_individual_ones(self):
         # 252 sequential deletes are slow AND not atomic: a run killed part-way
         # through leaves exactly the orphans this function exists to prevent.
         mw = FakeMiddleware(["Tap@snap", "Tap/apps@snap", "Tap/apps/lidarr@snap"])
-        asyncio.run(delete_snapshot_tree(mw, "Tap@snap"))
+        delete_snapshot_tree(mw, "Tap@snap")
         assert mw.snapshots == []
         deletes = [a for m, a in mw.calls if m == "zfs.snapshot.delete"]
         assert len(deletes) == 1, "should be ONE recursive call, not one per snapshot"
@@ -255,20 +289,20 @@ class TestDeleteSnapshotTree:
 
     def test_survives_recursive_and_query_failure_by_deleting_the_parent(self):
         class Broken(FakeMiddleware):
-            async def call(self, method, *args):
+            def call_sync(self, method, *args):
                 if method == "zfs.snapshot.query":
                     raise RuntimeError("boom")
                 if method == "zfs.snapshot.delete" and len(args) > 1:
                     raise RuntimeError("recursive delete unavailable")
-                return await super().call(method, *args)
+                return super().call_sync(method, *args)
 
         mw = Broken(["Tap@snap"])
-        asyncio.run(delete_snapshot_tree(mw, "Tap@snap"))
+        delete_snapshot_tree(mw, "Tap@snap")
         assert mw.snapshots == []
 
     def test_leaves_unrelated_snapshots_alone_when_the_tree_is_gone(self):
         mw = FakeMiddleware(["Tap@unrelated"])
-        asyncio.run(delete_snapshot_tree(mw, "Tap@snap"))
+        delete_snapshot_tree(mw, "Tap@snap")
         assert mw.snapshots == ["Tap@unrelated"]
 
 
@@ -281,20 +315,13 @@ class TestStageNestedOrdering:
 
         monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
         order = []
+        stub_core(monkeypatch, tn, order=order,
+                  plan=([("/src", str(tmp_path / "cloud_backup-5"))], []))
 
-        class Recorder(FakeMiddleware):
-            async def run_in_thread(self, fn, *args):
-                order.append(fn.__name__)
-                if fn.__name__ == "plan_staging":
-                    return ([("/src", str(tmp_path / "cloud_backup-5"))], [])
-                if fn.__name__ in ("apply_plan", "verify_staged", "teardown"):
-                    return [] if fn.__name__ == "teardown" else True
-                return fn(*args)
-
-        asyncio.run(tn.stage_nested(
-            Recorder(), "/mnt/Tap", "Tap@snap", "Tap", "/mnt/Tap",
+        tn.stage_nested(
+            FakeMiddleware(), "/mnt/Tap", "Tap@snap", "Tap", "/mnt/Tap",
             "cloud_backup-5", DATASETS,
-        ))
+        )
 
         assert order.index("_write_sidecar") < order.index("apply_plan")
 
@@ -312,28 +339,12 @@ class TestStageNestedOrdering:
             fh.write("Tap@old-crashed-run")
 
         mw = FakeMiddleware(["Tap@old-crashed-run", "Tap/apps@old-crashed-run"])
+        stub_core(monkeypatch, tn, plan=([("/src", root)], []))
 
-        class Stub(FakeMiddleware):
-            def __init__(self, inner):
-                super().__init__()
-                self.inner = inner
-
-            async def call(self, method, *args):
-                return await self.inner.call(method, *args)
-
-            async def run_in_thread(self, fn, *args):
-                if fn.__name__ == "plan_staging":
-                    return ([("/src", root)], [])
-                if fn.__name__ == "teardown":
-                    return []
-                if fn.__name__ in ("apply_plan", "verify_staged"):
-                    return True
-                return fn(*args)
-
-        asyncio.run(tn.stage_nested(
-            Stub(mw), "/mnt/Tap", "Tap@new", "Tap", "/mnt/Tap",
+        tn.stage_nested(
+            mw, "/mnt/Tap", "Tap@new", "Tap", "/mnt/Tap",
             "cloud_backup-5", DATASETS,
-        ))
+        )
 
         assert mw.snapshots == [], "the crashed run's snapshot tree must be reclaimed"
 
@@ -342,18 +353,13 @@ class TestStageNestedOrdering:
 
         monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
         root = tn.staging_root_for("cloud_backup-5")
-
-        class Failing(FakeMiddleware):
-            async def run_in_thread(self, fn, *args):
-                if fn.__name__ == "plan_staging":
-                    raise StagingError("boom")
-                return fn(*args)
+        stub_core(monkeypatch, tn, plan_raises=StagingError("boom"))
 
         with pytest.raises(StagingError):
-            asyncio.run(tn.stage_nested(
-                Failing(), "/mnt/Tap", "Tap@snap", "Tap", "/mnt/Tap",
+            tn.stage_nested(
+                FakeMiddleware(), "/mnt/Tap", "Tap@snap", "Tap", "/mnt/Tap",
                 "cloud_backup-5", DATASETS,
-            ))
+            )
 
         assert not os.path.exists(sidecar_for(root))
 
@@ -374,7 +380,7 @@ class TestCleanupTask:
         mw = FakeMiddleware(["Tap@snap", "Tap/apps@snap"])
         monkeypatch.setattr(tn, "teardown", lambda *_a, **_k: [])
 
-        asyncio.run(cleanup_task(mw, "cloud_backup-5"))
+        cleanup_task(mw, "cloud_backup-5")
 
         assert mw.snapshots == []
         assert not os.path.exists(sidecar_for(root))
@@ -384,7 +390,7 @@ class TestCleanupTask:
 
         monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path / "nope"))
         mw = FakeMiddleware(["Tap@snap"])
-        asyncio.run(cleanup_task(mw, "cloud_backup-5"))
+        cleanup_task(mw, "cloud_backup-5")
         assert mw.calls == []
         assert mw.snapshots == ["Tap@snap"]
 

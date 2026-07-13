@@ -491,20 +491,41 @@ else:
 # the guard removed but the traversal missing -- that would be a silently empty
 # backup, the worst possible outcome.
 
-SNAPSHOT_BLOCK = """
+# ── nested blocks: one core, two wrappers ─────────────────────────────────────
+#
+# TrueNAS <= 25.10 has an ASYNC cloud_backup path; TrueNAS 26 rewrote it SYNCHRONOUS
+# (`middleware.call_sync` throughout, no awaits). An `async def` wrapper on 26 hands
+# sync.py a coroutine where it unpacks a tuple, and a `def` wrapper on 25.10 blocks
+# the event loop. So each block is assembled from:
+#
+#   * a CORE, written once, synchronous, using middleware.call_sync -- which is safe
+#     from a worker thread and deadlocks on the event loop; and
+#   * a WRAPPER matching the stock function's own flavour, chosen at apply time by
+#     reading whether the installed middlewared declares it `async def`.
+#
+# On <= 25.10 the async wrapper hops to a thread via `await middleware.run_in_thread`
+# -- exactly the thread call_sync needs. On 26 the stock function is already running
+# in middlewared's thread pool (its own code calls call_sync), so the sync wrapper
+# calls the core directly.
+#
+# The logic that matters -- snapshots, bind mounts, failure modes -- exists once.
+# An async twin would mean every future fix had to land twice, and the one that got
+# missed would be the one that eats a backup.
+
+_NESTED_IMPORT = """
 # TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
 try:
     from middlewared.plugins.cloud import _truecloud_nested as _tc_nested
 except ImportError:
     _tc_nested = None
+"""
 
+SNAPSHOT_CORE = _NESTED_IMPORT + """
 if _tc_nested is not None:
     _tc_orig_create_snapshot = create_snapshot
 
-    async def create_snapshot(middleware, path, name="cloud_task-onetime"):
-        # Stock takes the (already recursive) snapshot; we only replace the PATH.
-        snapshot, snap_path = await _tc_orig_create_snapshot(middleware, path, name)
-
+    def _tc_stage(middleware, path, name, snapshot, snap_path):
+        # Synchronous, and always called from a worker thread (see above).
         _logger = getattr(middleware, "logger", None)
         try:
             # Enumerate datasets AFTER the snapshot, never before. The snapshot is
@@ -513,10 +534,13 @@ if _tc_nested is not None:
             # our staging plan would not -- silently omitting it from the backup.
             # Read afterwards, an unsnapshotted dataset instead trips the isdir()
             # check in plan_staging and fails the run loudly. Loud beats silent.
-            datasets = await middleware.call(
+            datasets = middleware.call_sync(
                 "zfs.dataset.query", [["type", "=", "FILESYSTEM"]]
             )
-            dataset, nested = get_dataset_recursive(datasets, path)
+            # OUR copy of get_dataset_recursive, not the host module's: TrueNAS 26
+            # deleted that helper (create_snapshot uses filesystem.statfs now), so
+            # calling it out of the module namespace is a NameError there.
+            dataset, nested = _tc_nested.get_dataset_recursive(datasets, path)
 
             if not nested:
                 # No children: stock behaviour, untouched. Stock's `finally` owns
@@ -524,38 +548,42 @@ if _tc_nested is not None:
                 # because a non-nested snapshot has no children).
                 return snapshot, snap_path
 
-            staging_root = await _tc_nested.stage_nested(
+            staging_root = _tc_nested.stage_nested(
                 middleware, path, snapshot,
                 dataset["name"], dataset["properties"]["mountpoint"]["value"],
                 name, datasets, logger=_logger,
             )
         except Exception:
             # The snapshot exists, but this exception means sync.py never completes
-            # `snapshot, local_path = await create_snapshot(...)`, so its local
-            # `snapshot` stays None and its `finally` deletes NOTHING. Sweep the
-            # tree ourselves or leak the parent plus one snapshot per descendant
-            # dataset (160+ here) on every failed run.
-            await _tc_nested.delete_snapshot_tree(middleware, snapshot, logger=_logger)
+            # `snapshot, local_path = create_snapshot(...)`, so its local `snapshot`
+            # stays None and its `finally` deletes NOTHING. Sweep the tree ourselves
+            # or leak the parent plus one snapshot per descendant dataset (160+ here)
+            # on every failed run.
+            _tc_nested.delete_snapshot_tree(middleware, snapshot, logger=_logger)
             raise
 
         return snapshot, staging_root
+"""
+
+SNAPSHOT_ASYNC = SNAPSHOT_CORE + """
+    async def create_snapshot(middleware, path, name="cloud_task-onetime"):
+        snapshot, snap_path = await _tc_orig_create_snapshot(middleware, path, name)
+        return await middleware.run_in_thread(
+            _tc_stage, middleware, path, name, snapshot, snap_path
+        )
 
     create_snapshot._truecloud_patched = True
 """
 
-CRUD_BLOCK = """
-# TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
-try:
-    from middlewared.plugins.cloud import _truecloud_nested as _tc_nested
-except ImportError:
-    _tc_nested = None
+SNAPSHOT_SYNC = SNAPSHOT_CORE + """
+    def create_snapshot(middleware, path, name="cloud_task-onetime"):
+        snapshot, snap_path = _tc_orig_create_snapshot(middleware, path, name)
+        return _tc_stage(middleware, path, name, snapshot, snap_path)
 
-if _tc_nested is not None:
-    _tc_orig_validate = CloudTaskServiceMixin._validate
+    create_snapshot._truecloud_patched = True
+"""
 
-    async def _tc_validate(self, app, verrors, name, data):
-        await _tc_orig_validate(self, app, verrors, name, data)
-
+_CRUD_FILTER = """
         # Only cloud_backup: staging teardown is wired into cloud_backup.sync's
         # finally. cloudsync would leak bind mounts, so leave its guard intact.
         if getattr(getattr(self, "_config", None), "namespace", "") != "cloud_backup":
@@ -576,34 +604,63 @@ if _tc_nested is not None:
     CloudTaskServiceMixin._validate._truecloud_patched = True
 """
 
-SYNC_BLOCK = """
-# TRUECLOUD_PATCH — added by truenas-truecloud-patch/patch/apply.sh
-try:
-    from middlewared.plugins.cloud import _truecloud_nested as _tc_nested
-except ImportError:
-    _tc_nested = None
+CRUD_ASYNC = _NESTED_IMPORT + """
+if _tc_nested is not None:
+    _tc_orig_validate = CloudTaskServiceMixin._validate
 
+    async def _tc_validate(self, app, verrors, name, data):
+        await _tc_orig_validate(self, app, verrors, name, data)
+""" + _CRUD_FILTER
+
+CRUD_SYNC = _NESTED_IMPORT + """
+if _tc_nested is not None:
+    _tc_orig_validate = CloudTaskServiceMixin._validate
+
+    def _tc_validate(self, app, verrors, name, data):
+        _tc_orig_validate(self, app, verrors, name, data)
+""" + _CRUD_FILTER
+
+# *args/**kwargs, not the stock signature spelled out.
+#
+# 24.10 and 25.04 have `restic_backup(middleware, job, cloud_backup, dry_run)`;
+# 25.10 added `rate_limit`. Naming them and forwarding all five raised
+# `TypeError: takes 4 positional arguments but 5 were given` on every nested backup
+# on the two older releases. Forwarding whatever we were handed makes this wrapper
+# indifferent to iX adding or dropping a trailing parameter -- which they have now
+# done twice.
+#
+# Our bind mounts pin the ZFS snapshot, so stock's `finally` cannot destroy it
+# (EBUSY) and logs one benign warning. We unmount here and then delete it for real.
+SYNC_ASYNC = _NESTED_IMPORT + """
 if _tc_nested is not None:
     _tc_orig_restic_backup = restic_backup
 
     async def restic_backup(middleware, job, cloud_backup, *args, **kwargs):
-        # *args/**kwargs, not the stock signature spelled out.
-        #
-        # 24.10 and 25.04 have `restic_backup(middleware, job, cloud_backup, dry_run)`;
-        # 25.10 added `rate_limit`. Naming them here and forwarding all five raised
-        # `TypeError: takes 4 positional arguments but 5 were given` on every nested
-        # backup on the two older releases. Forwarding whatever we were handed makes
-        # this wrapper indifferent to iX adding or dropping a trailing parameter --
-        # which they have now done twice.
-        #
-        # Our bind mounts pin the ZFS snapshot, so stock's `finally` cannot
-        # destroy it (EBUSY) and logs one benign warning. We unmount here and
-        # then delete the snapshot for real.
         try:
             return await _tc_orig_restic_backup(middleware, job, cloud_backup, *args, **kwargs)
         finally:
             try:
-                await _tc_nested.cleanup_task(
+                await middleware.run_in_thread(
+                    _tc_nested.cleanup_task,
+                    middleware,
+                    f"cloud_backup-{cloud_backup.get('id', 'onetime')}",
+                )
+            except Exception as e:
+                middleware.logger.warning("truecloud-patch: staging cleanup failed: %r", e)
+
+    restic_backup._truecloud_patched = True
+"""
+
+SYNC_SYNC = _NESTED_IMPORT + """
+if _tc_nested is not None:
+    _tc_orig_restic_backup = restic_backup
+
+    def restic_backup(middleware, job, cloud_backup, *args, **kwargs):
+        try:
+            return _tc_orig_restic_backup(middleware, job, cloud_backup, *args, **kwargs)
+        finally:
+            try:
+                _tc_nested.cleanup_task(
                     middleware,
                     f"cloud_backup-{cloud_backup.get('id', 'onetime')}",
                     logger=getattr(middleware, "logger", None),
@@ -706,10 +763,39 @@ else:
         if missing:
             raise FileNotFoundError('missing: ' + ', '.join(missing))
 
+        # Which flavour of cloud_backup is installed? <= 25.10 is async; TrueNAS 26
+        # rewrote it synchronous. Inject the wrapper that matches: an `async def` on
+        # 26 hands sync.py a coroutine where it unpacks a tuple, and a plain `def` on
+        # 25.10 blocks the event loop.
+        #
+        # None means the three stock functions disagree, or one could not be read.
+        # Refuse rather than guess -- a half-converted middleware is one this patch
+        # has never seen, and guessing wrong there costs a backup, not a feature.
+        # nested_src is <repo>/patch/truecloud_nested.py, so tools/ is its sibling.
+        # APPEND, never insert(0) -- shadowing the stdlib for this interpreter is a
+        # far worse failure than not finding compat.
+        sys.path.append(
+            os.path.join(os.path.dirname(os.path.dirname(nested_src)), 'tools')
+        )
+        import compat
+        _flavour = compat.async_flavour_tree(mw_dir)
+        if _flavour is None:
+            raise RuntimeError(
+                'cannot tell whether this TrueNAS cloud_backup path is async or '
+                'sync (the wrapped functions disagree, or could not be read)'
+            )
+
+        _snapshot_block = SNAPSHOT_ASYNC if _flavour else SNAPSHOT_SYNC
+        _sync_block     = SYNC_ASYNC     if _flavour else SYNC_SYNC
+        _crud_block     = CRUD_ASYNC     if _flavour else CRUD_SYNC
+
         shutil.copyfile(nested_src, nested_dst)   # 1. traversal implementation
-        patch_file(snapshot_py, SNAPSHOT_BLOCK)   # 2. build the staging tree
-        patch_file(sync_path, SYNC_BLOCK)         # 3. tear it down afterwards
-        patch_file(crud_py, CRUD_BLOCK)           # 4. ONLY NOW allow nested tasks
+        patch_file(snapshot_py, _snapshot_block)  # 2. build the staging tree
+        patch_file(sync_path, _sync_block)        # 3. tear it down afterwards
+        patch_file(crud_py, _crud_block)          # 4. ONLY NOW allow nested tasks
+
+        print('OK: cloud_backup is %s; injected the matching wrappers.'
+              % ('async (TrueNAS <= 25.10)' if _flavour else 'synchronous (TrueNAS 26+)'))
 
         nested_ok = True
         nested_detail = 'nested-dataset snapshots enabled (staging tree)'

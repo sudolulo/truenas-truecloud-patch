@@ -129,14 +129,11 @@ class TestFalseOkWouldBreakBackups:
         }))
         assert is_broken(r[PROVIDERS])
 
-    def test_async_to_sync_is_caught(self):
-        # THE TrueNAS 26 change.
+    def test_a_vanished_symbol_is_broken(self):
         r = check_files(with_(**{
-            "plugins/cloud/snapshot.py":
-                'def create_snapshot(middleware, path, name="x"):\n    return 1, 2\n',
+            "plugins/cloud/snapshot.py": "def something_else():\n    pass\n",
         }))
         assert is_broken(r[NESTED])
-        assert "async def" in r[NESTED]["problems"][0]["detail"]
 
 
 class TestFalseBrokenWouldDisableWorkingBoxes:
@@ -172,8 +169,7 @@ class TestFalseBrokenWouldDisableWorkingBoxes:
         r = check_files(with_(**{
             "plugins/cloud/snapshot.py": Unreadable("HTTP 429"),
             "plugins/cloud_backup/sync.py":
-                "def restic_backup(middleware, job, cloud_backup, dry_run=False, "
-                "rate_limit=None):\n    pass\n",
+                "async def restic_backup(job, middleware, cloud_backup):\n    pass\n",
         }))
         assert is_broken(r[NESTED]), "unknown must not launder away a proven break"
 
@@ -189,7 +185,7 @@ class TestTheNativeVerdict:
         r = check_files(with_(**{
             "plugins/cloud/crud.py":
                 "class CloudTaskServiceMixin:\n"
-                "    def _validate(self, app, verrors, name, data):\n"
+                "    async def _validate(self, verrors, name):\n"
                 "        verrors.add('x', 'no children allowed')\n",
         }))
         assert r[NESTED]["native"]
@@ -231,3 +227,47 @@ class TestUpdateReadmeCannotPublishAGuess:
         with pytest.raises(Unreadable):
             compat.update_readme(rows, path=str(readme))
         assert "old" in readme.read_text(), "a blip must not repaint the matrix"
+
+
+class TestAsyncFlavour:
+    """TrueNAS <= 25.10 is async; 26 is synchronous. Both are supported -- apply.sh
+    injects the wrapper that matches. So asyncness is DETECTED, never assumed."""
+
+    def test_async_middleware_is_detected(self):
+        assert compat.async_flavour(loader(GOOD)) is True
+
+    def test_sync_middleware_is_detected(self):
+        sync = dict(GOOD)
+        sync["plugins/cloud/snapshot.py"] = (
+            'def create_snapshot(middleware, path, name="x"):\n    return "s", "p"\n'
+        )
+        sync["plugins/cloud/crud.py"] = (
+            "class CloudTaskServiceMixin:\n"
+            "    def _validate(self, app, verrors, name, data):\n"
+            "        verrors.add('x', 'no further nesting')\n"
+        )
+        sync["plugins/cloud_backup/sync.py"] = (
+            "def restic_backup(middleware, job, cloud_backup, dry_run=False, "
+            "rate_limit=None):\n    pass\n"
+        )
+        assert compat.async_flavour(loader(sync)) is False
+
+    def test_a_HALF_converted_middleware_is_refused(self):
+        # The dangerous middle. If iX converts create_snapshot but not restic_backup,
+        # there is no single wrapper flavour that works -- and guessing means either
+        # a coroutine unpacked as a tuple, or the event loop blocked. None means
+        # "do not patch"; apply.sh turns that into a skip, not a guess.
+        half = dict(GOOD)
+        half["plugins/cloud/snapshot.py"] = (
+            'def create_snapshot(middleware, path, name="x"):\n    return "s", "p"\n'
+        )
+        assert compat.async_flavour(loader(half)) is None
+
+    def test_an_unreadable_source_refuses_rather_than_guesses(self):
+        broken = dict(GOOD)
+        broken["plugins/cloud_backup/sync.py"] = Unreadable("HTTP 429")
+        assert compat.async_flavour(loader(broken)) is None
+
+    def test_the_real_truenas_versions(self):
+        # Pinning the actual fact this whole port exists for.
+        assert compat.async_flavour(loader(GOOD)) is True

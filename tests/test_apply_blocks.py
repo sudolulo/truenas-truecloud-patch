@@ -14,13 +14,26 @@ import pytest
 
 APPLY_SH = os.path.join(os.path.dirname(__file__), "..", "patch", "apply.sh")
 
+#: Every block that is actually injected into a middlewared module.
+#:
+#: The three nested blocks come in two flavours. TrueNAS <= 25.10 has an ASYNC
+#: cloud_backup path; TrueNAS 26 rewrote it synchronous. apply.sh reads which one is
+#: installed and injects the matching wrapper -- an `async def` on 26 would hand
+#: sync.py a coroutine where it unpacks a tuple, and a plain `def` on 25.10 would
+#: block the event loop. Both flavours must therefore be valid Python, always.
 EXPECTED_BLOCKS = {
     "B2_BLOCK",
     "RESTIC_BLOCK",
-    "SNAPSHOT_BLOCK",
-    "CRUD_BLOCK",
-    "SYNC_BLOCK",
+    "SNAPSHOT_ASYNC",
+    "SNAPSHOT_SYNC",
+    "CRUD_ASYNC",
+    "CRUD_SYNC",
+    "SYNC_ASYNC",
+    "SYNC_SYNC",
 }
+
+NESTED_BLOCKS = ["SNAPSHOT_ASYNC", "SNAPSHOT_SYNC", "CRUD_ASYNC", "CRUD_SYNC",
+                 "SYNC_ASYNC", "SYNC_SYNC"]
 
 
 def heredoc_source():
@@ -32,18 +45,30 @@ def heredoc_source():
 
 
 def extract_blocks():
+    """The blocks as apply.sh actually builds them.
+
+    EVALUATED, not read off as string literals: each nested block is a CORE
+    concatenated with a flavour-specific wrapper, so reading only `ast.Constant`
+    would silently return nothing for them -- a green suite over blocks nobody
+    checked. Assignments that need the runtime (argv, imports) simply fail to
+    evaluate and are skipped.
+    """
     tree = ast.parse(heredoc_source())
-    blocks = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for tgt in node.targets:
-                if (
-                    isinstance(tgt, ast.Name)
-                    and tgt.id.endswith("_BLOCK")
-                    and isinstance(node.value, ast.Constant)
-                    and isinstance(node.value.value, str)
-                ):
-                    blocks[tgt.id] = node.value.value
+    ns, blocks = {}, {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        try:
+            value = eval(  # noqa: S307 - our own shipped source, on purpose
+                compile(ast.Expression(node.value), "<blocks>", "eval"), {}, ns
+            )
+        except Exception:
+            continue
+        for tgt in node.targets:
+            if isinstance(tgt, ast.Name) and isinstance(value, str):
+                ns[tgt.id] = value
+                if tgt.id in EXPECTED_BLOCKS:
+                    blocks[tgt.id] = value
     return blocks
 
 
@@ -98,7 +123,7 @@ def test_injected_block_carries_the_idempotency_marker(name):
     assert extract_blocks()[name].lstrip("\n").startswith("# TRUECLOUD_PATCH")
 
 
-@pytest.mark.parametrize("name", ["SNAPSHOT_BLOCK", "CRUD_BLOCK", "SYNC_BLOCK"])
+@pytest.mark.parametrize("name", NESTED_BLOCKS)
 def test_nested_blocks_degrade_safely_without_the_module(name):
     # If _truecloud_nested failed to install, every nested block must no-op.
     # Critically this includes CRUD_BLOCK: relaxing the guard without the
@@ -119,20 +144,21 @@ class TestSnapshotLeak:
         # On a staging failure, sync.py's `snapshot, local_path = await
         # create_snapshot(...)` never completes, so its local `snapshot` stays
         # None and its finally deletes nothing. We must sweep it ourselves.
-        block = extract_blocks()["SNAPSHOT_BLOCK"]
+        block = extract_blocks()["SNAPSHOT_ASYNC"]
         assert "except Exception:" in block
         assert "delete_snapshot_tree" in block
         assert "raise" in block
 
     def test_sync_block_cleans_up_on_every_path(self):
-        block = extract_blocks()["SYNC_BLOCK"]
+        block = extract_blocks()["SYNC_ASYNC"]
         assert "finally:" in block
         assert "cleanup_task" in block
 
 
 def test_crud_block_is_scoped_to_cloud_backup():
     # cloudsync has no staging teardown wired in, so its guard must stay.
-    assert '!= "cloud_backup"' in extract_blocks()["CRUD_BLOCK"]
+    for name in ("CRUD_ASYNC", "CRUD_SYNC"):
+        assert '!= "cloud_backup"' in extract_blocks()[name]
 
 
 class TestIndependentModules:
@@ -220,7 +246,7 @@ class TestIndependentModules:
         # find the string in our own patch and never detect native support.
         sh = self._sh()
         assert "split('\\n# TRUECLOUD_PATCH', 1)[0]" in sh
-        assert "no further nesting" in extract_blocks()["CRUD_BLOCK"], (
+        assert "no further nesting" in extract_blocks()["CRUD_ASYNC"], (
             "if this ever stops being true, the probe comment is stale"
         )
 
@@ -264,7 +290,7 @@ class TestOptIn:
         # The guard-relaxing crud.py patch must be inside the enabled branch.
         src = heredoc_source()
         gate = src.index("if not nested_needed:")
-        crud = src.index("patch_file(crud_py, CRUD_BLOCK)")
+        crud = src.index("patch_file(crud_py, _crud_block)")
         assert gate < crud, "crud.py patch must sit inside the opt-in branch"
 
     def test_disabling_REVERTS_the_patch_rather_than_merely_skipping_it(self):
@@ -282,7 +308,7 @@ class TestOptIn:
         assert "from mw_patch import patch_file, revert_nested" in src
         gate = src.index("if not nested_needed:")
         revert = src.index("reverted = revert_nested(")
-        patch = src.index("patch_file(crud_py, CRUD_BLOCK)")
+        patch = src.index("patch_file(crud_py, _crud_block)")
         assert gate < revert < patch, "revert belongs in the not-needed branch"
 
     def test_import_failure_skips_the_patch_rather_than_crashing(self):
@@ -302,9 +328,9 @@ def test_guard_is_relaxed_only_after_traversal_is_installed():
     src = heredoc_source()
     order = [
         src.index("shutil.copyfile(nested_src, nested_dst)"),
-        src.index("patch_file(snapshot_py, SNAPSHOT_BLOCK)"),
-        src.index("patch_file(sync_path, SYNC_BLOCK)"),
-        src.index("patch_file(crud_py, CRUD_BLOCK)"),
+        src.index("patch_file(snapshot_py, _snapshot_block)"),
+        src.index("patch_file(sync_path, _sync_block)"),
+        src.index("patch_file(crud_py, _crud_block)"),
     ]
     assert order == sorted(order), "crud.py must be patched last"
 
@@ -324,7 +350,7 @@ class TestWrappersDoNotHardcodeStockArity:
     """
 
     def test_restic_backup_forwards_rather_than_naming_stock_params(self):
-        block = extract_blocks()["SYNC_BLOCK"]
+        block = extract_blocks()["SYNC_ASYNC"]
         assert "async def restic_backup(middleware, job, cloud_backup, *args, **kwargs)" in block
         assert "_tc_orig_restic_backup(middleware, job, cloud_backup, *args, **kwargs)" in block
 

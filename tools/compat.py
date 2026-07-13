@@ -105,19 +105,22 @@ ASSUMPTIONS = [
     ),
 
     # ── nested snapshots. Every block here is an async wrapper. ───────────────
+    # is_async is deliberately NOT asserted on these three. The patch now injects an
+    # async OR a sync wrapper to match whichever the installed middleware declares
+    # (TrueNAS <= 25.10 is async; 26 rewrote them synchronous), so asyncness is a
+    # thing to DETECT, not a thing to require -- see async_flavour(). What must still
+    # hold is the shape: same name, same leading positional parameters.
     Assumption(
         "create-snapshot", NESTED, "plugins/cloud/snapshot.py", "create_snapshot",
-        is_async=True, params=["middleware", "path", "name"],
-        why="SNAPSHOT_BLOCK replaces it with `async def` that AWAITS the original "
-            "and returns (snapshot, staging_root). TrueNAS 26 made it synchronous: "
-            "the wrapper would return a coroutine that sync.py unpacks as a tuple",
+        params=["middleware", "path", "name"],
+        why="SNAPSHOT_BLOCK wraps it and returns (snapshot, staging_root) instead of "
+            "(snapshot, snap_path)",
     ),
     Assumption(
         "crud-mixin-validate", NESTED, "plugins/cloud/crud.py",
         "CloudTaskServiceMixin._validate",
-        kind="method", is_async=True, params=["self", "app", "verrors", "name", "data"],
-        why="CRUD_BLOCK replaces it with `async def` that AWAITS the original, to "
-            "drop the no-further-nesting error",
+        kind="method", params=["self", "app", "verrors", "name", "data"],
+        why="CRUD_BLOCK wraps it to drop the no-further-nesting error",
     ),
     Assumption(
         # SYNC_BLOCK's wrapper is (middleware, job, cloud_backup, *args, **kwargs) and
@@ -125,10 +128,9 @@ ASSUMPTIONS = [
         # 25.04 have `(…, dry_run)`, 25.10 added `rate_limit`. Only the leading three
         # are named by the patch, so only they have to hold.
         "restic-backup", NESTED, "plugins/cloud_backup/sync.py", "restic_backup",
-        is_async=True, forwards=True,
+        forwards=True,
         params=["middleware", "job", "cloud_backup"],
-        why="SYNC_BLOCK replaces it with `async def` that AWAITS the original, to "
-            "tear down bind mounts in a finally",
+        why="SYNC_BLOCK wraps it to tear down bind mounts in a finally",
     ),
 ]
 
@@ -460,6 +462,50 @@ def check(loader, modules=None) -> dict:
     # repair it -- and must not: a module with one unreadable file AND one proven
     # broken assumption is broken, not unknown.
     return out
+
+
+#: The three stock symbols the nested module wraps. TrueNAS <= 25.10 declares them
+#: `async def`; TrueNAS 26 rewrote them synchronous. apply.sh injects the wrapper
+#: that matches, so this is the question it has to answer at every boot.
+NESTED_WRAPPED = [
+    ("plugins/cloud/snapshot.py", "create_snapshot"),
+    ("plugins/cloud/crud.py", "CloudTaskServiceMixin._validate"),
+    ("plugins/cloud_backup/sync.py", "restic_backup"),
+]
+
+
+def async_flavour(loader) -> bool | None:
+    """Is the installed cloud_backup path async? True, False, or None if unclear.
+
+    None means "do not patch": either a symbol is missing, or -- the case worth
+    naming -- the three DISAGREE. A middleware caught half-converted is one this
+    patch has never seen, and guessing a flavour there means injecting an `async def`
+    that a synchronous caller unpacks as a tuple. Declining costs a feature; guessing
+    costs a backup.
+    """
+    flavours = set()
+    for path, symbol in NESTED_WRAPPED:
+        try:
+            src = loader(path)
+        except Unreadable:
+            return None
+        if src is None:
+            return None
+        try:
+            tree = ast.parse(_stock(src))
+        except SyntaxError:
+            return None
+
+        node = _find(tree, symbol)
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            return None
+        flavours.add(isinstance(node, ast.AsyncFunctionDef))
+
+    return flavours.pop() if len(flavours) == 1 else None
+
+
+def async_flavour_tree(root: str) -> bool | None:
+    return async_flavour(lambda p: _read(root, p))
 
 
 def check_ref(ref: str, modules=None) -> dict:

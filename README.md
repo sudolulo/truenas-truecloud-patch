@@ -6,8 +6,8 @@
 > 24.10**. There is nothing here to install on an older release, and `install.sh`
 > will refuse.
 >
-> Verified on **24.10**, **25.04** and **25.10**. Not yet compatible with the
-> unreleased **26.0** (see [TrueNAS compatibility](#truenas-compatibility)).
+> Verified on **24.10**, **25.04**, **25.10**, and the unreleased **26.0 beta**
+> (see [TrueNAS compatibility](#truenas-compatibility)).
 
 Extends TrueNAS SCALE's **TrueCloud Backup** feature to:
 
@@ -44,7 +44,7 @@ costs a fraction of the new Storj price.
 | 24.10.2.4 | ok | ok | — |
 | 25.04.2.6 | ok | ok | — |
 | 25.10.4 | ok | ok | nested + providers; 252-snapshot recursive backup of /mnt/Tap, 18m |
-| 26.0.0-BETA.3 _(unreleased)_ | ok | **BROKEN** | — |
+| 26.0.0-BETA.3 _(unreleased)_ | ok | ok | — |
 | master _(unreleased)_ | **BROKEN** | **BROKEN** | — |
 
 | verdict | meaning |
@@ -62,17 +62,31 @@ The table above is **regenerated daily by CI** — it is not a claim somebody ty
 once and forgot. **TrueCloud Backup does not exist before 24.10**, so earlier
 versions are absent rather than "unsupported".
 
-### ⚠️ TrueNAS 26 breaks nested snapshots (not yet released)
+### TrueNAS 26 — supported, and this is how we knew in advance
 
 TrueNAS 26 rewrites the whole `cloud_backup` path **from async to synchronous**.
-Every block the nested module injects is an `async def` wrapping an `await`ed
-original, so on 26 it would hand `sync.py` a coroutine where it unpacks a tuple.
+Every block the nested module injected was an `async def` wrapping an `await`ed
+original, so on 26 it would have handed `sync.py` a coroutine where it unpacks a
+tuple, and 26 also **deleted `get_dataset_recursive()`**, which one of those blocks
+called. Both are backup-breaking, and neither would have surfaced until a restore
+failed.
 
-You do not need to do anything. `apply.sh` checks these assumptions against the
-middleware **actually installed on your box** at every boot, and will not apply a
-module that no longer fits. On TrueNAS 26 the nested module simply stays off:
-backups keep running, without nested-dataset coverage. A broken backup is worse
-than a missing feature.
+The daily compatibility check found both **while 26 was still in beta**, and filed
+the bug report itself. The patch now reads which flavour of `cloud_backup` your box
+has and injects the wrapper that matches — one implementation of the actual logic,
+two thin wrappers — and carries its own copy of the deleted helper.
+
+**If a future TrueNAS breaks it anyway, nothing bad happens quietly.** `apply.sh`
+re-checks these assumptions against the middleware *actually installed on your box*
+at every boot and will not apply a module that no longer fits: TrueNAS is left
+stock, backups keep running without that module's feature, and the reason is named
+in `apply.log`. A broken backup is worse than a missing feature.
+
+`master` (the development branch after 26) currently reports **BROKEN**: iXsystems
+are still reshaping these functions there — renaming `middleware` to `context`,
+`cloud_backup` to `entry`, adding a required `credentials` parameter. That is a
+moving target and is deliberately not chased; the check will keep reporting it until
+it settles into a beta, which is exactly when it becomes worth fixing.
 
 ### How this is kept honest
 

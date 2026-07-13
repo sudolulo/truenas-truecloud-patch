@@ -362,10 +362,69 @@ def teardown(staging_root, runner=_run, mounts_file="/proc/self/mounts"):
     return errors
 
 
-# ── async orchestration (middleware is duck-typed; no middlewared import) ─────
+# ── orchestration (middleware is duck-typed; no middlewared import) ───────────
+#
+# These are SYNCHRONOUS and talk to middlewared via `middleware.call_sync`, which
+# is safe from a worker thread and deadlocks on the event loop. That is the whole
+# reason this file has one implementation instead of two:
+#
+#   TrueNAS <= 25.10  cloud_backup is async. The injected wrapper is `async def` and
+#                     hands these to `await middleware.run_in_thread(...)`, which is
+#                     exactly the thread `call_sync` needs.
+#   TrueNAS >= 26     cloud_backup is synchronous and already runs in middlewared's
+#                     thread pool (its own code calls `call_sync`). The injected
+#                     wrapper calls these directly.
+#
+# So the async/sync difference lives entirely in the three injected blocks, and the
+# logic below -- the part with the snapshots, the bind mounts and the failure modes
+# -- is written once. Duplicating it as an async twin would mean every future fix
+# had to be made twice, and the one that got missed would be the one that eats a
+# backup.
 
 
-async def delete_snapshot_tree(middleware, snapshot, logger=None):
+def get_dataset_recursive(datasets, directory):
+    """The dataset containing `directory`, and whether anything is nested under it.
+
+    Vendored from middlewared's own plugins/cloud/snapshot.py (TrueNAS <= 25.10),
+    because TrueNAS 26 DELETED it -- create_snapshot there uses filesystem.statfs
+    instead. The injected block used to call it out of the host module's namespace,
+    which on 26 is a straight NameError.
+
+    Carrying our own copy removes the dependency on both versions rather than adding
+    an assumption about it. It is ~10 lines of pure list arithmetic over data we
+    already have in hand, and it has no reason to change.
+
+    Returns (dataset, has_children):
+      dataset      -- the DEEPEST dataset whose mountpoint is a prefix of `directory`
+      has_children -- whether any OTHER dataset is mounted beneath `directory`
+    """
+    datasets = [
+        dict(dataset, prefixlen=len(
+            os.path.dirname(os.path.commonprefix(
+                [dataset["properties"]["mountpoint"]["value"] + "/", directory + "/"]))
+        ))
+        for dataset in datasets
+        if dataset["properties"]["mountpoint"]["value"] != "none"
+    ]
+
+    dataset = sorted(
+        [
+            dataset
+            for dataset in datasets
+            if (directory + "/").startswith(dataset["properties"]["mountpoint"]["value"] + "/")
+        ],
+        key=lambda dataset: dataset["prefixlen"],
+        reverse=True,
+    )[0]
+
+    return dataset, any(
+        (ds["properties"]["mountpoint"]["value"] + "/").startswith(directory + "/")
+        for ds in datasets
+        if ds != dataset
+    )
+
+
+def delete_snapshot_tree(middleware, snapshot, logger=None):
     """Delete the parent snapshot AND every child created by ``zfs snapshot -r``.
 
     ``zfs.snapshot.delete`` is non-recursive by default and stock calls it with
@@ -381,7 +440,7 @@ async def delete_snapshot_tree(middleware, snapshot, logger=None):
     # through 252 sequential deletes leaves exactly the orphans this function
     # exists to prevent.
     try:
-        await middleware.call("zfs.snapshot.delete", snapshot, {"recursive": True})
+        middleware.call_sync("zfs.snapshot.delete", snapshot, {"recursive": True})
         return
     except Exception as e:  # noqa: BLE001 - fall through to the explicit sweep
         # Usually just "parent already gone" (stock's finally won the race once our
@@ -398,7 +457,7 @@ async def delete_snapshot_tree(middleware, snapshot, logger=None):
     # our mounts are released -- which fails the recursive delete while the
     # children survive. Sweep them by name.
     try:
-        snaps = await middleware.call(
+        snaps = middleware.call_sync(
             "zfs.snapshot.query", [["name", "^", dataset]], {"select": ["name"]}
         )
         # An empty result means the tree is already gone -- delete nothing, and
@@ -415,7 +474,7 @@ async def delete_snapshot_tree(middleware, snapshot, logger=None):
 
     for name in names:
         try:
-            await middleware.call("zfs.snapshot.delete", name)
+            middleware.call_sync("zfs.snapshot.delete", name)
         except Exception as e:  # noqa: BLE001 - already gone is fine
             if logger:
                 logger.warning(
@@ -423,8 +482,8 @@ async def delete_snapshot_tree(middleware, snapshot, logger=None):
                 )
 
 
-async def stage_nested(middleware, path, snapshot, base_dataset, base_mountpoint,
-                       task_name, datasets, logger=None):
+def stage_nested(middleware, path, snapshot, base_dataset, base_mountpoint,
+                 task_name, datasets, logger=None):
     """Build a complete staging tree for `path` from the already-taken `snapshot`.
 
     `snapshot` is a full ZFS snapshot name ("Tap@cloud_backup-5-2026...").
@@ -447,30 +506,30 @@ async def stage_nested(middleware, path, snapshot, base_dataset, base_mountpoint
     staging_root = staging_root_for(task_name)
 
     # A previous run may have crashed mid-flight; never build on top of that.
-    await middleware.run_in_thread(teardown, staging_root)
+    teardown(staging_root)
 
     # ...and if it left a sidecar behind, that snapshot tree is still on disk and
     # nothing else will ever reclaim it. Sweep it before we overwrite the record,
     # or a single crashed run orphans 160+ snapshots permanently.
-    stale = await middleware.run_in_thread(_read_sidecar, staging_root)
+    stale = _read_sidecar(staging_root)
     if stale and stale != snapshot:
         if logger:
             logger.warning(
                 "truecloud-patch: reclaiming snapshot tree from an earlier "
                 "interrupted run: %s", stale,
             )
-        await delete_snapshot_tree(middleware, stale, logger=logger)
+        delete_snapshot_tree(middleware, stale, logger=logger)
 
     # Record the snapshot BEFORE mounting anything, not after. middlewared can
     # die at any point (this patch even schedules a restart at boot), and the
     # sidecar is the only thing that survives it -- an in-process dict would take
     # the sole record of a 160-snapshot tree with it. Writing it after apply_plan
     # would leave exactly the crash window the sidecar exists to close.
-    await middleware.run_in_thread(_write_sidecar, staging_root, snapshot)
+    _write_sidecar(staging_root, snapshot)
 
     try:
-        mounts, skipped = await middleware.run_in_thread(
-            plan_staging, base_dataset, base_mountpoint, path, snapshot_name,
+        mounts, skipped = plan_staging(
+            base_dataset, base_mountpoint, path, snapshot_name,
             datasets, staging_root,
         )
         if logger:
@@ -479,11 +538,11 @@ async def stage_nested(middleware, path, snapshot, base_dataset, base_mountpoint
                     "truecloud-patch: not staging dataset %r: %s", name, reason
                 )
 
-        await middleware.run_in_thread(apply_plan, mounts)
-        await middleware.run_in_thread(verify_staged, mounts)
+        apply_plan(mounts)
+        verify_staged(mounts)
     except Exception:
-        await middleware.run_in_thread(teardown, staging_root)
-        await middleware.run_in_thread(_remove_sidecar, staging_root)
+        teardown(staging_root)
+        _remove_sidecar(staging_root)
         raise
 
     if logger:
@@ -494,7 +553,7 @@ async def stage_nested(middleware, path, snapshot, base_dataset, base_mountpoint
     return staging_root
 
 
-async def cleanup_task(middleware, task_name, logger=None):
+def cleanup_task(middleware, task_name, logger=None):
     """Tear down a task's staging tree and delete the snapshot it pinned.
 
     Safe to call unconditionally: a no-op when the task was never staged.
@@ -505,13 +564,13 @@ async def cleanup_task(middleware, task_name, logger=None):
     if snapshot is None and not os.path.isdir(staging_root):
         return  # never staged; nothing to do
 
-    errors = await middleware.run_in_thread(teardown, staging_root)
+    errors = teardown(staging_root)
     if errors and logger:
         for err in errors:
             logger.warning("truecloud-patch: staging teardown: %s", err)
 
     if snapshot is not None:
-        await delete_snapshot_tree(middleware, snapshot, logger=logger)
+        delete_snapshot_tree(middleware, snapshot, logger=logger)
 
     _remove_sidecar(staging_root)
 

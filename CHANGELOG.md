@@ -57,11 +57,30 @@ worse than no alert, because one day it carries a security fix.
   appeared somewhere in the signature, so it happily passed a call that could never
   work.
 
-- **TrueNAS 26 rewrites the entire `cloud_backup` path from async to synchronous.**
-  Every block the nested module injects is an `async def` wrapping an `await`ed
-  original, so on 26 it would hand `sync.py` a coroutine where it unpacks a tuple —
-  a broken backup, discovered at restore time. On TrueNAS 26 the nested module now
-  stays off rather than applying and breaking.
+### Added
+
+- **TrueNAS 26 support.** 26 rewrites the entire `cloud_backup` path from async to
+  **synchronous**, and separately **deletes `get_dataset_recursive()`** — which one
+  of the injected blocks called out of the host module's namespace. Either one is a
+  broken backup found at restore time: an `async def` wrapper hands `sync.py` a
+  coroutine where it unpacks a tuple, and the vanished helper is a straight
+  `NameError`.
+
+  The nested module is now **one synchronous implementation** (talking to middlewared
+  through `call_sync`) behind **two thin wrappers**. `apply.sh` reads which flavour
+  the installed middleware declares and injects the matching one: TrueNAS ≤ 25.10
+  reaches it via `await middleware.run_in_thread(...)`, and TrueNAS 26 — already in a
+  worker thread — calls it directly. The logic that owns the snapshots, the bind
+  mounts and the failure modes exists **once**; an async twin would mean every future
+  fix had to land twice, and the one that got missed would be the one that eats a
+  backup.
+
+  A middleware whose three wrapped functions **disagree** about async-ness is refused
+  outright rather than guessed at. And `get_dataset_recursive` is now carried as our
+  own copy — removing the dependency on both versions instead of asserting it.
+
+  Both breaks were found by the daily compatibility check **while 26 was still in
+  beta**, which is the entire point of it.
 
 - **An incompatible TrueNAS no longer sets the permanent kill switch.** `apply.sh`
   reused a "nothing left to do" exit that touches `disabled`, which suppresses
