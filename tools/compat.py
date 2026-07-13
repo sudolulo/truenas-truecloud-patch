@@ -133,7 +133,41 @@ ASSUMPTIONS = [
         params=["middleware", "job", "cloud_backup"],
         why="SYNC_BLOCK wraps it to tear down bind mounts in a finally",
     ),
+    Assumption(
+        # Not a plugin method -- a method on the middleware OBJECT itself, which the
+        # manifest had no way to express and therefore never checked.
+        #
+        # The nested module calls `middleware.get_service(<ns>)` to decide whether to
+        # sweep snapshots through `pool.snapshot` or `zfs.snapshot` (see
+        # SNAPSHOT_SERVICES). If it ever disappears, `_can_delete()` catches the
+        # AttributeError, reports BOTH namespaces unusable, and every nested backup
+        # fails -- loudly, but only at RUN time, on a box the preflight had already
+        # declared healthy. Checking it costs one file read.
+        "get-service", NESTED, "utils/plugins.py",
+        "LoadPluginsMixin.get_service", kind="method",
+        params=["self", "name"],
+        why="snapshot_service() resolves the snapshot namespace through it; without "
+            "it the module cannot sweep the snapshot it just took",
+    ),
 ]
+
+
+def accepted_spellings(name):
+    """The method names that satisfy a call to `<namespace>.<name>`.
+
+    A CRUDService exposes `create`/`update`/`delete` from methods NAMED
+    `do_create`/`do_update`/`do_delete`. Both are live across the matrix: 24.10 and
+    25.04 declare `do_delete`, 25.10 renamed it to `delete`, and all of them answer
+    to `<ns>.delete`. Accepting only the literal name reported working releases as
+    BROKEN and would have switched nested snapshots off on boxes where they work.
+    """
+    return (name, f"do_{name}")
+
+
+#: The spellings that satisfy `<ns>.delete`. A test binds this to the runtime's
+#: `truecloud_nested.DELETE_METHODS`, so the checker and the patch cannot come to
+#: disagree about what "can delete" means on the same box.
+DELETE_NAMES = accepted_spellings("delete")
 
 
 class MiddlewareCall:
@@ -195,14 +229,6 @@ class MiddlewareCall:
     def name_of(method):
         return method.rsplit(".", 1)[1]
 
-    @property
-    def namespace(self):
-        return self.namespace_of(self.method)
-
-    @property
-    def name(self):
-        return self.name_of(self.method)
-
 
 #: Every middlewared method the nested module calls at runtime.
 #: The middleware methods the nested module CALLS.
@@ -220,9 +246,8 @@ class MiddlewareCall:
 #:     cannot be deleted from under us the way `zfs.*` just was.
 #:   * The same methods, in the same files, exist on 24.10 through 26. One code
 #:     path, no version conditionals.
-#:   * `pool.snapshot.delete` takes `recursive`, which the private call did not.
-#:     The old sweep had to enumerate ~250 snapshots and delete them one at a
-#:     time, and any it missed leaked forever.
+#:   * Both spellings take `recursive`, so ONE call sweeps the whole tree instead
+#:     of ~250 individual deletes, any of which could be missed.
 MIDDLEWARE_CALLS = [
     MiddlewareCall(
         "call-snapshot-delete", NESTED, "pool.snapshot.delete",
@@ -303,7 +328,7 @@ def check_call(c: MiddlewareCall, src: str | None,
         n.name for n in ast.walk(tree)
         if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
     }
-    if name not in defined and f"do_{name}" not in defined:
+    if not any(sp in defined for sp in accepted_spellings(name)):
         return "broken", f"{path} no longer defines `{method}`"
 
     return "ok", None

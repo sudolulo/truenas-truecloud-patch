@@ -57,6 +57,13 @@ GOOD = {
     #
     # This default tree is a MODERN box (25.10/26): it has pool.snapshot and no
     # zfs.snapshot. The older shape is built explicitly where it is tested.
+    # Not a plugin: a method on the middleware OBJECT. `snapshot_service()` resolves
+    # the snapshot namespace through it, so if it vanishes the module cannot sweep the
+    # snapshot it just took.
+    "utils/plugins.py": (
+        "class LoadPluginsMixin:\n"
+        "    def get_service(self, name):\n        pass\n"
+    ),
     "plugins/pool_/dataset.py": (
         "class PoolDatasetService(CRUDService):\n"
         "    class Config:\n"

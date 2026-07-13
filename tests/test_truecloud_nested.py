@@ -19,6 +19,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "patch"))
 
+import truecloud_nested as tn  # noqa: E402
 from truecloud_nested import (  # noqa: E402
     StagingError,
     apply_plan,
@@ -33,6 +34,41 @@ from truecloud_nested import (  # noqa: E402
     teardown,
     verify_staged,
 )
+
+
+@pytest.fixture(autouse=True)
+def never_touch_the_real_system(monkeypatch):
+    """A unit test must never shell out to the real box. This makes it impossible.
+
+    Five tests silently did. `gc_stale_snapshots`'s DEFAULT lister runs
+    `zfs list -t snapshot -r Tap` -- and on the NAS, `Tap` is the real pool, with
+    2148 snapshots and a genuine leaked `cloud_backup-5` snapshot in it. Those tests
+    passed on the dev box only because it has no `zfs` binary (FileNotFoundError,
+    swallowed by a broad except), and would have gone RED on the one machine the
+    release process requires them green on -- for reasons having nothing to do with
+    the code. The same code path calls `umount`.
+
+    Tests that need a system command inject one (`runner=` / `list_snapshots=`).
+
+    It RECORDS and asserts at teardown rather than raising, because raising would be
+    swallowed: `gc_stale_snapshots` catches broad `Exception` around its enumeration
+    (deliberately — it must fail toward collecting nothing). That swallow is exactly
+    what let five tests shell out unnoticed, so the check must survive it.
+    """
+    attempted = []
+
+    def forbidden(cmd):
+        attempted.append(cmd)
+        raise AssertionError(f"real system command in a unit test: {cmd!r}")
+
+    monkeypatch.setattr(tn, "_run", forbidden)
+    yield
+    assert not attempted, (
+        "this test ran real system commands: "
+        + "; ".join(repr(c) for c in attempted)
+        + ". Inject a fake (runner= / list_snapshots=) -- on the NAS these hit the "
+        "REAL pool, and the suite must not depend on the machine it runs on."
+    )
 
 SNAP = "cloud_backup-5-20260712030000"
 ROOT = "/run/truecloud-nested/cloud_backup-5"
@@ -197,6 +233,22 @@ class TestSnapshotTreeNames:
         assert snapshot_tree_names("Tap", self.ALL) == []
 
 
+class _FakeSnapshotService:
+    """What `middleware.get_service("<ns>")` hands back.
+
+    It carries a `delete` (or `do_delete`) attribute and nothing else, because that
+    is the ONLY thing the runtime inspects: `snapshot_service()` asks "can this
+    namespace delete for me?", not "is this namespace registered?". A service object
+    with no delete must be REFUSED — iX has already gutted a method while keeping its
+    service (`pool.snapshot.do_update` on master), and settling for the weaker
+    question is how the runtime and `tools/compat.py` would come to disagree.
+    """
+
+    def __init__(self, delete_method):
+        if delete_method:
+            setattr(self, delete_method, lambda *a, **kw: None)
+
+
 class FakeMiddleware:
     """middlewared as this module actually uses it: `call_sync`, from a thread.
 
@@ -217,16 +269,22 @@ class FakeMiddleware:
     snapshots on somebody's NAS.
     """
 
-    def __init__(self, snapshots=None, snapshot_ns="pool.snapshot"):
+    def __init__(self, snapshots=None, snapshot_ns="pool.snapshot",
+                 delete_method="delete"):
         self.snapshots = list(snapshots or [])
         self.calls = []
         self.logger = None
         self.snapshot_ns = snapshot_ns
+        #: A CRUDService exposes `delete` from a method NAMED `do_delete`. Both
+        #: spellings are live across the matrix, and the runtime must accept either
+        #: -- it resolves the namespace by asking whether it can DELETE, not merely
+        #: whether the service is registered.
+        self.delete_method = delete_method
 
     def get_service(self, name):
         if name != self.snapshot_ns:
             raise KeyError(name)      # middleware raises KeyError for an unknown ns
-        return object()
+        return _FakeSnapshotService(self.delete_method)
 
     def list_snapshots(self, dataset):
         """Stands in for `zfs list -t snapshot -r <dataset>`.
@@ -312,27 +370,37 @@ class TestDeleteSnapshotTree:
         # 252 sequential deletes are slow AND not atomic: a run killed part-way
         # through leaves exactly the orphans this function exists to prevent.
         mw = FakeMiddleware(["Tap@snap", "Tap/apps@snap", "Tap/apps/lidarr@snap"])
-        delete_snapshot_tree(mw, "Tap@snap", list_snapshots=mw.list_snapshots)
+        listed = []
+
+        def counting_lister(dataset):
+            listed.append(dataset)
+            return mw.list_snapshots(dataset)
+
+        delete_snapshot_tree(mw, "Tap@snap", list_snapshots=counting_lister)
         assert mw.snapshots == []
         deletes = [a for m, a in mw.calls if m.endswith(".delete")]
         assert len(deletes) == 1, "should be ONE recursive call, not one per snapshot"
         assert deletes[0][1] == {"recursive": True}
-        assert not [m for m, _a in mw.calls if m.endswith(".query")], (
-            "no enumeration needed on the fast path"
+        assert listed == [], (
+            "the fast path enumerated. On the real pool that is a `zfs list` over 2148 "
+            "snapshots on every clean run, for nothing."
         )
 
-    def test_survives_recursive_and_query_failure_by_deleting_the_parent(self):
-        class Broken(FakeMiddleware):
+    def test_survives_recursive_and_enumeration_failure_by_deleting_the_parent(self):
+        # Both the recursive delete AND the ZFS enumeration fail. The sweep must still
+        # remove the parent rather than give up entirely.
+        class NoRecursive(FakeMiddleware):
             def call_sync(self, method, *args):
-                if method.endswith(".query"):
-                    raise RuntimeError("boom")
                 if method.endswith(".delete") and len(args) > 1:
                     raise RuntimeError("recursive delete unavailable")
                 return super().call_sync(method, *args)
 
-        mw = Broken(["Tap@snap"])
-        delete_snapshot_tree(mw, "Tap@snap", list_snapshots=mw.list_snapshots)
-        assert mw.snapshots == []
+        def broken_lister(_dataset):
+            raise tn.ZfsError("boom")
+
+        mw = NoRecursive(["Tap@snap"])
+        delete_snapshot_tree(mw, "Tap@snap", list_snapshots=broken_lister)
+        assert mw.snapshots == [], "must fall back to at least deleting the parent"
 
     def test_leaves_unrelated_snapshots_alone_when_the_tree_is_gone(self):
         mw = FakeMiddleware(["Tap@unrelated"])
@@ -352,9 +420,10 @@ class TestStageNestedOrdering:
         stub_core(monkeypatch, tn, order=order,
                   plan=([("/src", str(tmp_path / "cloud_backup-5"))], []))
 
+        _mw = FakeMiddleware()
         tn.stage_nested(
-            FakeMiddleware(), "/mnt/Tap", "Tap@snap", "Tap", "/mnt/Tap",
-            "cloud_backup-5", DATASETS,
+            _mw, "/mnt/Tap", "Tap@snap", "Tap", "/mnt/Tap",
+            "cloud_backup-5", DATASETS, list_snapshots=_mw.list_snapshots,
         )
 
         assert order.index("_write_sidecar") < order.index("apply_plan")
@@ -377,7 +446,7 @@ class TestStageNestedOrdering:
 
         tn.stage_nested(
             mw, "/mnt/Tap", "Tap@new", "Tap", "/mnt/Tap",
-            "cloud_backup-5", DATASETS,
+            "cloud_backup-5", DATASETS, list_snapshots=mw.list_snapshots,
         )
 
         assert mw.snapshots == [], "the crashed run's snapshot tree must be reclaimed"
@@ -397,9 +466,10 @@ class TestStageNestedOrdering:
         stub_core(monkeypatch, tn, plan_raises=StagingError("boom"))
 
         with pytest.raises(StagingError):
+            _mw = FakeMiddleware()
             tn.stage_nested(
-                FakeMiddleware(), "/mnt/Tap", "Tap@snap", "Tap", "/mnt/Tap",
-                "cloud_backup-5", DATASETS,
+                _mw, "/mnt/Tap", "Tap@snap", "Tap", "/mnt/Tap",
+                "cloud_backup-5", DATASETS, list_snapshots=_mw.list_snapshots,
             )
 
         assert os.path.exists(sidecar_for(root)), (
@@ -426,7 +496,7 @@ class TestCleanupTask:
         mw = FakeMiddleware(["Tap@snap", "Tap/apps@snap"])
         monkeypatch.setattr(tn, "teardown", lambda *_a, **_k: [])
 
-        cleanup_task(mw, "cloud_backup-5")
+        cleanup_task(mw, "cloud_backup-5", list_snapshots=mw.list_snapshots)
 
         assert mw.snapshots == []
         assert not os.path.exists(sidecar_for(root))
@@ -436,7 +506,7 @@ class TestCleanupTask:
 
         monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path / "nope"))
         mw = FakeMiddleware(["Tap@snap"])
-        cleanup_task(mw, "cloud_backup-5")
+        cleanup_task(mw, "cloud_backup-5", list_snapshots=mw.list_snapshots)
         assert mw.calls == []
         assert mw.snapshots == ["Tap@snap"]
 
@@ -798,9 +868,9 @@ class TestSidecarSurvivesAnIncompleteSweep:
         mw = BusyMiddleware(["Tap@snap", "Tap/apps/prometheus@snap"],
                             busy=["Tap/apps/prometheus@snap"], busy_for=99)
         monkeypatch.setattr(tn, "delete_snapshot_tree",
-                            lambda m, s, logger=None: ["Tap/apps/prometheus@snap"])
+                            lambda m, s, logger=None, **kw: ["Tap/apps/prometheus@snap"])
 
-        tn.cleanup_task(mw, "cloud_backup-5")
+        tn.cleanup_task(mw, "cloud_backup-5", list_snapshots=mw.list_snapshots)
         assert os.path.exists(sidecar_for(root)), (
             "sidecar removed despite survivors — they are now orphaned forever"
         )
@@ -814,8 +884,9 @@ class TestSidecarSurvivesAnIncompleteSweep:
         with open(sidecar_for(root), "w", encoding="utf-8") as fh:
             fh.write("Tap@snap")
 
-        monkeypatch.setattr(tn, "delete_snapshot_tree", lambda m, s, logger=None: [])
-        tn.cleanup_task(FakeMiddleware(), "cloud_backup-5")
+        monkeypatch.setattr(tn, "delete_snapshot_tree", lambda m, s, logger=None, **kw: [])
+        _mw = FakeMiddleware()
+        tn.cleanup_task(_mw, "cloud_backup-5", list_snapshots=_mw.list_snapshots)
         assert not os.path.exists(sidecar_for(root))
 
 
@@ -862,12 +933,14 @@ class TestTheSidecarCarriesEveryPendingTree:
         # The reclaim of Tap@old leaves one snapshot behind (still busy).
         monkeypatch.setattr(
             tn, "delete_snapshot_tree",
-            lambda m, s, logger=None: ["Tap/apps/x@old"] if s == "Tap@old" else [],
+            lambda m, s, logger=None, **kw: ["Tap/apps/x@old"] if s == "Tap@old" else [],
         )
         stub_core(monkeypatch, tn, plan=([("/src", root)], []))
 
-        tn.stage_nested(FakeMiddleware(), "/mnt/Tap", "Tap@new", "Tap", "/mnt/Tap",
-                        "cloud_backup-5", DATASETS)
+        _mw = FakeMiddleware()
+        tn.stage_nested(_mw, "/mnt/Tap", "Tap@new", "Tap", "/mnt/Tap",
+                        "cloud_backup-5", DATASETS,
+                        list_snapshots=_mw.list_snapshots)
 
         recorded = tn._read_sidecar(root)
         assert "Tap/apps/x@old" in recorded, (
@@ -887,12 +960,13 @@ class TestTheSidecarCarriesEveryPendingTree:
 
         swept = []
 
-        def fake_delete(m, s, logger=None):
+        def fake_delete(m, s, logger=None, **kw):
             swept.append(s)
             return ["Tap/apps/x@new"] if s == "Tap@new" else []
 
         monkeypatch.setattr(tn, "delete_snapshot_tree", fake_delete)
-        tn.cleanup_task(FakeMiddleware(), "cloud_backup-5")
+        _mw = FakeMiddleware()
+        tn.cleanup_task(_mw, "cloud_backup-5", list_snapshots=_mw.list_snapshots)
 
         assert swept == ["Tap@old", "Tap@new"], "both pending trees must be swept"
         # Only the SURVIVOR is written back -- re-recording Tap@old would make every
@@ -906,9 +980,10 @@ class TestTheSidecarCarriesEveryPendingTree:
         root = tn.staging_root_for("cloud_backup-5")
         os.makedirs(root, exist_ok=True)
         tn._write_sidecar(root, ["Tap@a", "Tap@b"])
-        monkeypatch.setattr(tn, "delete_snapshot_tree", lambda m, s, logger=None: [])
+        monkeypatch.setattr(tn, "delete_snapshot_tree", lambda m, s, logger=None, **kw: [])
 
-        tn.cleanup_task(FakeMiddleware(), "cloud_backup-5")
+        _mw = FakeMiddleware()
+        tn.cleanup_task(_mw, "cloud_backup-5", list_snapshots=_mw.list_snapshots)
         assert not os.path.exists(sidecar_for(root))
 
     def test_cleanup_all_reports_each_pending_snapshot_on_its_own_line(self, tmp_path):
@@ -1073,18 +1148,23 @@ class TestGarbageCollectorExecution:
         mounts = tmp_path / "mounts"
         mounts.write_text("")
 
-        class Broken(FakeMiddleware):
-            def call_sync(self, method, *args):
-                if method.endswith(".query"):
-                    raise RuntimeError("middleware is having a day")
-                return super().call_sync(method, *args)
+        # The ENUMERATION fails -- which is now a `zfs list` that cannot run, not a
+        # middleware query. (This test used to fake a failure of `.query`, a call
+        # production no longer makes, so it passed no matter what the code did.)
+        def broken_lister(_dataset):
+            raise tn.ZfsError("cannot open 'Tap': pool I/O is currently suspended")
 
+        mw = FakeMiddleware(["Tap/apps/x@cloud_backup-5-20260713030000"])
         assert tn.gc_stale_snapshots(
-            Broken(["Tap/apps/x@cloud_backup-5-20260713030000"]),
+            mw,
             "cloud_backup-5", "Tap@cloud_backup-5-20260714115900",
             now=dt.datetime(2026, 7, 14, 12, 0, 0, tzinfo=dt.UTC),
             mounts_file=str(mounts),
+            list_snapshots=broken_lister,
         ) == []
+        assert mw.snapshots, (
+            "cannot enumerate => cannot know what is ours => must delete NOTHING"
+        )
 
 
 class TestEnumerationComesFromZfsNotMiddleware:
@@ -1177,4 +1257,225 @@ class TestEnumerationComesFromZfsNotMiddleware:
         assert "scratch/ix-apps@s" in names, (
             "pool.snapshot.query hides this; a sweep that cannot see it orphans it "
             "on every single run, forever"
+        )
+
+
+class TestTheProductionWiringIsWhatWeThinkItIs:
+    """Tests of a seam prove nothing if production stops using the seam.
+
+    An audit mutation-tested this suite and found two regressions that reinstate the
+    exact bug this module exists to prevent, while all 293 tests still passed:
+
+      * swap `delete_snapshot_tree`/`gc_stale_snapshots`'s DEFAULT enumerator for one
+        that returns [] (which is what middleware's filtered query does for the 84
+        hidden datasets) -- green, because every test injected its own.
+      * put `pool.dataset.query` back into apply.sh's injected block -- green, because
+        nothing asserted what that block enumerates with.
+
+    Both are pinned here. These tests are about the WIRING, not the logic.
+    """
+
+    def test_the_default_snapshot_enumerator_is_the_ZFS_one(self, monkeypatch, tmp_path):
+        # Called with no `list_snapshots=`, exactly as production calls it.
+        called = []
+        monkeypatch.setattr(tn, "list_snapshot_names",
+                            lambda ds, **kw: called.append(ds) or [])
+
+        mw = FakeMiddleware(["Tap@snap"])
+
+        class NoRecursive(FakeMiddleware):
+            def call_sync(self, method, *args):
+                if method.endswith(".delete") and len(args) > 1:
+                    raise RuntimeError("recursive delete unavailable")
+                return super().call_sync(method, *args)
+
+        tn.delete_snapshot_tree(NoRecursive(["Tap@snap"]), "Tap@snap")
+        assert called == ["Tap"], (
+            "delete_snapshot_tree's fallback sweep must enumerate from ZFS by default. "
+            "If it defaults to a middleware query, it cannot see the internal datasets "
+            "and orphans one snapshot per hidden dataset on every run."
+        )
+
+        called.clear()
+        mounts = tmp_path / "mounts"
+        mounts.write_text("")
+        monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
+        tn.gc_stale_snapshots(mw, "cloud_backup-5", "Tap@cloud_backup-5-2026",
+                              mounts_file=str(mounts))
+        assert called == ["Tap"], "the GC must enumerate from ZFS by default too"
+
+    def test_the_injected_block_enumerates_from_ZFS_not_middleware(self):
+        # apply.sh is a shell file holding the Python that gets injected into
+        # middlewared. Assert on what that block actually says.
+        with open(os.path.join(os.path.dirname(__file__), "..", "patch", "apply.sh"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+
+        assert "_tc_nested.query_filesystems(" in src, (
+            "the staging plan must be built from query_filesystems() (which reads ZFS)"
+        )
+        for filtered in ("pool.dataset.query", "pool.snapshot.query",
+                         "zfs.dataset.query", "zfs.snapshot.query"):
+            assert f'"{filtered}"' not in src, (
+                f"apply.sh calls {filtered}. Middleware's queries apply a visibility "
+                f"policy and hide ix-apps/*, .system/*, .ix-virt/* -- 84 of 270 "
+                f"datasets on a real pool, including live app data. Enumerating from "
+                f"them omits those datasets from the backup SILENTLY."
+            )
+
+
+class TestTheSnapshotNamespaceIsResolvedNotAssumed:
+    """24.10/25.04 have only `zfs.snapshot`; 26 has only `pool.snapshot`.
+
+    Every one of these mutations used to pass the whole suite, because no test ever
+    built a non-default middleware generation:
+
+      * `_can_delete` -> always True  (breaks 24.10: picks a namespace that isn't there)
+      * SNAPSHOT_SERVICES reversed    (breaks 26)
+      * `snapshot_service` guessing instead of raising
+    """
+
+    def test_a_24_10_box_deletes_through_zfs_snapshot(self):
+        mw = FakeMiddleware(["Tap@snap", "Tap/apps@snap"], snapshot_ns="zfs.snapshot")
+        assert tn.delete_snapshot_tree(mw, "Tap@snap",
+                                       list_snapshots=mw.list_snapshots) == []
+        assert mw.snapshots == []
+        methods = {m for m, _a in mw.calls}
+        assert methods == {"zfs.snapshot.delete"}, (
+            f"a 24.10 box has no pool.snapshot; called {methods}"
+        )
+
+    def test_a_26_box_deletes_through_pool_snapshot(self):
+        mw = FakeMiddleware(["Tap@snap", "Tap/apps@snap"], snapshot_ns="pool.snapshot")
+        assert tn.delete_snapshot_tree(mw, "Tap@snap",
+                                       list_snapshots=mw.list_snapshots) == []
+        assert {m for m, _a in mw.calls} == {"pool.snapshot.delete"}
+
+    def test_a_CRUDService_that_only_defines_do_delete_is_usable(self):
+        # `delete` is exposed FROM a method named `do_delete`. compat.py accepts both,
+        # so the runtime must too, or they disagree about the same box.
+        mw = FakeMiddleware(["Tap@snap"], delete_method="do_delete")
+        assert tn.snapshot_service(mw) == "pool.snapshot"
+
+    def test_a_registered_service_that_CANNOT_delete_is_not_chosen(self):
+        # The subtle one. `get_service()` only proves the namespace is registered.
+        # iX has already gutted a method while keeping its service
+        # (`pool.snapshot.do_update` on master). If the runtime settled for "the
+        # service exists", it would pick pool.snapshot, fail every delete, and orphan
+        # the whole tree -- while compat.py, which checks the METHOD, fell through to
+        # zfs.snapshot and reported the box healthy.
+        class GuttedPoolSnapshot(FakeMiddleware):
+            def get_service(self, name):
+                if name == "pool.snapshot":
+                    return object()          # registered, but no delete on it
+                if name == "zfs.snapshot":
+                    return super().get_service("zfs.snapshot")
+                raise KeyError(name)
+
+        mw = GuttedPoolSnapshot(["Tap@snap"], snapshot_ns="zfs.snapshot")
+        assert tn.snapshot_service(mw) == "zfs.snapshot", (
+            "must fall through to a namespace that can actually delete"
+        )
+
+    def test_no_usable_namespace_REFUSES_rather_than_guessing(self):
+        class Neither(FakeMiddleware):
+            def get_service(self, name):
+                raise KeyError(name)
+
+        with pytest.raises(StagingError, match="no usable snapshot delete"):
+            tn.snapshot_service(Neither())
+
+    def test_the_runtime_list_and_the_compat_manifest_cannot_drift(self):
+        # tools/compat.py claims "the runtime picks the same way ... so what this
+        # checks and what the patch does cannot drift apart." Nothing enforced that,
+        # and reordering SNAPSHOT_SERVICES silently broke the claim. Now it is bound.
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+        import compat
+
+        call = next(c for c in compat.MIDDLEWARE_CALLS if c.id == "call-snapshot-delete")
+        checked = [compat.MiddlewareCall.namespace_of(m) for m, _p in call.options]
+        assert checked == list(tn.SNAPSHOT_SERVICES), (
+            f"compat checks {checked} but the runtime tries {list(tn.SNAPSHOT_SERVICES)} "
+            f"-- in THIS order. They must agree, or CI blesses a box that fails at run "
+            f"time."
+        )
+        assert set(compat.DELETE_NAMES) == set(tn.DELETE_METHODS), (
+            "compat and the runtime must accept the same delete spellings"
+        )
+
+
+class TestWeOwnTheSweepEvenWhenWeDoNotStage:
+    """TrueNAS 26 leak: stock's `recursive` rule is not the patch's `nested` rule.
+
+    <= 25.10  stock's create_snapshot calls get_dataset_recursive() -- the same
+              function this module vendors. "Stock went recursive" and "we have
+              something to stage" were the SAME question, so a non-staged snapshot
+              provably had no children and stock's non-recursive delete was correct.
+
+    26        stock uses filesystem.statfs: recursive = (path == the dataset's
+              mountpoint). Now the rules disagree. A dataset whose only descendants
+              are ZVOLs or legacy/none-mountpoint datasets gets a RECURSIVE snapshot,
+              while get_dataset_recursive() reports nothing to stage -- neither kind
+              is a mounted filesystem under `path`.
+
+    Stock then destroys the PARENT ONLY. With no staging tree there was no sidecar,
+    and the GC only ever ran from stage_nested -- so nothing on the box would ever
+    have found the children. One orphan per zvol/legacy descendant, on every run,
+    forever, while the backup reports SUCCESS.
+
+    Ownership of the sweep is therefore NOT conditional on staging.
+    """
+
+    def test_own_snapshot_records_a_snapshot_it_did_not_stage(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
+        mounts = tmp_path / "mounts"
+        mounts.write_text("")
+
+        mw = FakeMiddleware(["Tap@cloud_backup-5-2026", "Tap/vm-zvol@cloud_backup-5-2026"])
+        root = tn.own_snapshot(mw, "cloud_backup-5", "Tap@cloud_backup-5-2026",
+                               list_snapshots=mw.list_snapshots)
+
+        assert tn._read_sidecar(root) == ["Tap@cloud_backup-5-2026"], (
+            "the snapshot must be RECORDED even though nothing was staged -- the "
+            "sidecar is the only thing that makes the sweep happen"
+        )
+
+    def test_the_recorded_snapshot_is_then_actually_swept(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
+        mounts = tmp_path / "mounts"
+        mounts.write_text("")
+
+        # A recursive snapshot of a dataset whose only child is a ZVOL: exactly the
+        # 26 case. Nothing to stage, but the children are real.
+        mw = FakeMiddleware([
+            "Tap@cloud_backup-5-2026",
+            "Tap/vm-zvol@cloud_backup-5-2026",
+            "Tap/legacy-ds@cloud_backup-5-2026",
+        ])
+        tn.own_snapshot(mw, "cloud_backup-5", "Tap@cloud_backup-5-2026",
+                        list_snapshots=mw.list_snapshots)
+
+        # ...then the run finishes and cleanup fires, exactly as restic_backup's
+        # `finally` does.
+        tn.cleanup_task(mw, "cloud_backup-5", list_snapshots=mw.list_snapshots)
+
+        assert mw.snapshots == [], (
+            "the zvol/legacy children of an unstaged recursive snapshot were orphaned. "
+            "Stock deletes only the parent; if we do not own the sweep, nothing does."
+        )
+
+    def test_apply_sh_owns_the_snapshot_on_the_not_nested_path(self):
+        # The gate itself. It used to `return snapshot, snap_path` and hand the
+        # snapshot back to stock, whose delete is non-recursive.
+        with open(os.path.join(os.path.dirname(__file__), "..", "patch", "apply.sh"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+
+        gate = src.index("if not nested:")
+        ret = src.index("return snapshot, snap_path", gate)
+        assert "_tc_nested.own_snapshot(" in src[gate:ret], (
+            "the not-nested path returns to stock without recording the snapshot. On "
+            "26 stock may have taken a RECURSIVE snapshot (its rule is statfs-based, "
+            "not ours) and deletes only the parent -- so every child is orphaned, with "
+            "no sidecar and no GC, on every run."
         )
