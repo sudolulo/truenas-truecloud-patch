@@ -87,8 +87,8 @@ class TrueCloudPatchUpdateAlertSource(ThreadedAlertSource):
         # this file -- nothing user-supplied reaches the command line. The partial
         # `git` path is moot: this runs as root inside middlewared, so anyone who
         # can poison PATH already has root.
-        return subprocess.run(  # noqa: S603, S607
-            ["git", "-C", PATCH_DIR, *args],
+        return subprocess.run(  # noqa: S603
+            ["git", "-C", PATCH_DIR, *args],  # noqa: S607
             capture_output=True, text=True, timeout=_TIMEOUT, check=True,
         ).stdout
 
