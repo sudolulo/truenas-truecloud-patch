@@ -52,7 +52,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 
 _PATCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _STATUS_FILE = os.path.join(_PATCH_DIR, "hook_status.json")

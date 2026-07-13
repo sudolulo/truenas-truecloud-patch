@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.3.4 — 2026-07-13
+
+### Changed
+
+- **One implementation of apply/revert (`patch/mw_patch.py`).** The "strip the
+  `TRUECLOUD_PATCH` block" logic existed twice — in `apply.sh`'s heredoc and in an
+  inline heredoc in `uninstall.sh` — and the uninstall copy was the untested one.
+  That is exactly how the two could have drifted apart, with `apply.sh` reverting
+  one set of files and `uninstall.sh` another. Both now call the same tested
+  module (17 new tests, including that `revert_nested` never touches `restic.py`,
+  which belongs to the providers module and whose removal would silently break B2
+  backups).
+
+  `apply.sh` imports it fail-safe: if it cannot, the backend patch is skipped and
+  middlewared starts stock, which is this script's whole design principle. The
+  import uses `sys.path.append`, never `insert(0)` — prepending would give
+  `patch/` precedence over the stdlib for that interpreter, so a future
+  `patch/json.py` would shadow the real `json` and break the boot.
+
+### Docs
+
+- The README's `create_task.py` example still taught `--password <secret>`, which
+  is how a security fix quietly fails to land. It now shows `--password-stdin`.
+
 ## v0.3.3 — 2026-07-13
 
 ### Security

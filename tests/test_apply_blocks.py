@@ -277,42 +277,22 @@ class TestOptIn:
         running until the next reboot.
         """
         src = heredoc_source()
-        assert "def unpatch_file(" in src
-        assert "def revert_nested(" in src
-        # The revert must run on every not-needed path (opt-out, superseded).
+        # The implementation lives in patch/mw_patch.py (see test_mw_patch.py);
+        # apply.sh must import and actually call it.
+        assert "from mw_patch import patch_file, revert_nested" in src
         gate = src.index("if not nested_needed:")
         revert = src.index("reverted = revert_nested(")
         patch = src.index("patch_file(crud_py, CRUD_BLOCK)")
         assert gate < revert < patch, "revert belongs in the not-needed branch"
 
-    def test_revert_removes_the_module_before_unpatching_files(self):
-        # Every injected block is guarded by `if _tc_nested is not None`, so
-        # deleting the module first means the guard is restored even if a later
-        # unpatch step fails.
+    def test_import_failure_skips_the_patch_rather_than_crashing(self):
+        # apply.sh runs at PREINIT. If mw_patch.py cannot be imported it must
+        # degrade to "middlewared starts stock", never take the boot down.
         src = heredoc_source()
-        body = src[src.index("def revert_nested("):src.index("def patch_file(") if
-                   src.index("def patch_file(") > src.index("def revert_nested(") else len(src)]
-        body = src[src.index("def revert_nested("):]
-        body = body[:body.index("\n\n\n")] if "\n\n\n" in body else body
-        assert body.index("_truecloud_nested.py") < body.index("crud.py")
-
-    def test_revert_never_touches_the_providers_patch(self):
-        # restic.py also carries a TRUECLOUD_PATCH block, but it belongs to the
-        # providers module. Reverting it would silently break B2 backups.
-        src = heredoc_source()
-        body = src[src.index("def revert_nested("):]
-        body = body[:body.index("return reverted")]
-        # Comments legitimately *mention* restic.py to explain why it is excluded;
-        # what matters is that no code line touches it.
-        code = "\n".join(
-            ln for ln in body.splitlines() if not ln.lstrip().startswith("#")
-        )
-        assert "restic" not in code
-        assert "b2.py" not in code
-        # It must only ever revert these three, plus the module itself.
-        assert "crud.py" in code
-        assert "sync_path" in code
-        assert "snapshot.py" in code
+        i = src.index("from mw_patch import")
+        tail = src[i:i + 400]
+        assert "except ImportError" in tail
+        assert "skipping backend patch" in tail
 
 
 def test_guard_is_relaxed_only_after_traversal_is_installed():

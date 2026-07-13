@@ -376,17 +376,24 @@ host address or API key:
 # List your cloud credentials to find the right ID
 python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py list-credentials
 
-# Create a task with a B2 credential (id=3)
+# Create a task with a B2 credential (id=3).
+# The restic repo password is read from stdin, so it never lands in your shell
+# history — nor in any process's argv, where `ps` would expose it.
+printf '%s' 'restic-repo-password' | \
 python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py create \
     --name "tank-to-b2" \
     --path /mnt/tank/data \
     --credential 3 \
     --bucket my-bucket \
     --folder backups/tank \
-    --password "restic-repo-password" \
+    --password-stdin \
     --cache-path /mnt/tank/.restic-cache \
     --keep-last 14
 ```
+
+Omit `--password-stdin` and you'll be prompted for the password instead. `--password
+<secret>` still works but warns: that password is the encryption key for the whole
+repository, and a CLI argument persists in your shell history forever.
 
 > **Always pass `--cache-path`.** Without it TrueNAS runs restic with `--no-cache`,
 > which re-fetches all repo metadata from the provider every run — glacially slow

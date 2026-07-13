@@ -32,7 +32,7 @@
 # Derive PATCH_DIR from this script's location (parent of the patch/ directory).
 PATCH_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="$PATCH_DIR/apply.log"
-VERSION="0.3.3"
+VERSION="0.3.4"
 
 # Rotate log at 512 KB to avoid unbounded growth on a system volume.
 # Keep two prior generations (.1 and .2) so the last three boots are always available.
@@ -468,65 +468,24 @@ if _tc_nested is not None:
 """
 
 
-def patch_file(path, block):
-    with open(path, encoding="utf-8") as fh:
-        content = fh.read()
-    marker = "\n# TRUECLOUD_PATCH"
-    idx = content.find(marker)
-    base = content[:idx] if idx != -1 else content
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(base.rstrip("\n") + "\n" + block)
+# Single implementation of the block apply/revert logic (patch/mw_patch.py), so
+# uninstall.sh and apply.sh cannot drift apart. Fail-safe: if it cannot be
+# imported, skip the backend patch entirely -- middlewared then starts stock,
+# which is the whole design principle of this script.
+# APPEND, never insert(0): this dir would otherwise take precedence over the
+# stdlib for this interpreter, so a future patch/json.py (say) would shadow the
+# real json module and break the boot. Appending fails safe -- worst case our
+# import misses and the backend patch is skipped.
+sys.path.append(os.path.dirname(nested_src))
+try:
+    from mw_patch import patch_file, revert_nested
+except ImportError as _e:
+    print(f'WARNING: cannot import patch/mw_patch.py ({_e}) — skipping backend patch.')
+    print('WARNING: middlewared will start with stock (unpatched) modules.')
+    sys.exit(1)
 
-
-def unpatch_file(path):
-    """Strip our appended block, restoring the stock file. True if it was patched."""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            content = fh.read()
-    except OSError:
-        return False
-    idx = content.find("\n# TRUECLOUD_PATCH")
-    if idx == -1:
-        return False
-    try:
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(content[:idx].rstrip("\n") + "\n")
-    except OSError:
-        return False
-    return True
-
-
-def revert_nested(cloud_dir, sync_path):
-    """Undo the nested patch. Returns the names of what was actually reverted.
-
-    Skipping the patch is NOT enough to disable the feature. The overlay persists
-    for the whole boot, so an earlier run this boot may already have written the
-    patched files -- and middlewared re-imports them on the restart that
-    install.sh performs. Without this, `install.sh --disable-nested-snapshots`
-    would report "disabled" while the feature kept running until the next reboot.
-    """
-    reverted = []
-
-    # Remove the module FIRST. Every injected block is guarded by
-    # `if _tc_nested is not None`, so once it is gone they all no-op even if a
-    # later step here fails -- the guard is restored no matter what.
-    try:
-        os.unlink(os.path.join(cloud_dir, '_truecloud_nested.py'))
-        reverted.append('_truecloud_nested.py')
-    except OSError:
-        pass
-
-    # NB: restic.py also carries a TRUECLOUD_PATCH block, but that belongs to the
-    # providers module. Only these three are ours to revert.
-    for name, path in (
-        ('crud.py', os.path.join(cloud_dir, 'crud.py')),
-        ('sync.py', sync_path),
-        ('snapshot.py', os.path.join(cloud_dir, 'snapshot.py')),
-    ):
-        if unpatch_file(path):
-            reverted.append(name)
-
-    return reverted
+# .../middlewared/plugins/cloud -> .../middlewared
+mw_dir = os.path.dirname(os.path.dirname(cloud_dir))
 
 b2_ok = restic_ok = False
 nested_ok = False
@@ -582,7 +541,7 @@ if not nested_needed:
         nested_detail = 'not needed'
         print('INFO: Nested module skipped.')
 
-    reverted = revert_nested(cloud_dir, sync_path)
+    reverted = revert_nested(mw_dir)
     if reverted:
         print('OK: Reverted a previously-applied nested patch (' + ', '.join(reverted) + ').')
         print('    The stock nesting guard is restored once middlewared restarts.')
