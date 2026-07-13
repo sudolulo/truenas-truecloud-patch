@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.3.1 — 2026-07-13
+
+### Added
+
+- **Automated releases.** Pushing a `v*` tag runs the full test suite and then
+  cuts a GitHub release whose body is the matching `CHANGELOG.md` section — so
+  release notes have exactly one source of truth, and no second place to go stale.
+  The workflow refuses to publish if the tests fail, if the tag does not match the
+  `VERSION=` declared by every script, or if the CHANGELOG has no section for it.
+
+- **Version-drift check.** `VERSION=` had silently diverged to three different
+  values across `install.sh`, `uninstall.sh`, `recover.sh`, and `patch/apply.sh`,
+  and nothing noticed. CI now asserts every script agrees with the others and with
+  the newest CHANGELOG entry.
+
+### Note
+
+- Releases for `v0.2.0` and `v0.2.1` were backfilled — they had been tagged but
+  never released, so the releases page jumped v0.1.0 → v0.3.0 and hid the fix for
+  the boot race that took every app down.
+
 ## v0.3.0 — 2026-07-13
 
 ### Added
@@ -82,14 +103,6 @@
   find its parent snapshot between runs. Stock's
   `.zfs/snapshot/<name>-<timestamp>/` path changes every run, which defeats
   restic's parent detection and forces a full re-scan each time.
-
-- **Automated releases.** Pushing a `v*` tag runs the full test suite and then
-  cuts a GitHub release whose body is the matching `CHANGELOG.md` section — so
-  release notes have exactly one source of truth. The workflow refuses to publish
-  if the tests fail, if the tag does not match the `VERSION=` declared by every
-  script, or if the CHANGELOG has no section for it. (`VERSION=` had silently
-  drifted to three different values across the scripts, and nothing noticed.)
-  `workflow_dispatch` can create a release for an already-existing tag.
 
 - **CI** (GitHub Actions): shellcheck + `bash -n` on every script, ruff, and
   pytest on Python 3.11/3.12/3.13. Includes tests that `compile()` the

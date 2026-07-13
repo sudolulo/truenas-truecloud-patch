@@ -6,8 +6,12 @@ name: Release
 #
 #   git tag -a v0.4.0 -m "v0.4.0" && git push origin v0.4.0
 #
-# workflow_dispatch exists to create a release for a tag that already exists
-# (backfilling history), since re-pushing an existing tag triggers nothing.
+# workflow_dispatch re-cuts (or updates) the release for a tag that already
+# exists, since re-pushing an existing tag triggers nothing.
+#
+# It checks out the TAG, because the tagged code is what people install and it has
+# to pass its own tests. That means it only works for tags that actually contain
+# this tooling (>= v0.3.0). Tags older than that were backfilled by hand.
 
 on:
   push:

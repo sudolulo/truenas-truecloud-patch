@@ -17,7 +17,7 @@
 #   bash /mnt/tank/truenas-truecloud-patch/patch/apply.sh
 #   systemctl restart middlewared
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 
