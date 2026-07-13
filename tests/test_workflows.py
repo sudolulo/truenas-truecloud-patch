@@ -127,11 +127,35 @@ class TestTheBotDoesNotSpam:
         # Checked against CODE, not comments — the step's own commentary explains what
         # it replaced, and that mention must not read as the thing itself.
         with open(os.path.join(WORKFLOWS, "compat.yml"), encoding="utf-8") as fh:
-            code = "\n".join(
-                ln for ln in fh.read().splitlines() if not ln.lstrip().startswith("#")
-            )
-        assert "gh pr create" in code
+            src = fh.read()
+        code = "\n".join(
+            ln for ln in src.splitlines() if not ln.lstrip().startswith("#")
+        )
+        assert "/pulls" in code, "the matrix refresh must open a PR"
         assert "HEAD:main" not in code, "CI still pushes straight to main"
+
+    def test_the_matrix_PR_targets_the_CANONICAL_forge_not_the_mirror(self):
+        # GitHub is a one-way mirror: a PR merged there would be silently clobbered by
+        # the next `fleet-repos mirror` push from Gitea. A bot opening PRs against a
+        # mirror is a bot doing nothing, slowly.
+        with open(os.path.join(WORKFLOWS, "compat.yml"), encoding="utf-8") as fh:
+            src = fh.read()
+        i = src.index("refresh the README matrix")
+        step = src[i:i + 400]
+        assert "!contains(github.server_url, 'github.com')" in step, (
+            "the matrix PR must be opened on Gitea (canonical), not GitHub (mirror)"
+        )
+
+    def test_the_workflow_has_the_permissions_its_steps_actually_need(self):
+        # It shipped with `contents: read` while the step pushed a branch and opened a
+        # PR — it would have died with a 403 on the first scheduled run, and I would
+        # have had a bot that silently never worked.
+        with open(os.path.join(WORKFLOWS, "compat.yml"), encoding="utf-8") as fh:
+            src = fh.read()
+        perms = src[src.index("permissions:"):src.index("jobs:")]
+        assert "contents: write" in perms, "pushing a branch needs contents: write"
+        assert "pull-requests: write" in perms, "opening a PR needs pull-requests: write"
+        assert "issues: write" in perms
 
 
 class TestCompatCannotSilentlyPass:
