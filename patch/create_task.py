@@ -26,8 +26,9 @@ Create a task backed by a B2 credential (id=3):
         --credential 3 \\
         --bucket my-bucket \\
         --folder backups/tank \\
-        --password "restic-repo-password" \\
+        --password-stdin \\
         --keep-last 14
+    (pipe the password in:  echo -n "s3cret" | python3 create_task.py create ... )
 
 Create a task using an S3-compatible credential (Wasabi, R2, etc.):
     python3 create_task.py create \\
@@ -36,7 +37,7 @@ Create a task using an S3-compatible credential (Wasabi, R2, etc.):
         --credential 5 \\
         --bucket my-bucket \\
         --folder backups \\
-        --password "restic-repo-password"
+        --password-stdin
 
 List existing TrueCloud Backup tasks:
     python3 create_task.py list-tasks
@@ -44,39 +45,49 @@ List existing TrueCloud Backup tasks:
 
 import argparse
 import calendar
+import getpass
 import json
 import os
 import subprocess
 import sys
 import time
 
-__version__ = "0.2.0"
+__version__ = "0.3.3"
 
 _PATCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _STATUS_FILE = os.path.join(_PATCH_DIR, "hook_status.json")
 
 
 def midclt_call(method, *args):
-    """Call a middleware method locally via `midclt`, the supported JSON-RPC transport
-    that replaces the deprecated /api/v2.0 REST API (removed in TrueNAS 26.04). Must run
-    on the TrueNAS host. Each arg is JSON-encoded (a dict for create; none for queries).
-    Exits with a clear message on failure."""
-    cmd = ["midclt", "call", method] + [json.dumps(a) for a in args]
+    """Call a middleware method on the local host.
+
+    Uses `truenas_api_client` -- the library that backs `midclt` itself -- rather
+    than shelling out to `midclt`.
+
+    This is a SECURITY requirement, not a style choice. `midclt call <method>
+    <json>` puts its arguments in the process's **argv**, and `cloud_backup.create`
+    carries the restic repository password. argv is world-readable via `ps`, so
+    shelling out would expose the key to the entire backup repo to every local
+    user for the duration of the call. Going through the client library keeps it
+    in this process's memory.
+    """
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    except FileNotFoundError:
-        print("ERROR: `midclt` not found — run this script ON the TrueNAS host.",
-              file=sys.stderr)
+        from truenas_api_client import Client
+    except ImportError:
+        print(
+            "ERROR: `truenas_api_client` not importable — run this script ON the\n"
+            "       TrueNAS host. (It ships with midclt.)",
+            file=sys.stderr,
+        )
         sys.exit(1)
-    except subprocess.SubprocessError as exc:
-        print(f"ERROR: midclt call failed: {exc}", file=sys.stderr)
+
+    try:
+        with Client() as client:
+            return client.call(method, *args)
+    except Exception as exc:  # noqa: BLE001 - surface any middleware error verbatim
+        # Never echo `args` here: for cloud_backup.create it contains the password.
+        print(f"ERROR: {method}: {exc}", file=sys.stderr)
         sys.exit(1)
-    if proc.returncode != 0:
-        print(f"ERROR: midclt {method}: {(proc.stderr or proc.stdout).strip()}",
-              file=sys.stderr)
-        sys.exit(1)
-    out = proc.stdout.strip()
-    return json.loads(out) if out else None
 
 
 # ── Sub-commands ──────────────────────────────────────────────────────────────
@@ -213,6 +224,37 @@ def cmd_list_tasks(_args):
         print(f"{t['id']:>4}  {enabled:<8}  {ptype:<14}  {t.get('description', '')}")
 
 
+def _resolve_password(args):
+    """Get the restic repo password without writing it to the user's shell history.
+
+    That password is the key to the whole backup repository. `--password <secret>`
+    persists it in ~/.bash_history and exposes it in `ps` for the lifetime of the
+    shell command, so it is accepted but warned about; stdin and an interactive
+    prompt are the safe paths.
+    """
+    if args.password_stdin:
+        if args.password:
+            print("ERROR: use either --password or --password-stdin, not both.",
+                  file=sys.stderr)
+            sys.exit(1)
+        password = sys.stdin.readline().rstrip("\n")
+    elif args.password:
+        print(
+            "WARNING: --password puts the restic repository password in your shell\n"
+            "         history. Prefer:  echo -n 'pw' | ... --password-stdin",
+            file=sys.stderr,
+        )
+        password = args.password
+    else:
+        password = getpass.getpass("Restic repository password: ")
+
+    if not password:
+        print("ERROR: the restic repository password must not be empty.",
+              file=sys.stderr)
+        sys.exit(1)
+    return password
+
+
 def cmd_create(args):
     parts = args.schedule.split()
     if len(parts) != 5:
@@ -223,6 +265,8 @@ def cmd_create(args):
         sys.exit(1)
     minute, hour, dom, month, dow = parts
 
+    password = _resolve_password(args)
+
     body = {
         "description": args.name,
         "path": args.path,
@@ -231,7 +275,7 @@ def cmd_create(args):
             "bucket": args.bucket,
             "folder": args.folder,
         },
-        "password": args.password,
+        "password": password,
         "keep_last": args.keep_last,
         "transfer_setting": args.transfer_setting,
         "schedule": {
@@ -297,8 +341,11 @@ def main():
                    help="Bucket (S3) or container (B2) name")
     c.add_argument("--folder",      default="",
                    help="Path within the bucket (default: root)")
-    c.add_argument("--password",    required=True,
-                   help="Restic repository encryption password (choose a strong one)")
+    c.add_argument("--password",    default=None,
+                   help="Restic repository password. UNSAFE: it lands in your shell "
+                        "history. Prefer --password-stdin, or omit both and be prompted.")
+    c.add_argument("--password-stdin", action="store_true",
+                   help="Read the restic repository password from stdin (recommended)")
     c.add_argument("--keep-last",   type=int, default=14, metavar="N",
                    help="Snapshots to retain after each run (default: 14)")
     c.add_argument("--schedule",    default="0 2 * * *",

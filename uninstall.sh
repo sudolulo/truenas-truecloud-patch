@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.3.2"
+VERSION="0.3.3"
 
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 _HOOK_COMMENT='TrueCloud provider patch (S3/B2)'
@@ -89,6 +89,63 @@ done
 if [ "$_ov_found" -eq 0 ]; then
     echo "  None active."
 fi
+echo ""
+
+# ── Revert file-level patches ─────────────────────────────────────────────────
+# Unmounting the overlay is what normally reverts everything — the lower layer is
+# the untouched /usr. But apply.sh only mounts an overlay when the directory is
+# read-only; on a writable /usr it patches the real files in place. Uninstall
+# would then remove the boot hook and report success while leaving every patch
+# applied. Strip our appended blocks explicitly.
+
+echo "Reverting any file-level patches ..."
+python3 - <<'PYEOF'
+import os
+
+try:
+    import middlewared
+except ImportError:
+    print("  middlewared not importable — nothing to revert.")
+    raise SystemExit(0)
+
+mw = os.path.dirname(os.path.abspath(middlewared.__file__))
+targets = [
+    os.path.join(mw, "rclone", "remote", "b2.py"),
+    os.path.join(mw, "plugins", "cloud_backup", "restic.py"),
+    os.path.join(mw, "plugins", "cloud_backup", "sync.py"),
+    os.path.join(mw, "plugins", "cloud", "crud.py"),
+    os.path.join(mw, "plugins", "cloud", "snapshot.py"),
+]
+
+reverted = []
+for path in targets:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            content = fh.read()
+    except OSError:
+        continue
+    idx = content.find("\n# TRUECLOUD_PATCH")
+    if idx == -1:
+        continue
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content[:idx].rstrip("\n") + "\n")
+        reverted.append(os.path.basename(path))
+    except OSError as e:
+        print(f"  WARNING: could not revert {path}: {e}")
+
+nested = os.path.join(mw, "plugins", "cloud", "_truecloud_nested.py")
+try:
+    os.unlink(nested)
+    reverted.append("_truecloud_nested.py")
+except OSError:
+    pass
+
+if reverted:
+    print("  Reverted: " + ", ".join(reverted))
+else:
+    print("  Nothing to revert (overlay already removed, or never patched).")
+PYEOF
 echo ""
 
 # ── Unmount nested-snapshot staging trees ─────────────────────────────────────

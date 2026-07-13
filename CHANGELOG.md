@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.3.3 — 2026-07-13
+
+### Security
+
+- **The restic repository password no longer passes through a process's argv.**
+  `create_task.py` shelled out to `midclt call cloud_backup.create '<json>'`, and
+  that JSON contains the repo password — so it appeared in the process's argv,
+  which is world-readable via `ps`, for the duration of the call. That password is
+  the encryption key for the entire cloud backup repository.
+
+  It now talks to the middleware through `truenas_api_client` (the library that
+  backs `midclt` itself), so the password never leaves the process's memory.
+
+- **`--password` no longer required.** Passing a secret as a CLI argument writes it
+  to shell history permanently. `--password-stdin` reads it from stdin, and with
+  neither flag the tool prompts via `getpass`. `--password` still works but now
+  warns.
+
+### Fixed
+
+- **`uninstall.sh` could leave every patch installed.** It reverted by unmounting
+  the overlay — but `apply.sh` only mounts one when the target directory is
+  read-only. On a writable `/usr` it patches the real files in place, and uninstall
+  would remove the boot hook, report success, and leave the patch applied. It now
+  strips the appended blocks from the middleware files explicitly.
+
+- **`create_task.py.__version__` had been stuck at `0.2.0`** for three releases.
+  The version-drift check added in v0.3.1 only looked at `VERSION=` in shell
+  scripts, so it missed the one file that actually shows a version to users
+  (`--version`). The check now covers `__version__` too — and caught this
+  immediately.
+
 ## v0.3.2 — 2026-07-13
 
 ### Fixed

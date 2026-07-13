@@ -19,17 +19,20 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHANGELOG = os.path.join(ROOT, "CHANGELOG.md")
 
-# Every script prints a version; they must all agree, and agree with the tag.
-# They drifted to three different values once (0.0.4 / 0.2.1) before anything
-# checked them.
+# Everything that announces a version must agree with everything else. They drifted
+# to three different values once (0.0.4 / 0.2.1) before anything checked them --
+# and create_task.py's __version__ then sat at 0.2.0 through three more releases,
+# because the first version of this check only looked at VERSION= in shell scripts.
 VERSIONED_FILES = [
     "install.sh",
     "uninstall.sh",
     "recover.sh",
     os.path.join("patch", "apply.sh"),
+    os.path.join("patch", "create_task.py"),   # exposes `--version` to users
 ]
 
-_VERSION_RE = re.compile(r'^VERSION="([^"]+)"', re.M)
+# `VERSION="x"` (shell) or `__version__ = "x"` (python).
+_VERSION_RE = re.compile(r'^(?:VERSION=|__version__\s*=\s*)"([^"]+)"', re.M)
 _HEADING_RE = re.compile(r"^##\s+v?(\d+\.\d+\.\d+[^\s]*)", re.M)
 
 
