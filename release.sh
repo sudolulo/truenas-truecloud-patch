@@ -77,9 +77,16 @@ printf '%s' "$target" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
 
 [ -d .git ] || die "not a git checkout"
 
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  die "working tree is dirty. Commit or stash first -- a release must be
-       reproducible from a commit, not from whatever happened to be on disk."
+# UNTRACKED files count as dirty, because --rc runs `git add -A`: an untracked file
+# lying around would be swept into the release commit and pushed. This checkout is
+# routinely shared between sessions, so stray files are the normal state here, not
+# an exotic one. (Anything genuinely ignorable belongs in .gitignore.)
+if [ -n "$(git status --porcelain)" ]; then
+  echo "  Working tree is not clean:" >&2
+  git status --short >&2
+  die "commit, stash, or ignore the above first -- a release must be reproducible
+       from a commit, not from whatever happened to be on disk. --rc runs
+       'git add -A', so an untracked file here ships inside the release."
 fi
 
 branch="$(git rev-parse --abbrev-ref HEAD)"
@@ -101,6 +108,17 @@ git fetch --tags --quiet origin
 if [ -n "$(git log --oneline "origin/$branch..$branch" 2>/dev/null)" ]; then
   die "local main has commits that are not pushed. Push first: the tag must point
        at a commit the world can actually fetch."
+fi
+
+# BEHIND is just as bad as ahead, and less obvious. --rc commits the version stamp,
+# creates the tag, and only THEN pushes -- so on a stale main the push is rejected
+# (non-fast-forward) *after* the tag exists and `## Unreleased` has already been
+# consumed. Re-running then sees rc1, cuts rc2, and silently skips the stamping
+# step; the rc1 tag dangles locally forever.
+if [ -n "$(git log --oneline "$branch..origin/$branch" 2>/dev/null)" ]; then
+  die "local main is BEHIND origin. Pull first:  git pull --ff-only
+       Releasing from a stale main half-completes: the tag is cut locally, the push
+       is rejected, and '## Unreleased' has already been consumed."
 fi
 
 # ── the gates: identical to the ones CI will run ─────────────────────────────
@@ -167,11 +185,25 @@ fi
 if [ "$mode" = "rc" ]; then
   tag="$(python3 tools/release_gate.py "$target" --next-rc -C .)"
 
+  # Tests BEFORE the stamping commit, deliberately.
+  #
+  # Stamping consumes `## Unreleased` and makes a "release vX.Y.Z" commit. If the
+  # suite then failed, that commit was already on main and a re-run died inside
+  # promote() with "no `## Unreleased` content" -- the release was wedged, and the
+  # only way out was to hand-unpick a commit. Failing first leaves the tree
+  # untouched.
+  run_tests
+
   # The first candidate promotes `## Unreleased` and stamps the version into every
   # script. Later candidates (rc2+) are re-cuts of an already-stamped version, so
   # they only tag -- the CHANGELOG section for this version already exists, and
   # fixes found during rc go into it.
-  if git rev-parse -q --verify "refs/tags/v$target-rc1" >/dev/null; then
+  #
+  # "Already stamped" is decided by the TREE, not by the rc1 tag: if a previous run
+  # stamped and committed but died before tagging (or before pushing), the tag is
+  # absent while the stamp is present, and re-stamping would try to promote an
+  # `## Unreleased` section that is no longer there.
+  if python3 tools/release_notes.py check "v$target-rc0" >/dev/null 2>&1; then
     note "v$target is already stamped; cutting a follow-up candidate"
   else
     note "promoting '## Unreleased' -> v$target and stamping the scripts"
@@ -215,8 +247,8 @@ PY
 
   # Gated as the rc tag it is: content is checked against the base version, and the
   # provenance gate is a no-op for candidates -- being one is the whole point.
+  # (run_tests already ran, above, before anything was committed.)
   run_gates "$tag"
-  run_tests
 
   echo
   note "about to cut $tag"
@@ -227,8 +259,12 @@ PY
   echo "    run:  bash release.sh $target --promote"
   confirm "cut $tag?"
 
-  git tag -a "$tag" -m "$tag"
+  # Push the branch FIRST. If it is rejected, no tag has been created yet -- a tag
+  # pointing at a commit nobody else has is worse than no tag, because the next run
+  # sees it, counts it as a candidate, and cuts rc2 against a commit that was never
+  # published.
   git push --quiet origin main
+  git tag -a "$tag" -m "$tag"
   git push --quiet origin "$tag"
   ok "pushed $tag"
   echo

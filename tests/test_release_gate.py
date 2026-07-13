@@ -65,6 +65,33 @@ def repo(tmp_path):
     return r
 
 
+class TestTheBarrierBeforeTheTagExists:
+    """release.sh calls the gate BEFORE creating the stable tag.
+
+    Every other test here tags first, and that is what let a fatal bug ship green:
+    `check_promotable` began with `commit_for(vX.Y.Z)` and returned "does not exist",
+    while release.sh's own guard refuses to run at all IF the tag exists. The two
+    conditions were mutually exclusive, so `--promote` could never succeed -- the
+    only way to cut a stable release was to hand-tag, bypassing every gate.
+
+    A gate that can only be satisfied after the thing it gates is not a gate.
+    """
+
+    def test_promote_is_allowed_when_head_was_a_candidate_and_the_tag_is_absent(self, repo):
+        repo.git("tag", "v1.0.0-rc1")          # rc on HEAD, no stable tag yet
+        assert check_promotable("v1.0.0", cwd=str(repo)) == []
+
+    def test_promote_is_refused_when_head_was_never_a_candidate(self, repo):
+        assert check_promotable("v1.0.0", cwd=str(repo))
+
+    def test_promote_is_refused_when_head_moved_past_the_candidate(self, repo):
+        repo.git("tag", "v1.0.0-rc1")
+        repo.commit("one more little fix")     # HEAD is no longer the candidate
+        problems = check_promotable("v1.0.0", cwd=str(repo))
+        assert problems
+        assert "no release candidate does" in problems[0]
+
+
 class TestTheBarrier:
     def test_a_tag_with_no_candidate_is_refused(self, repo):
         repo.git("tag", "v1.0.0")
@@ -109,9 +136,15 @@ class TestTheBarrier:
         repo.git("tag", "v1.0.0")
         assert check_promotable("v1.0.0", cwd=str(repo)) == []
 
-    def test_missing_tag_is_reported_not_crashed(self, repo):
-        problems = check_promotable("v9.9.9", cwd=str(repo))
-        assert problems and "does not exist" in problems[0]
+    def test_a_tag_the_numbering_does_not_understand_is_not_a_candidate(self, repo):
+        # `v1.0.0-rc*` also globs `v1.0.0-rc1-hotfix`, which _rc_number reads as 0.
+        # The barrier must be satisfied only by something that really was a candidate.
+        repo.git("tag", "v1.0.0-rc1-hotfix")
+        repo.git("tag", "v1.0.0")
+        problems = check_promotable("v1.0.0", cwd=str(repo))
+        assert problems
+        assert "never a release candidate" in problems[0]
+        assert rc_tags("1.0.0", cwd=str(repo)) == []
 
 
 class TestRcNumbering:

@@ -135,8 +135,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
+          # Lowercased: release_gate/release_notes match the suffix case-INsensitively
+          # (`is_prerelease` uses re.I), so a `v0.6.0-RC1` skipped the barrier as a
+          # candidate and then landed here as a case-sensitive MISS -- published as the
+          # forge's "Latest release" on a commit that was never a candidate.
           prerelease=""
-          case "$TAG" in
+          case "$(printf '%s' "$TAG" | tr '[:upper:]' '[:lower:]')" in
             *-rc*|*-beta*|*-alpha*) prerelease="--prerelease" ;;
           esac
 
@@ -156,7 +160,7 @@ jobs:
           API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
         run: |
           prerelease=false
-          case "$TAG" in
+          case "$(printf '%s' "$TAG" | tr '[:upper:]' '[:lower:]')" in
             *-rc*|*-beta*|*-alpha*) prerelease=true ;;
           esac
 

@@ -307,3 +307,33 @@ def test_guard_is_relaxed_only_after_traversal_is_installed():
         src.index("patch_file(crud_py, CRUD_BLOCK)"),
     ]
     assert order == sorted(order), "crud.py must be patched last"
+
+
+class TestWrappersDoNotHardcodeStockArity:
+    """iX changes the tail of these signatures between releases.
+
+    SYNC_BLOCK used to spell out `(middleware, job, cloud_backup, dry_run, rate_limit)`
+    and forward all five. But 24.10 and 25.04 declare only four -- `rate_limit` arrived
+    in 25.10 -- so every nested backup on those two releases raised
+    `TypeError: restic_backup() takes 4 positional arguments but 5 were given`.
+    It shipped broken and nothing noticed, because the compat check at the time only
+    asked whether the parameter NAMES still appeared somewhere in the signature.
+
+    Forwarding *args/**kwargs makes the wrapper indifferent to a trailing parameter
+    being added or dropped, which is the only part iX actually churns.
+    """
+
+    def test_restic_backup_forwards_rather_than_naming_stock_params(self):
+        block = extract_blocks()["SYNC_BLOCK"]
+        assert "async def restic_backup(middleware, job, cloud_backup, *args, **kwargs)" in block
+        assert "_tc_orig_restic_backup(middleware, job, cloud_backup, *args, **kwargs)" in block
+
+        # Comments stripped: the block's own commentary explains the rate_limit
+        # history, and that must not be mistaken for the code re-declaring it.
+        code = "\n".join(
+            line for line in block.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "rate_limit" not in code, (
+            "naming a trailing stock parameter re-introduces the arity bug"
+        )

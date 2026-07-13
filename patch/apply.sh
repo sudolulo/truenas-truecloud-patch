@@ -227,6 +227,17 @@ fi
 _TC_COMPAT_JSON="$PATCH_DIR/incompatible.json"
 rm -f "$_TC_COMPAT_JSON"
 
+_tc_incompatible=0
+_tc_compat=unknown
+
+# No middlewared directory means the checker has nothing to read -- every module
+# would look "broken" because every file is missing, which is the strongest possible
+# evidence derived from the weakest possible input. Skip the preflight entirely and
+# let the existing "Cannot determine middlewared directory" path handle it.
+if [ -z "$_MW_DIR" ]; then
+    echo "NOTICE: middlewared directory unknown; skipping the compatibility preflight."
+    _tc_compat=$(printf 'unknown\nunknown\n')
+else
 _tc_compat=$("$PYTHON" - "$PATCH_DIR" "$_MW_DIR" "$_TC_COMPAT_JSON" 2>/dev/null <<'PYEOF' || printf 'unknown\nunknown\n'
 import json, os, sys
 
@@ -244,7 +255,19 @@ except Exception:
     raise SystemExit(0)
 
 def verdict(r):
-    return 'broken' if (not r['ok'] and not r['native']) else 'ok'
+    # Deliberately NOT exempting 'native' here, unlike the CI matrix.
+    #
+    # 'native' answers "do we still NEED this module?"; 'ok' answers "is it still
+    # SAFE to inject?". They are different questions, and letting native mask a
+    # broken assumption conflates them: a future TrueNAS that both reworded the
+    # nesting guard (-> native) AND changed the signatures (-> broken) would read
+    # as safe, and we would patch it anyway.
+    #
+    # Refusing to apply is the correct action for BOTH answers -- a native module
+    # is unnecessary and a broken one is dangerous -- so the apply path only has to
+    # ask whether the assumptions hold. Whether the feature went native is decided
+    # separately, by the probes above, and only affects the wording of the notice.
+    return 'ok' if r['ok'] else 'broken'
 
 broken = {m: r for m, r in result.items() if verdict(r) == 'broken'}
 if broken:
@@ -260,6 +283,7 @@ print(verdict(result['providers']))
 print(verdict(result['nested']))
 PYEOF
 )
+fi
 
 _tc_compat_providers=$(printf '%s' "$_tc_compat" | sed -n '1p')
 _tc_compat_nested=$(printf '%s' "$_tc_compat"    | sed -n '2p')
@@ -273,20 +297,63 @@ if [ "$_NESTED_ENABLED" = "1" ] && [ "$_tc_native_nested" != "yes" ]; then
     _nested_needed=1
 fi
 
-if [ "$_tc_compat_providers" = "broken" ]; then
+# The native checks above have already zeroed _*_needed for anything TrueNAS now
+# does itself, and printed the (good) news. Only complain about a module that is
+# still NEEDED and no longer fits -- otherwise a version that took a feature native
+# AND reshaped the module would be announced as "NOT COMPATIBLE", which is alarming
+# and false.
+if [ "$_tc_compat_providers" = "broken" ] && [ "$_providers_needed" = "1" ]; then
     echo "WARNING: truecloud-patch is NOT COMPATIBLE with this TrueNAS version."
     echo "WARNING:   The B2/S3 providers module will NOT be applied. TrueCloud is"
     echo "WARNING:   left stock, so B2/S3 tasks will not run until this is fixed."
     echo "WARNING:   Details: $_TC_COMPAT_JSON"
     _providers_needed=0
+    _tc_incompatible=1
 fi
 
-if [ "$_tc_compat_nested" = "broken" ] && [ "$_NESTED_ENABLED" = "1" ]; then
+if [ "$_tc_compat_nested" = "broken" ] && [ "$_nested_needed" = "1" ]; then
     echo "WARNING: truecloud-patch's nested-snapshot module is NOT COMPATIBLE with"
     echo "WARNING:   this TrueNAS version and will NOT be applied. Backups still"
     echo "WARNING:   run; datasets nested under the target are not included."
     echo "WARNING:   Details: $_TC_COMPAT_JSON"
     _nested_needed=0
+    _tc_incompatible=1
+fi
+
+_tc_unmount_overlays() {
+    for _tag in mw ui; do
+        if mount | grep -qF "truecloud-${_tag} on "; then
+            _mnt=$(mount | grep "truecloud-${_tag} on " | awk '{print $3}' | head -1)
+            if umount "$_mnt" 2>/dev/null; then
+                echo "NOTICE: Unmounted overlay on $_mnt"
+            fi
+        fi
+    done
+}
+
+# INCOMPATIBLE is not the same as RETIRED, and must never take the same exit.
+#
+# The kill switch below is permanent -- apply.sh checks for it and returns early on
+# every future boot -- and only install.sh removes it, NOT update.sh. That is right
+# for retirement ("TrueNAS does this natively now; stop forever"), and catastrophic
+# for incompatibility: on TrueNAS 26 the providers module fails its assumptions and
+# nested is opt-out by default, so BOTH would be zero, the kill switch would fire,
+# and the very release that fixes 26 could never re-enable itself. The user would
+# run `bash update.sh` -- exactly what the update alert tells them to do -- and the
+# patch would stay dead, silently, with their B2 backups off.
+#
+# So: incompatible means "apply nothing THIS boot, and try again next boot". The
+# fix ships, update.sh checks it out, the next boot re-runs the preflight, the
+# assumptions hold, and the patch comes back by itself.
+if [ "$_tc_incompatible" = "1" ] && [ "$_providers_needed" = "0" ] && [ "$_nested_needed" = "0" ]; then
+    echo "NOTICE: Nothing can be applied on this TrueNAS version — see the WARNINGs above."
+    echo "NOTICE: The kill switch is deliberately NOT set: this is an incompatibility,"
+    echo "NOTICE: not a retirement. Install a release that supports this TrueNAS"
+    echo "NOTICE:   bash $PATCH_DIR/update.sh"
+    echo "NOTICE: and the patch will re-apply itself on the next boot."
+    _tc_unmount_overlays
+    echo "=== done ==="
+    exit 0
 fi
 
 if [ "$_providers_needed" = "0" ] && [ "$_nested_needed" = "0" ]; then
@@ -301,12 +368,7 @@ if [ "$_providers_needed" = "0" ] && [ "$_nested_needed" = "0" ]; then
     echo "NOTICE: Run the following to fully remove the patch:"
     echo "NOTICE:   bash $PATCH_DIR/uninstall.sh"
     touch "$PATCH_DIR/disabled"
-    for _tag in mw ui; do
-        if mount | grep -qF "truecloud-${_tag} on "; then
-            _mnt=$(mount | grep "truecloud-${_tag} on " | awk '{print $3}' | head -1)
-            umount "$_mnt" 2>/dev/null && echo "NOTICE: Unmounted overlay on $_mnt" || true
-        fi
-    done
+    _tc_unmount_overlays
     echo "=== done ==="
     exit 0
 fi
@@ -524,12 +586,21 @@ except ImportError:
 if _tc_nested is not None:
     _tc_orig_restic_backup = restic_backup
 
-    async def restic_backup(middleware, job, cloud_backup, dry_run=False, rate_limit=None):
+    async def restic_backup(middleware, job, cloud_backup, *args, **kwargs):
+        # *args/**kwargs, not the stock signature spelled out.
+        #
+        # 24.10 and 25.04 have `restic_backup(middleware, job, cloud_backup, dry_run)`;
+        # 25.10 added `rate_limit`. Naming them here and forwarding all five raised
+        # `TypeError: takes 4 positional arguments but 5 were given` on every nested
+        # backup on the two older releases. Forwarding whatever we were handed makes
+        # this wrapper indifferent to iX adding or dropping a trailing parameter --
+        # which they have now done twice.
+        #
         # Our bind mounts pin the ZFS snapshot, so stock's `finally` cannot
         # destroy it (EBUSY) and logs one benign warning. We unmount here and
         # then delete the snapshot for real.
         try:
-            return await _tc_orig_restic_backup(middleware, job, cloud_backup, dry_run, rate_limit)
+            return await _tc_orig_restic_backup(middleware, job, cloud_backup, *args, **kwargs)
         finally:
             try:
                 await _tc_nested.cleanup_task(

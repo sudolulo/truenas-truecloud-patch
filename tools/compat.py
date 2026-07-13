@@ -65,14 +65,19 @@ class Assumption:
     """
 
     def __init__(self, ident, module, path, symbol, *, kind="function",
-                 is_async=None, params=None, why=""):
+                 is_async=None, params=None, forwards=False, why=""):
         self.id = ident
         self.module = module
         self.path = path
         self.symbol = symbol
         self.kind = kind
         self.is_async = is_async
+        #: The positional parameters the patch passes, in order.
         self.params = params or []
+        #: True if the wrapper takes *args/**kwargs and forwards the rest. Then a
+        #: trailing parameter that iX adds or removes is harmless, and only the
+        #: leading `params` must still match.
+        self.forwards = forwards
         self.why = why
 
 
@@ -115,8 +120,13 @@ ASSUMPTIONS = [
             "drop the no-further-nesting error",
     ),
     Assumption(
+        # SYNC_BLOCK's wrapper is (middleware, job, cloud_backup, *args, **kwargs) and
+        # forwards the rest, precisely because iX keeps changing the tail: 24.10 and
+        # 25.04 have `(…, dry_run)`, 25.10 added `rate_limit`. Only the leading three
+        # are named by the patch, so only they have to hold.
         "restic-backup", NESTED, "plugins/cloud_backup/sync.py", "restic_backup",
-        is_async=True, params=["middleware", "job", "cloud_backup"],
+        is_async=True, forwards=True,
+        params=["middleware", "job", "cloud_backup"],
         why="SYNC_BLOCK replaces it with `async def` that AWAITS the original, to "
             "tear down bind mounts in a finally",
     ),
@@ -162,96 +172,239 @@ def _squash(text: str) -> str:
 
 # ── AST lookups ──────────────────────────────────────────────────────────────
 
+_DEFS = (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def _defs_in(body):
+    """Definitions in `body`, descending into if/try/else/with.
+
+    A module-level `def` is not always at module level:
+
+        try:
+            from .fast import create_snapshot
+        except ImportError:
+            async def create_snapshot(...): ...
+
+    Scanning only `tree.body` would say "no longer defines create_snapshot" -- a
+    false BROKEN. And a false BROKEN is not a harmless over-caution here: it makes a
+    module decline to apply on a box where it works perfectly.
+    """
+    for node in body:
+        if isinstance(node, _DEFS):
+            yield node
+        elif isinstance(node, ast.If | ast.Try | ast.With | ast.AsyncWith):
+            yield from _defs_in(node.body)
+            yield from _defs_in(getattr(node, "orelse", []))
+            yield from _defs_in(getattr(node, "finalbody", []))
+            for h in getattr(node, "handlers", []):
+                yield from _defs_in(h.body)
+
+
+def _imports(tree, name):
+    """True if `name` is bound by an import -- i.e. re-exported from elsewhere."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            for alias in node.names:
+                if (alias.asname or alias.name.split(".")[0]) == name:
+                    return True
+    return False
+
+
 def _find(tree, symbol):
-    """The node for `name` or `Class.method`, or None."""
+    """The def node for `name` or `Class.method`, or None."""
     if "." in symbol:
         cls_name, meth = symbol.split(".", 1)
-        for node in tree.body:
+        for node in _defs_in(tree.body):
             if isinstance(node, ast.ClassDef) and node.name == cls_name:
-                for sub in node.body:
+                for sub in _defs_in(node.body):
                     if isinstance(sub, ast.FunctionDef | ast.AsyncFunctionDef) \
                             and sub.name == meth:
                         return sub
         return None
 
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) \
-                and node.name == symbol:
+    for node in _defs_in(tree.body):
+        if node.name == symbol:
             return node
     return None
 
 
-def _params(node):
+def _positional(node):
     a = node.args
-    return [p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)]
+    return [p.arg for p in (*a.posonlyargs, *a.args)]
 
 
-def check_source(a: Assumption, src: str | None) -> str | None:
-    """The reason assumption `a` no longer holds, or None if it does."""
+def _signature_problem(node, symbol, want, forwards=False):
+    """Why `symbol`'s signature no longer supports how the patch calls it.
+
+    The injected blocks call the original POSITIONALLY and with a fixed arg list:
+
+        await _tc_orig_create_snapshot(middleware, path, name)
+        _tc_orig_get_restic_config(cloud_backup)
+
+    So a name-subset test ("are these names still in there somewhere?") is not
+    enough, and that is what this used to be. It passed a reorder, a keyword-only
+    conversion, and an added required parameter -- each of which is a TypeError or,
+    worse, silently correct-looking with the arguments swapped.
+
+    The realistic one is not hypothetical: on `master`, iX already renamed
+    get_restic_config's parameter and added a second. That function is rebound
+    module-wide by RESTIC_BLOCK, so a wrong wrapper there kills EVERY TrueCloud
+    task -- Storj included, for users who never wanted this patch's features.
+    """
+    have = _positional(node)
+    n = len(want)
+
+    if have[:n] != want:
+        return (
+            f"{symbol}{tuple(have)} — positional parameters changed; the patch "
+            f"calls it as ({', '.join(want)})"
+        )
+
+    # Extra parameters are fine only if they are optional -- the patch will not pass
+    # them -- OR if the wrapper forwards *args/**kwargs, in which case whatever the
+    # caller supplied is handed straight through. A new REQUIRED one that we neither
+    # pass nor forward is a TypeError at the first backup.
+    args = node.args
+    required = len(have) - len(args.defaults)
+    if required > n and not forwards:
+        return (
+            f"{symbol} now requires {', '.join(have[n:required])} — the patch does "
+            f"not pass it"
+        )
+
+    req_kwonly = [
+        k.arg for k, d in zip(args.kwonlyargs, args.kw_defaults, strict=False)
+        if d is None
+    ]
+    if req_kwonly and not forwards:
+        return (
+            f"{symbol} now requires keyword-only {', '.join(req_kwonly)} — the "
+            f"patch does not pass it"
+        )
+
+    return None
+
+
+def check_source(a: Assumption, src: str | None) -> tuple[str, str | None]:
+    """("ok"|"broken"|"unknown", detail).
+
+    "unknown" exists so that "I cannot inspect this" is never reported as "this is
+    broken". Only "broken" makes a module decline to apply, and declining wrongly
+    breaks a box that was working.
+    """
     if src is None:
-        return f"{a.path} does not exist"
+        return "broken", f"{a.path} does not exist"
 
     try:
         tree = ast.parse(src)
     except SyntaxError as e:
-        return f"{a.path} does not parse: {e}"
+        return "unknown", f"{a.path} does not parse: {e}"
 
     node = _find(tree, a.symbol)
     if node is None:
-        return f"{a.path} no longer defines {a.symbol}"
+        root = a.symbol.split(".", 1)[0]
+        if _imports(tree, root):
+            # Re-exported: `from ._impl import get_restic_config`. The name is still
+            # there and the patch's rebinding still works; we simply cannot see the
+            # signature from here. Refusing to apply over a refactor that changed
+            # nothing would be worse than not checking.
+            return "unknown", (
+                f"{a.path} re-exports {root} from another module; "
+                f"cannot verify its signature here"
+            )
+        return "broken", f"{a.path} no longer defines {a.symbol}"
 
     if a.kind == "class":
         if not isinstance(node, ast.ClassDef):
-            return f"{a.symbol} is no longer a class"
-        return None
+            return "broken", f"{a.symbol} is no longer a class"
+        return "ok", None
 
     if isinstance(node, ast.ClassDef):
-        return f"{a.symbol} is a class, expected a function"
+        return "broken", f"{a.symbol} is a class, expected a function"
 
     got_async = isinstance(node, ast.AsyncFunctionDef)
     if a.is_async is not None and got_async != a.is_async:
         want = "async def" if a.is_async else "def"
         got = "async def" if got_async else "def"
-        return (
-            f"{a.symbol} is now `{got}`, the patch requires `{want}` "
-            f"({a.path})"
+        return "broken", (
+            f"{a.symbol} is now `{got}`, the patch requires `{want}` ({a.path})"
         )
 
-    have = _params(node)
-    missing = [p for p in a.params if p not in have]
-    if missing:
-        return (
-            f"{a.symbol}{tuple(have)} no longer takes {', '.join(missing)}"
-        )
-
-    return None
+    problem = _signature_problem(node, a.symbol, a.params, a.forwards)
+    return ("broken", problem) if problem else ("ok", None)
 
 
 # ── sources ──────────────────────────────────────────────────────────────────
 
+class Unreadable(Exception):
+    """The source could not be READ. That is not the same as it not existing.
+
+    Folding these together is how a network blip becomes "iX deleted six files",
+    which becomes "both modules are broken", which becomes a bug report, a red
+    support matrix pushed to the README, and -- on a real box -- a module declining
+    to apply. A transient failure must never be able to say anything about
+    middleware.
+    """
+
+
 def _fetch(ref: str, path: str) -> str | None:
+    """Source at `ref`, None if iX genuinely does not have that file (404).
+
+    Raises Unreadable for anything else: rate limits (the matrix makes ~30
+    unauthenticated requests per run and 429 is a real outcome), DNS, timeouts.
+    """
     url = RAW.format(ref=ref, path=path)
     try:
         with urllib.request.urlopen(url, timeout=_TIMEOUT) as r:  # noqa: S310
-            if r.status != 200:
+            if r.status == 404:
                 return None
+            if r.status != 200:
+                raise Unreadable(f"{url} -> HTTP {r.status}")
             return r.read().decode("utf-8", "replace")
-    except Exception:
-        return None
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None          # the file really is gone
+        raise Unreadable(f"{url} -> HTTP {e.code}") from e
+    except Unreadable:
+        raise
+    except Exception as e:
+        raise Unreadable(f"{url} -> {e!r}") from e
 
 
 def _read(root: str, path: str) -> str | None:
+    full = os.path.join(root, *path.split("/"))
     try:
-        with open(os.path.join(root, *path.split("/")), encoding="utf-8") as fh:
+        with open(full, encoding="utf-8") as fh:
             return fh.read()
-    except OSError:
-        return None
+    except FileNotFoundError:
+        return None                       # genuinely absent
+    except OSError as e:
+        raise Unreadable(f"{full} -> {e!r}") from e   # permissions, I/O, ...
+
+
+def _stock(text: str) -> str:
+    """Only the part of the file that iX wrote.
+
+    Our own blocks are appended after the MARKER, and they quote the very strings
+    the probes look for -- B2_BLOCK literally writes `B2RcloneRemote.restic = True`
+    into b2.py, and CRUD_BLOCK quotes the "no further nesting" message it filters
+    on. Scanning the whole file on an already-patched box therefore finds OUR text
+    and concludes TrueNAS went native, i.e. "retire the module". apply.sh has always
+    cut at the marker for exactly this reason; compat.py did not, so the one command
+    its own docstring recommends for a live box (`--tree /usr/lib/.../middlewared`)
+    reported providers as native on every patched machine.
+    """
+    return text.split("\n# TRUECLOUD_PATCH", 1)[0]
 
 
 def check(loader, modules=None) -> dict:
-    """Check every assumption. `loader(path) -> source|None`.
+    """Check every assumption. `loader(path) -> source|None`, may raise Unreadable.
 
-    Returns {module: {"ok": bool, "native": bool, "problems": [...]}}.
+    Returns {module: {"ok", "native", "unknown", "problems"}}.
+
+    `unknown` means the sources could not be READ -- a rate limit, a timeout, an
+    unreadable tree. It is NOT `ok` and it is emphatically NOT `broken`: nothing may
+    act on a verdict derived from a failed download.
     """
     modules = modules or [PROVIDERS, NESTED]
     cache = {}
@@ -261,27 +414,51 @@ def check(loader, modules=None) -> dict:
             cache[path] = loader(path)
         return cache[path]
 
-    out = {m: {"ok": True, "native": False, "problems": []} for m in modules}
+    out = {
+        m: {"ok": True, "native": False, "unknown": False, "problems": []}
+        for m in modules
+    }
 
     for a in ASSUMPTIONS:
         if a.module not in out:
             continue
-        problem = check_source(a, src(a.path))
-        if problem:
+        try:
+            text = src(a.path)
+        except Unreadable as e:
+            out[a.module]["unknown"] = True
+            out[a.module]["problems"].append({
+                "id": a.id, "detail": f"could not read {a.path}: {e}", "why": a.why,
+            })
+            continue
+
+        status, detail = check_source(a, text if text is None else _stock(text))
+        if status == "broken":
             out[a.module]["ok"] = False
             out[a.module]["problems"].append({
-                "id": a.id, "detail": problem, "why": a.why,
+                "id": a.id, "detail": detail, "why": a.why,
+            })
+        elif status == "unknown":
+            out[a.module]["unknown"] = True
+            out[a.module]["problems"].append({
+                "id": a.id, "detail": detail, "why": a.why,
             })
 
     for module, (path, phrase, native_when_present) in NATIVE_PROBES.items():
         if module not in out:
             continue
-        text = src(path)
+        try:
+            text = src(path)
+        except Unreadable:
+            out[module]["unknown"] = True
+            continue
         if text is None:
             continue
-        present = _squash(phrase) in _squash(text)
+        present = _squash(phrase) in _squash(_stock(text))
         out[module]["native"] = (present == native_when_present)
 
+    # `ok` is cleared ONLY by a definite violation, so "unknown" never needs to
+    # repair it -- and must not: a module with one unreadable file AND one proven
+    # broken assumption is broken, not unknown.
     return out
 
 
@@ -419,9 +596,26 @@ def matrix(refs=None, remote: str = REPO) -> list[dict]:
 
 
 def _verdict(r: dict) -> str:
+    """BROKEN outranks native, which outranks unknown.
+
+    "native" used to win outright, which meant a module that was BOTH broken and
+    apparently-native rendered as good news: green CI, no bug report, and a README
+    row telling users the feature went native while it was in fact broken. A proven
+    violation is the strongest signal here and must never be masked by a weaker one
+    -- and the native probe is only a substring match on iX's source, so it is
+    exactly the weaker one.
+    """
+    if not r["ok"]:
+        return "BROKEN"
     if r["native"]:
         return "native"
-    return "ok" if r["ok"] else "BROKEN"
+    if r["unknown"]:
+        return "unknown"
+    return "ok"
+
+
+def is_broken(r: dict) -> bool:
+    return not r["ok"]
 
 
 #: Versions a human has actually run a backup on, with real data, on real hardware.
@@ -456,7 +650,22 @@ END = "<!-- END COMPAT MATRIX -->"
 
 
 def update_readme(rows: list[dict], path: str = README) -> bool:
-    """Rewrite the README's matrix block. True if it changed."""
+    """Rewrite the README's matrix block. True if it changed.
+
+    Refuses if ANY row could not be fully checked. The published matrix is what a
+    stranger reads before trusting this with their backups, and CI pushes it
+    automatically -- so a rate limit or a DNS blip must never be able to repaint it.
+    A stale-but-true table beats a fresh-but-invented one.
+    """
+    unknown = [
+        r["ref"] for r in rows
+        if any(m["unknown"] for m in r["modules"].values())
+    ]
+    if unknown:
+        raise Unreadable(
+            "not rewriting the matrix: could not fully check " + ", ".join(unknown)
+        )
+
     with open(path, encoding="utf-8") as fh:
         text = fh.read()
 
@@ -494,6 +703,7 @@ def render_markdown(rows: list[dict]) -> str:
                 "ok": "ok",
                 "BROKEN": "**BROKEN**",
                 "native": "native",
+                "unknown": "unknown",
             }[v])
 
         version = ref.removeprefix("TS-")
@@ -579,7 +789,7 @@ def main(argv):
         shipped_broken = [
             r["ref"] for r in rows
             if not r["unreleased"]
-            and any(not m["ok"] and not m["native"] for m in r["modules"].values())
+            and any(is_broken(m) for m in r["modules"].values())
         ]
         if shipped_broken:
             print(f"\nBROKEN on shipped releases: {', '.join(shipped_broken)}",
@@ -597,7 +807,7 @@ def main(argv):
         print(render(label, result))
 
     # Exit 1 if any module is broken. "Native" is not broken -- it is good news.
-    return 1 if any(not r["ok"] and not r["native"] for r in result.values()) else 0
+    return 1 if any(is_broken(r) for r in result.values()) else 0
 
 
 if __name__ == "__main__":

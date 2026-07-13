@@ -50,10 +50,18 @@ def _git(*args: str, cwd: str | None = None) -> str:
 
 
 def rc_tags(version: str, cwd: str | None = None) -> list[str]:
-    """Every rc tag for this version, oldest first (rc2 sorts after rc1)."""
-    want = normalise(base_version(version))
-    out = _git("tag", "--list", f"v{want}-rc*", cwd=cwd)
-    tags = [t.strip() for t in out.splitlines() if t.strip()]
+    """Every rc tag for this version, oldest first (rc2 sorts after rc1).
+
+    The glob is only a prefilter; the anchored regex decides. `v1.0.0-rc*` also
+    matches `v1.0.0-rc1-hotfix`, which _rc_number reads as 0 -- so a tag the
+    numbering logic does not understand could satisfy the barrier while never having
+    been a release candidate.
+    """
+    want = re.escape(normalise(base_version(version)))
+    exact = re.compile(rf"^v{want}-rc\d+$")
+
+    out = _git("tag", "--list", f"v{normalise(base_version(version))}-rc*", cwd=cwd)
+    tags = [t.strip() for t in out.splitlines() if exact.match(t.strip())]
     return sorted(tags, key=_rc_number)
 
 
@@ -79,9 +87,15 @@ def commit_for(ref: str, cwd: str | None = None) -> str | None:
 def check_promotable(version: str, cwd: str | None = None) -> list[str]:
     """Every reason v<version> may not be cut as a stable release.
 
-    Empty list means the barrier is satisfied. Does NOT talk to the network: CI
-    layers the "did that rc's run actually pass" check on top, because only CI can
-    see workflow results.
+    Empty list means the barrier is satisfied.
+
+    The commit under test is the tag's if it exists, and HEAD otherwise. Both are
+    real: CI runs this AFTER the tag is pushed, and release.sh runs it BEFORE
+    creating the tag -- which is the whole point, since refusing after the tag
+    exists is too late to be a gate. Requiring the tag unconditionally made
+    `release.sh --promote` impossible: it dies if the tag already exists, and the
+    gate died if it did not, so the only way through was to hand-tag and bypass
+    every check this file exists to enforce.
     """
     if is_prerelease(version):
         return []  # candidates are what the barrier exists to encourage
@@ -91,7 +105,9 @@ def check_promotable(version: str, cwd: str | None = None) -> list[str]:
 
     target = commit_for(tag, cwd=cwd)
     if target is None:
-        return [f"{tag} does not exist"]
+        target = commit_for("HEAD", cwd=cwd)
+    if target is None:
+        return ["cannot resolve a commit to release (no HEAD?)"]
 
     candidates = rc_tags(want, cwd=cwd)
     if not candidates:

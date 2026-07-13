@@ -26,23 +26,12 @@ worse than no alert, because one day it carries a security fix.
   then I pushed one more little fix" is refused by name — that is precisely how
   v0.5.1 happened.
 
-### Changed
-
-- **A stable release may not leave work stranded under `## Unreleased`.** Either it
-  is finished and belongs in the release, or the release is premature. Candidates
-  are exempt: an rc may legitimately have work queued behind it.
-
-- **`release.sh` refuses to run on an installed box.** The whole repo is cloned onto
-  every box, so this file is there too; `update.sh` pins the checkout to a tag in
-  detached HEAD, and `release.sh` now recognises that and says so, rather than
-  emitting a confusing branch error.
-
 - **TrueNAS compatibility is now checked, not hoped for.**
   [`tools/compat.py`](tools/compat.py) is a written-down record of everything each
   module assumes about middlewared, checked in two places:
 
   - **CI, daily** — against iXsystems' source at every release line *including
-    `master` and the current BETA/RC_. When an unreleased TrueNAS breaks the patch
+    `master` and the current BETA/RC*. When an unreleased TrueNAS breaks the patch
     it files a bug report automatically, so there is time to fix it before that
     version reaches anyone. It also refreshes the README's support matrix, so the
     table cannot quietly become a false promise.
@@ -50,11 +39,61 @@ worse than no alert, because one day it carries a security fix.
     box. **A module whose assumptions no longer hold is not applied.** Stock TrueNAS
     without a feature beats TrueNAS with a broken backup.
 
-  This immediately found a real one: **TrueNAS 26 rewrites the entire `cloud_backup`
-  path from async to synchronous.** Every block the nested module injects is an
-  `async def` wrapping an `await`ed original, so on 26 it hands `sync.py` a coroutine
-  where it unpacks a tuple. Nobody would have found out until a restore failed. On
-  TrueNAS 26 the nested module now simply stays off.
+  It immediately found two real breaks: TrueNAS 26 (below), and a nested-snapshot bug
+  that had been shipping for two releases (below).
+
+### Fixed
+
+- **Nested snapshots were broken on TrueNAS 24.10 and 25.04, and had been all
+  along.** `SYNC_BLOCK`'s wrapper spelled out the stock signature and forwarded five
+  arguments — but those releases declare `restic_backup(middleware, job,
+  cloud_backup, dry_run)`; `rate_limit` only arrived in 25.10. Every nested backup on
+  24.10/25.04 raised `TypeError: restic_backup() takes 4 positional arguments but 5
+  were given`. The wrapper now takes `*args, **kwargs` and forwards whatever it is
+  handed, so a trailing parameter appearing or disappearing is a non-event.
+
+  Found by the new compatibility check, not by a user — which is the whole argument
+  for having it. The check it replaced only asked whether the parameter *names* still
+  appeared somewhere in the signature, so it happily passed a call that could never
+  work.
+
+- **TrueNAS 26 rewrites the entire `cloud_backup` path from async to synchronous.**
+  Every block the nested module injects is an `async def` wrapping an `await`ed
+  original, so on 26 it would hand `sync.py` a coroutine where it unpacks a tuple —
+  a broken backup, discovered at restore time. On TrueNAS 26 the nested module now
+  stays off rather than applying and breaking.
+
+- **An incompatible TrueNAS no longer sets the permanent kill switch.** `apply.sh`
+  reused a "nothing left to do" exit that touches `disabled`, which suppresses
+  patching on every future boot and is cleared only by `install.sh` — never by
+  `update.sh`. On TrueNAS 26 (providers-compatible, nested opt-out by default) that
+  branch would have fired, and the very release that fixed 26 could not have
+  re-enabled itself: the user would run `bash update.sh`, exactly as the update alert
+  tells them to, and the patch would stay dead with their B2 backups off.
+  Incompatibility now means "apply nothing this boot, try again next boot".
+  Retirement and incompatibility are opposite situations and no longer share an exit.
+
+- **The compatibility check itself could be fooled**, in ways that each had teeth: a
+  reordered, keyword-only, or newly-required parameter now reads as broken (the patch
+  calls these positionally); a **re-exported or conditionally-defined** symbol reads
+  as *unknown* rather than broken, so an innocent upstream refactor cannot make a
+  working module decline to apply; an **unreadable** source (rate limit, DNS, timeout)
+  is *unknown* rather than "iXsystems deleted this file", so a network blip cannot
+  file a bug report, fail CI, and repaint the published support matrix; and `native`
+  no longer masks `BROKEN`, which used to render a TrueNAS that both reworded the
+  nesting guard *and* reshaped the functions as good news.
+
+- **`compat.py --tree` no longer reads the patch's own code as native support.**
+  `B2_BLOCK` writes `B2RcloneRemote.restic = True` into `b2.py` — exactly the string
+  the providers native-probe looks for — so the one command the docs recommend for
+  checking a live box said "retire the providers module" on every *patched* machine.
+  It now reads only the part of the file iXsystems wrote.
+
+- **`release.sh --promote` could never succeed.** It refused to run if the stable tag
+  existed, and the gate refused if it did not — mutually exclusive, so the only way to
+  cut a stable release was to hand-tag and bypass every gate this work exists to
+  enforce. The gate now resolves the tag's commit if it exists and `HEAD` otherwise.
+  The tests hid it by always tagging first.
 
 ### Changed
 
@@ -71,9 +110,9 @@ worse than no alert, because one day it carries a security fix.
   GitHub as a mirror. Both forges run the same workflows and publish the same
   releases. The update alert now **derives the changelog URL from the `origin`
   remote** instead of hard-coding GitHub — which matters more than it sounds: when
-  the changelog cannot be read, the alert deliberately fires *anyway* rather than
-  risk hiding a security fix, so a stale URL would not have disabled the alert, it
-  would have made it nag on every release including documentation-only ones.
+  the changelog cannot be read, the alert deliberately fires *anyway* rather than risk
+  hiding a security fix, so a stale URL would not have disabled the alert, it would
+  have made it nag on every release, including documentation-only ones.
 
 ### Security
 
