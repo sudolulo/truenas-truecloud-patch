@@ -66,6 +66,18 @@ worse than no alert, because one day it carries a security fix.
 
 ### Fixed
 
+- **Installing the patch permanently blocked updating it.** `install.sh` does
+  `chmod +x update.sh`, and git recorded `update.sh` as `100644` — so the chmod was a
+  *tracked modification*, and `update.sh` refuses to run over a dirty tree. Install
+  once and you could never update again; the error even told you to run
+  `git checkout -- .`, which just undoes the exec bit so the next install can re-dirty
+  it. A real box sat on an old version for exactly this reason.
+
+  Fixed on both sides: the scripts `install.sh` chmods are now executable in git (so
+  the chmod is a no-op), and `update.sh`'s dirty check now looks at **content**, not
+  file mode — `git diff --numstat` reports `0 0` for a mode-only change. A test
+  asserts every script in `install.sh`'s chmod loop is already `100755` in git.
+
 - **Nested snapshots were broken on TrueNAS 24.10 and 25.04, and had been all
   along.** `SYNC_BLOCK`'s wrapper spelled out the stock signature and forwarded five
   arguments — but those releases declare `restic_backup(middleware, job,

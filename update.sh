@@ -136,9 +136,21 @@ fi
 
 # A dirty tree means someone edited or scp'd files in place; merging over that
 # silently loses their changes, or conflicts halfway through.
-if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+#
+# CONTENT changes only. A mode-only change (100644 -> 100755) is not somebody's work
+# and must not block an update -- and it is not hypothetical: install.sh chmod +x's
+# these very scripts, so on any version where git recorded one as 100644, INSTALLING
+# dirtied the checkout and update.sh then refused to run. Install once, and updating
+# was blocked forever, with an error telling the user to `git checkout -- .` (which
+# merely undoes the exec bit so the next install can re-dirty it). A real box sat on
+# an old version for exactly this reason.
+#
+# `git diff --numstat` reports "0  0  file" for a mode-only change, so anything with a
+# nonzero insert or delete count is a genuine edit.
+_dirty=$(git diff --numstat HEAD -- . | awk '$1 != 0 || $2 != 0 { print $3 }')
+if [ -n "$_dirty" ]; then
     echo "ERROR: the working tree has uncommitted changes:" >&2
-    git status --short --untracked-files=no >&2
+    printf '  M %s\n' $_dirty >&2
     echo "" >&2
     echo "  Refusing to update over them. Commit, stash, or discard them first:" >&2
     echo "    git -C $PATCH_DIR checkout -- ." >&2

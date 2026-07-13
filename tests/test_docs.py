@@ -94,3 +94,40 @@ class TestTheReadmeStaysAReadme:
         assert "24.10" in text[:text.index("## Install")], (
             "the minimum TrueNAS version must be visible above the install steps"
         )
+
+
+class TestInstallDoesNotDirtyTheCheckout:
+    """install.sh chmod +x's scripts. If git records them as 100644, that chmod is a
+    TRACKED MODIFICATION -- and update.sh refuses to run over a dirty tree.
+
+    So installing once permanently blocked updating, for every user, with a message
+    telling them to `git checkout -- .` (which would just undo the exec bit and let
+    the next install re-dirty it). Found on a real box that had been stuck on an old
+    version for exactly this reason.
+
+    Every script install.sh makes executable must already be executable in git.
+    """
+
+    def test_every_chmodded_script_is_already_executable_in_git(self):
+        import re
+        import subprocess
+
+        with open(os.path.join(ROOT, "install.sh"), encoding="utf-8") as fh:
+            m = re.search(r"^for _exe in (.+?); do", fh.read(), re.M)
+        assert m, "could not find install.sh's chmod loop"
+        scripts = m.group(1).split()
+
+        out = subprocess.run(
+            ["git", "ls-files", "-s", *scripts],
+            cwd=ROOT, capture_output=True, text=True, check=True,
+        ).stdout
+
+        not_exec = [
+            line.split("\t")[-1] for line in out.strip().splitlines()
+            if not line.startswith("100755")
+        ]
+        assert not not_exec, (
+            "install.sh chmod +x's these, but git records them as non-executable — "
+            "so installing dirties the checkout and update.sh then refuses to run:\n  "
+            + "\n  ".join(not_exec)
+        )
