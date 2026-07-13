@@ -1,0 +1,98 @@
+name: Release
+
+# Push a tag, get a release. The body always comes from CHANGELOG.md, so there is
+# no second place to write release notes and therefore no second place for them to
+# go stale.
+#
+#   git tag -a v0.4.0 -m "v0.4.0" && git push origin v0.4.0
+#
+# workflow_dispatch exists to create a release for a tag that already exists
+# (backfilling history), since re-pushing an existing tag triggers nothing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to create a release for (e.g. v0.2.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Never publish a release for code that does not pass its own tests. A
+      # tagged commit is what people install; it has to be at least as good as
+      # main.
+      - name: install dev deps
+        run: python -m pip install --upgrade pip pytest ruff
+
+      - name: ruff
+        run: ruff check patch tests tools
+
+      - name: pytest
+        run: pytest tests -q
+
+      - name: shell syntax
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            bash -n "$f" || { echo "::error file=$f::bash syntax error"; fail=1; }
+          done < <(find . -name '*.sh' -not -path './.git/*')
+          exit $fail
+
+      # Catches the failure mode this repo actually had: VERSION= drifted to
+      # three different values across the scripts, and nothing noticed.
+      - name: version matches tag and CHANGELOG has a section
+        run: python3 tools/release_notes.py check "${{ steps.tag.outputs.tag }}"
+
+      - name: extract release notes from CHANGELOG
+        run: |
+          python3 tools/release_notes.py notes "${{ steps.tag.outputs.tag }}" > /tmp/notes.md
+          echo "--- release body ---"
+          cat /tmp/notes.md
+
+      - name: create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          # Pre-1.0 and any -rc/-beta suffix ship as prereleases, not "Latest".
+          prerelease=""
+          case "$TAG" in
+            *-rc*|*-beta*|*-alpha*) prerelease="--prerelease" ;;
+          esac
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists — updating notes."
+            gh release edit "$TAG" --notes-file /tmp/notes.md
+          else
+            # shellcheck disable=SC2086
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes-file /tmp/notes.md \
+              $prerelease
+          fi
