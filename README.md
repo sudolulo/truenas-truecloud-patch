@@ -38,8 +38,8 @@ knowing:
   log after an update.
 - If you file a TrueNAS bug report, **remove the patch first** and reproduce on a
   stock system.
-- **Test your restores.** That is true of any backup, but it matters more here —
-  see [Verifying it works](#verifying-it-works).
+- **Test your restores.** True of any backup, but it matters more here — see
+  [Verifying it works](#verifying-it-works).
 - Provided as-is, no warranty. See LICENSE.
 
 The patch is two independent modules — **providers** (B2/S3) and **nested**
@@ -112,10 +112,14 @@ bash install.sh --disable-nested-snapshots
 With neither flag `install.sh` leaves the setting alone, so `git pull && bash
 install.sh` won't flip it. The providers module is unaffected either way.
 
-The planner and the snapshot lifecycle have been validated against a real
-250-dataset pool. The `mount --bind` staging step has not yet been exercised by a
-live backup run, so confirm your first backup actually contains child-dataset
-data before relying on it — see [Verifying it works](#verifying-it-works).
+Validated end to end on a live 252-dataset pool: an unattended scheduled backup
+of `/mnt/Tap` built a 173-mount staging tree, completed in **18m14s**, and left
+**zero** orphaned snapshots and **zero** stale mounts behind. The same backup
+previously stalled at 74% for over 12 hours reading live files.
+
+Still: verify your own first run actually contains child-dataset data before you
+rely on it — see [Verifying it works](#verifying-it-works). That advice is not
+boilerplate; it is the specific thing this feature exists to make true.
 
 TrueCloud Backup's **Take Snapshot** option makes restic read from a frozen ZFS
 snapshot instead of live files. Without it the backup reads data *while apps are

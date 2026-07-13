@@ -187,6 +187,17 @@
   middlewared-restart case (which empties it) that must not orphan a snapshot
   tree. One record, on disk, or none.
 
+### Validated in production
+
+An unattended scheduled backup of a live 252-dataset pool (`/mnt/Tap`, TrueNAS
+25.10) ran through the staging tree end to end:
+
+- 252 datasets recursively snapshotted, 173 bind mounts built and verified
+- completed in **18m14s**, `SUCCESS` — the same task previously stalled at 74%
+  for over 12 hours reading live files
+- **zero** orphaned ZFS snapshots and **zero** stale mounts afterwards, which is
+  the failure mode that would otherwise have accumulated 251 snapshots per run
+
 ### Known issues
 
 - Stock `restic_backup()` deletes the ZFS snapshot in its own `finally`, which
