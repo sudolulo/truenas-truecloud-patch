@@ -56,6 +56,17 @@ jobs:
           python3 tools/compat.py --matrix --json > /tmp/matrix.json || rc=$?
           echo "shipped_broken=$rc" >> "$GITHUB_OUTPUT"
 
+      # The report body is written to a FILE, and never becomes a step output.
+      #
+      # An earlier version did `echo "${{ steps.report.outputs.body }}"`, which
+      # splices the text into the shell script itself -- and the report is full of
+      # backticks, so bash ran `create-snapshot`, `def` and `async` as commands. It
+      # is also an injection vector: the report is built from iX's source, so
+      # anything that lands in middleware would execute on the runner.
+      #
+      # The rule that avoids the whole class: never interpolate ${{ }} into a `run:`
+      # body. Files for data, `env:` for scalars (the runner sets those, rather than
+      # pasting them into the script).
       - name: build the report
         id: report
         run: |
@@ -76,14 +87,18 @@ jobs:
               if any(not m["ok"] and not m["native"] for m in r["modules"].values())
           ]
           native = [
-              r for r in rows
-              if any(m["native"] for m in r["modules"].values())
+              (r["ref"], mod)
+              for r in rows
+              for mod, m in sorted(r["modules"].items()) if m["native"]
           ]
 
-          print(f"broken={'1' if broken else '0'}")
-          print(f"refs={','.join(r['ref'] for r in broken)}")
-
-          lines = []
+          lines = [
+              "`tools/compat.py` found that the patch's assumptions about "
+              "middlewared no longer hold.",
+              "",
+              compat.render_markdown(rows),
+              "",
+          ]
           for r in broken:
               lines.append(f"### {r['ref']}")
               lines.append("")
@@ -96,21 +111,19 @@ jobs:
                       lines.append(f"- `{p['id']}`: {p['detail']}")
                       lines.append(f"  - why it matters: {p['why']}")
                   lines.append("")
-          if native:
-              lines.append("### Native support detected")
-              lines.append("")
-              for r in native:
-                  for mod, m in sorted(r["modules"].items()):
-                      if m["native"]:
-                          lines.append(
-                              f"- `{r['ref']}`: **{mod}** appears to be native now — "
-                              f"retire the module rather than fixing it."
-                          )
+          for ref, mod in native:
+              lines.append(
+                  f"- `{ref}`: **{mod}** appears to be NATIVE now — retire the "
+                  f"module rather than fixing it."
+              )
+          lines += ["", "_Filed automatically by `.github/workflows/compat.yml`._"]
 
-          # GITHUB_OUTPUT is line-based; a multi-line value needs a heredoc marker.
-          print("body<<__EOF__")
-          print("\n".join(lines))
-          print("__EOF__")
+          with open("/tmp/issue.md", "w") as fh:
+              fh.write("\n".join(lines))
+
+          # Scalars only. The body stays in the file.
+          print(f"broken={'1' if broken else '0'}")
+          print(f"refs={','.join(r['ref'] for r in broken)}")
           PY
 
       - name: matrix
@@ -132,25 +145,15 @@ jobs:
           # One issue per set of broken refs, reopened/updated rather than duplicated
           # daily -- a bot that files the same issue every morning gets muted, and
           # then it is not a warning system any more.
-          existing="$(gh issue list --state all --label compat --search "$TITLE" \
-                        --json number,title,state \
-                        --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)"
-
-          {
-            echo "\`tools/compat.py\` found that the patch's assumptions no longer hold."
-            echo
-            cat /tmp/matrix.md
-            echo
-            echo "${{ steps.report.outputs.body }}"
-            echo
-            echo "_Filed automatically by \`.github/workflows/compat.yml\`._"
-          } > /tmp/issue.md
+          existing="$(gh issue list --state all --search "$TITLE" \
+                        --json number,title \
+                        --jq '.[] | select(.title == env.TITLE) | .number' | head -1)"
 
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body-file /tmp/issue.md
             gh issue reopen "$existing" 2>/dev/null || true
           else
-            gh issue create --title "$TITLE" --body-file /tmp/issue.md --label compat
+            gh issue create --title "$TITLE" --body-file /tmp/issue.md
           fi
 
       - name: file a bug report (Gitea)
@@ -160,16 +163,6 @@ jobs:
           API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
           TITLE: "Incompatible with upcoming TrueNAS: ${{ steps.report.outputs.refs }}"
         run: |
-          {
-            echo "\`tools/compat.py\` found that the patch's assumptions no longer hold."
-            echo
-            cat /tmp/matrix.md
-            echo
-            echo "${{ steps.report.outputs.body }}"
-            echo
-            echo "_Filed automatically by \`.github/workflows/compat.yml\`._"
-          } > /tmp/issue.md
-
           body="$(jq -Rs . < /tmp/issue.md)"
           title="$(printf '%s' "$TITLE" | jq -Rs .)"
 
