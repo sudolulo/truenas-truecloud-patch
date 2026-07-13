@@ -640,10 +640,16 @@ if _tc_nested is not None:
             return await _tc_orig_restic_backup(middleware, job, cloud_backup, *args, **kwargs)
         finally:
             try:
+                # logger= must be passed here too, exactly as the sync variant does.
+                # run_in_thread forwards **kwargs (functools.partial), and without it
+                # cleanup_task gets logger=None -- so every teardown warning ("could
+                # not unmount X") is silently swallowed on <= 25.10, which is most
+                # boxes. The two wrappers must differ ONLY in how they reach the core.
                 await middleware.run_in_thread(
                     _tc_nested.cleanup_task,
                     middleware,
                     f"cloud_backup-{cloud_backup.get('id', 'onetime')}",
+                    logger=getattr(middleware, "logger", None),
                 )
             except Exception as e:
                 middleware.logger.warning("truecloud-patch: staging cleanup failed: %r", e)

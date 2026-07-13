@@ -51,6 +51,22 @@ GOOD = {
         "async def restic_backup(middleware, job, cloud_backup, dry_run=False, "
         "rate_limit=None):\n    pass\n"
     ),
+    # The middlewared METHODS the injected code calls. TrueNAS 26 deleted both of
+    # these files, taking zfs.dataset.query / zfs.snapshot.query / zfs.snapshot.delete
+    # with them -- see TestMiddlewareMethodsWeCall.
+    "plugins/zfs_/dataset.py": (
+        "class ZFSDataset(CRUDService):\n"
+        "    class Config:\n"
+        "        namespace = 'zfs.dataset'\n"
+        "    def query(self, filters, options):\n        pass\n"
+    ),
+    "plugins/zfs_/snapshot.py": (
+        "class ZFSSnapshot(CRUDService):\n"
+        "    class Config:\n"
+        "        namespace = 'zfs.snapshot'\n"
+        "    def query(self, filters, options):\n        pass\n"
+        "    def delete(self, id_, options={}):\n        pass\n"
+    ),
 }
 
 
@@ -271,3 +287,75 @@ class TestAsyncFlavour:
     def test_the_real_truenas_versions(self):
         # Pinning the actual fact this whole port exists for.
         assert compat.async_flavour(loader(GOOD)) is True
+
+
+class TestMiddlewareMethodsWeCall:
+    """The assumption class that was MISSING, and that hid a catastrophic break.
+
+    The manifest recorded the symbols the patch WRAPS. It said nothing about the
+    middlewared methods the patch CALLS -- and TrueNAS 26 deleted
+    plugins/zfs_/dataset.py and plugins/zfs_/snapshot.py outright, taking
+    `zfs.dataset.query`, `zfs.snapshot.query` and `zfs.snapshot.delete` with them.
+
+    Nothing about the five cloud_backup files reveals that. The patch applied
+    perfectly and every other check went green. The first backup would have failed --
+    or, far worse, snapshotted fine and then failed to DELETE, orphaning one snapshot
+    per descendant dataset (250 on a real pool) on every run, forever.
+    """
+
+    ZFS_SNAPSHOT = (
+        "class ZFSSnapshot(CRUDService):\n"
+        "    class Config:\n"
+        "        namespace = 'zfs.snapshot'\n"
+        "    def query(self, filters, options):\n        pass\n"
+        "    def delete(self, id_, options={}):\n        pass\n"
+    )
+    ZFS_DATASET = (
+        "class ZFSDataset(CRUDService):\n"
+        "    class Config:\n"
+        "        namespace = 'zfs.dataset'\n"
+        "    def query(self, filters, options):\n        pass\n"
+    )
+
+    def _tree(self, **over):
+        files = dict(GOOD)
+        files["plugins/zfs_/snapshot.py"] = self.ZFS_SNAPSHOT
+        files["plugins/zfs_/dataset.py"] = self.ZFS_DATASET
+        files.update(over)
+        return files
+
+    def test_present_methods_are_ok(self):
+        r = check_files(self._tree())
+        assert r[NESTED]["ok"], r[NESTED]["problems"]
+
+    def test_a_deleted_plugin_file_is_broken(self):
+        # Literally TrueNAS 26: plugins/zfs_/snapshot.py does not exist.
+        r = check_files(self._tree(**{"plugins/zfs_/snapshot.py": None}))
+        assert is_broken(r[NESTED])
+        details = " ".join(p["detail"] for p in r[NESTED]["problems"])
+        assert "zfs.snapshot.delete" in details
+
+    def test_a_renamed_namespace_is_broken(self):
+        r = check_files(self._tree(**{
+            "plugins/zfs_/snapshot.py": self.ZFS_SNAPSHOT.replace(
+                "'zfs.snapshot'", "'zfs.resource.snapshot'"),
+        }))
+        assert is_broken(r[NESTED])
+
+    def test_the_CRUDService_do_prefix_is_accepted(self):
+        # 24.10 and 25.04 declare `do_delete`; 25.10 renamed it to `delete`. BOTH
+        # answer to zfs.snapshot.delete. Accepting only the literal name reported the
+        # two older releases as broken -- a false BROKEN that would have switched off
+        # nested snapshots on boxes where they work perfectly.
+        r = check_files(self._tree(**{
+            "plugins/zfs_/snapshot.py": self.ZFS_SNAPSHOT.replace(
+                "def delete(", "def do_delete("),
+        }))
+        assert r[NESTED]["ok"], r[NESTED]["problems"]
+
+    def test_the_snapshot_delete_reason_names_the_orphan_risk(self):
+        # If this ever regresses, whoever reads the bug report must understand that
+        # it is not a cosmetic failure.
+        r = check_files(self._tree(**{"plugins/zfs_/snapshot.py": None}))
+        whys = " ".join(p["why"] for p in r[NESTED]["problems"])
+        assert "orphan" in whys

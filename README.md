@@ -6,8 +6,10 @@
 > 24.10**. There is nothing here to install on an older release, and `install.sh`
 > will refuse.
 >
-> Verified on **24.10**, **25.04**, **25.10**, and the unreleased **26.0 beta**
-> (see [TrueNAS compatibility](#truenas-compatibility)).
+> Verified on **24.10**, **25.04** and **25.10**. The unreleased **26.0** is not yet
+> supported for nested snapshots — see [TrueNAS
+> compatibility](#truenas-compatibility). Nothing breaks if you upgrade: the patch
+> checks, and declines.
 
 Extends TrueNAS SCALE's **TrueCloud Backup** feature to:
 
@@ -44,7 +46,7 @@ costs a fraction of the new Storj price.
 | 24.10.2.4 | ok | ok | — |
 | 25.04.2.6 | ok | ok | — |
 | 25.10.4 | ok | ok | nested + providers; 252-snapshot recursive backup of /mnt/Tap, 18m |
-| 26.0.0-BETA.3 _(unreleased)_ | ok | ok | — |
+| 26.0.0-BETA.3 _(unreleased)_ | ok | **BROKEN** | — |
 | master _(unreleased)_ | **BROKEN** | **BROKEN** | — |
 
 | verdict | meaning |
@@ -62,31 +64,40 @@ The table above is **regenerated daily by CI** — it is not a claim somebody ty
 once and forgot. **TrueCloud Backup does not exist before 24.10**, so earlier
 versions are absent rather than "unsupported".
 
-### TrueNAS 26 — supported, and this is how we knew in advance
+### TrueNAS 26 — nested snapshots are not supported yet
 
-TrueNAS 26 rewrites the whole `cloud_backup` path **from async to synchronous**.
-Every block the nested module injected was an `async def` wrapping an `await`ed
-original, so on 26 it would have handed `sync.py` a coroutine where it unpacks a
-tuple, and 26 also **deleted `get_dataset_recursive()`**, which one of those blocks
-called. Both are backup-breaking, and neither would have surfaced until a restore
-failed.
+**You do not need to do anything, and upgrading will not break your backups.** On
+26, `apply.sh` finds that the nested module's assumptions no longer hold and **does
+not apply it**. TrueNAS is left stock: B2/S3 backups keep running (the providers
+module is unaffected), datasets nested under the target are simply not included, and
+the reason is named in `apply.log`. A broken backup is worse than a missing feature.
 
-The daily compatibility check found both **while 26 was still in beta**, and filed
-the bug report itself. The patch now reads which flavour of `cloud_backup` your box
-has and injects the wrapper that matches — one implementation of the actual logic,
-two thin wrappers — and carries its own copy of the deleted helper.
+TrueNAS 26 changes three things underneath this module, and each one alone is
+backup-breaking:
 
-**If a future TrueNAS breaks it anyway, nothing bad happens quietly.** `apply.sh`
-re-checks these assumptions against the middleware *actually installed on your box*
-at every boot and will not apply a module that no longer fits: TrueNAS is left
-stock, backups keep running without that module's feature, and the reason is named
-in `apply.log`. A broken backup is worse than a missing feature.
+| what changed | what it would have done |
+| --- | --- |
+| `cloud_backup` rewritten **async → synchronous** | an `async def` wrapper hands `sync.py` a coroutine where it unpacks a tuple |
+| `get_dataset_recursive()` **deleted** from `plugins/cloud/snapshot.py` | `NameError` — the injected block called it out of the host module's namespace |
+| `plugins/zfs_/dataset.py` and `zfs_/snapshot.py` **deleted** | `zfs.dataset.query`, `zfs.snapshot.query` and `zfs.snapshot.delete` all vanish. 26 uses `filesystem.statfs` and `zfs.resource.*` instead |
 
-`master` (the development branch after 26) currently reports **BROKEN**: iXsystems
-are still reshaping these functions there — renaming `middleware` to `context`,
-`cloud_backup` to `entry`, adding a required `credentials` parameter. That is a
-moving target and is deliberately not chased; the check will keep reporting it until
-it settles into a beta, which is exactly when it becomes worth fixing.
+The first two are fixed: the patch now reads which flavour of `cloud_backup` your box
+declares and injects the wrapper that matches (one implementation of the real logic,
+two thin wrappers), and it carries its own copy of the deleted helper.
+
+The third is **not** fixed, and is why 26 still reports BROKEN. Porting it means
+rewriting the module's ZFS calls onto 26's new API, and there is no single API that
+spans 24.10 through 26 — so it needs a real 26 box to verify against, not a
+plausible-looking diff. **Shipping a port nobody has run is exactly the failure this
+project exists to avoid.** The third row is also the one that would have hurt most:
+`zfs.snapshot.delete` is what sweeps the recursive snapshot, and without it every run
+would orphan one snapshot per descendant dataset — 250 on a real pool — forever.
+
+`master` (development after 26) reports BROKEN too: iXsystems are still reshaping
+these functions there, renaming `middleware` → `context` and `cloud_backup` →
+`entry`, and adding a required `credentials` parameter. That is a moving target and
+is deliberately not chased; the check keeps reporting it until it settles into a
+beta, which is when it becomes worth fixing.
 
 ### How this is kept honest
 

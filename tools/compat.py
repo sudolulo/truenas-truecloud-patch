@@ -135,6 +135,114 @@ ASSUMPTIONS = [
 ]
 
 
+class MiddlewareCall:
+    """A middlewared METHOD the injected code calls at runtime.
+
+    THIS CLASS OF ASSUMPTION IS WHY THE CHECKER EXISTS, AND IT WAS THE ONE MISSING.
+
+    The manifest above records the symbols the patch *wraps*. It said nothing about
+    the methods the patch *calls* -- and that gap hid two separate TrueNAS 26 breaks
+    that both pass every other check:
+
+      * `get_dataset_recursive()` was deleted from plugins/cloud/snapshot.py, and the
+        injected block called it out of the host module's namespace (now vendored).
+      * plugins/zfs_/dataset.py and plugins/zfs_/snapshot.py were DELETED outright,
+        taking `zfs.dataset.query`, `zfs.snapshot.query` and `zfs.snapshot.delete`
+        with them. 26 uses filesystem.statfs and zfs.resource.* instead.
+
+    Nothing about the five cloud_backup files reveals that. The patch would apply
+    perfectly, and then the FIRST BACKUP would fail -- or, far worse, succeed at
+    snapshotting and fail at `zfs.snapshot.delete`, orphaning one snapshot per
+    descendant dataset (250 on a real pool) on every single run, forever.
+
+    A method is present when some plugin file declares its namespace AND defines it.
+    If iX merely MOVES a method to a different file we report BROKEN wrongly, and the
+    module declines to apply -- costing a feature, not a backup. That asymmetry is
+    the whole design: declining is always the cheaper mistake.
+    """
+
+    def __init__(self, ident, module, method, path, why=""):
+        self.id = ident
+        self.module = module
+        self.method = method              # "zfs.snapshot.delete"
+        self.path = path                  # plugin file that declares it
+        self.why = why
+
+    @property
+    def namespace(self):
+        return self.method.rsplit(".", 1)[0]
+
+    @property
+    def name(self):
+        return self.method.rsplit(".", 1)[1]
+
+
+#: Every middlewared method the nested module calls at runtime.
+MIDDLEWARE_CALLS = [
+    MiddlewareCall(
+        "call-zfs-dataset-query", NESTED, "zfs.dataset.query",
+        "plugins/zfs_/dataset.py",
+        why="SNAPSHOT_BLOCK enumerates FILESYSTEM datasets to build the staging plan",
+    ),
+    MiddlewareCall(
+        "call-zfs-snapshot-delete", NESTED, "zfs.snapshot.delete",
+        "plugins/zfs_/snapshot.py",
+        why="delete_snapshot_tree() sweeps the recursive snapshot. Without it every "
+            "run orphans one snapshot per descendant dataset (250 on a real pool)",
+    ),
+    MiddlewareCall(
+        "call-zfs-snapshot-query", NESTED, "zfs.snapshot.query",
+        "plugins/zfs_/snapshot.py",
+        why="delete_snapshot_tree()'s fallback sweep enumerates the tree by name",
+    ),
+]
+
+
+def check_call(c: MiddlewareCall, src: str | None) -> tuple[str, str | None]:
+    """Is `c.method` still registered by middlewared?"""
+    if src is None:
+        return "broken", (
+            f"{c.path} no longer exists, so `{c.method}` is gone"
+        )
+
+    try:
+        tree = ast.parse(_stock(src))
+    except SyntaxError as e:
+        return "unknown", f"{c.path} does not parse: {e}"
+
+    # namespace = 'zfs.snapshot' on some Service class in this file...
+    namespaces = {
+        n.value.value
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and isinstance(n.value, ast.Constant)
+        and isinstance(n.value.value, str)
+        and any(isinstance(t, ast.Name) and t.id == "namespace" for t in n.targets)
+    }
+    if c.namespace not in namespaces:
+        return "broken", (
+            f"{c.path} no longer declares namespace {c.namespace!r} "
+            f"(found: {sorted(namespaces) or 'none'}), so `{c.method}` is gone"
+        )
+
+    # ...and it defines the method.
+    #
+    # A CRUDService exposes `create`/`update`/`delete` from methods NAMED
+    # `do_create`/`do_update`/`do_delete`. Both spellings are live right now:
+    # 24.10 and 25.04 declare `do_delete`, 25.10 renamed it to `delete`, and all
+    # three answer to `zfs.snapshot.delete`. Accepting only the literal name reported
+    # the two older releases as broken -- a false BROKEN that would have switched off
+    # nested snapshots on boxes where they work.
+    defined = {
+        n.name for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    if c.name not in defined and f"do_{c.name}" not in defined:
+        return "broken", f"{c.path} no longer defines `{c.method}`"
+
+    return "ok", None
+
+
 #: Things that mean iX has done the job themselves and the module should RETIRE,
 #: not break. Absence of the nesting guard = nested snapshots went native.
 #: `restic = True` already on B2RcloneRemote = B2 restic support went native.
@@ -443,6 +551,31 @@ def check(loader, modules=None) -> dict:
             out[a.module]["unknown"] = True
             out[a.module]["problems"].append({
                 "id": a.id, "detail": detail, "why": a.why,
+            })
+
+    # The methods the injected code CALLS, not just the symbols it wraps.
+    for c in MIDDLEWARE_CALLS:
+        if c.module not in out:
+            continue
+        try:
+            text = src(c.path)
+        except Unreadable as e:
+            out[c.module]["unknown"] = True
+            out[c.module]["problems"].append({
+                "id": c.id, "detail": f"could not read {c.path}: {e}", "why": c.why,
+            })
+            continue
+
+        status, detail = check_call(c, text)
+        if status == "broken":
+            out[c.module]["ok"] = False
+            out[c.module]["problems"].append({
+                "id": c.id, "detail": detail, "why": c.why,
+            })
+        elif status == "unknown":
+            out[c.module]["unknown"] = True
+            out[c.module]["problems"].append({
+                "id": c.id, "detail": detail, "why": c.why,
             })
 
     for module, (path, phrase, native_when_present) in NATIVE_PROBES.items():
