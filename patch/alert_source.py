@@ -83,7 +83,11 @@ class TrueCloudPatchUpdateAlertSource(ThreadedAlertSource):
     # ── internals ────────────────────────────────────────────────────────────
 
     def _git(self, *args):
-        return subprocess.run(
+        # List form, never shell=True, and every `args` value is a literal from
+        # this file -- nothing user-supplied reaches the command line. The partial
+        # `git` path is moot: this runs as root inside middlewared, so anyone who
+        # can poison PATH already has root.
+        return subprocess.run(  # noqa: S603, S607
             ["git", "-C", PATCH_DIR, *args],
             capture_output=True, text=True, timeout=_TIMEOUT, check=True,
         ).stdout
