@@ -77,9 +77,10 @@ printf '%s' "$target" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
 
 [ -d .git ] || die "not a git checkout"
 
-git diff --quiet && git diff --cached --quiet \
-  || die "working tree is dirty. Commit or stash first -- a release must be
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  die "working tree is dirty. Commit or stash first -- a release must be
        reproducible from a commit, not from whatever happened to be on disk."
+fi
 
 branch="$(git rev-parse --abbrev-ref HEAD)"
 if [ "$branch" = "HEAD" ]; then

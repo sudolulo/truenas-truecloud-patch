@@ -227,7 +227,7 @@ fi
 _TC_COMPAT_JSON="$PATCH_DIR/incompatible.json"
 rm -f "$_TC_COMPAT_JSON"
 
-_tc_compat=$("$PYTHON" - "$PATCH_DIR" "$_MW_DIR" "$_TC_COMPAT_JSON" <<'PYEOF' 2>/dev/null || printf 'unknown\nunknown\n')
+_tc_compat=$("$PYTHON" - "$PATCH_DIR" "$_MW_DIR" "$_TC_COMPAT_JSON" 2>/dev/null <<'PYEOF' || printf 'unknown\nunknown\n'
 import json, os, sys
 
 patch_dir, mw_dir, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
