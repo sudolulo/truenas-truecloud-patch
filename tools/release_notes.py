@@ -29,6 +29,7 @@ VERSIONED_FILES = [
     "recover.sh",
     os.path.join("patch", "apply.sh"),
     os.path.join("patch", "create_task.py"),   # exposes `--version` to users
+    "update.sh",
 ]
 
 # `VERSION="x"` (shell) or `__version__ = "x"` (python).
@@ -139,7 +140,11 @@ def main(argv):
     version = argv[2]
 
     if cmd == "notes":
-        with open(CHANGELOG, encoding="utf-8") as fh:
+        # An explicit path lets update.sh show the notes from the CHANGELOG of the
+        # version it is about to install (`git show <tag>:CHANGELOG.md`), not the
+        # one already checked out.
+        path = argv[3] if len(argv) > 3 else CHANGELOG
+        with open(path, encoding="utf-8") as fh:
             print(extract_notes(fh.read(), version))
         return 0
 

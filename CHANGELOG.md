@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.4.0 — 2026-07-13
+
+### Added
+
+- **`update.sh`** — fetch a newer release and apply it, preserving your
+  nested-snapshot opt-in setting.
+
+  ```bash
+  bash update.sh              # to the newest release, with a confirmation
+  bash update.sh --check      # show what would happen; change nothing
+  bash update.sh --rollback   # undo the last update
+  ```
+
+  **Run it by hand. Never from cron or a systemd timer.** This patch injects
+  Python into middlewared and re-applies itself at every boot, so an unattended
+  pull would let any bad upstream commit reach your box with no human in the loop
+  and take effect on the next reboot. v0.0.4 shipped exactly such a bug and took
+  every app on the box down. The manual step *is* the safety gate.
+
+  Design:
+
+  - **Defaults to the newest release tag, not `main`.** `main` can be mid-refactor;
+    a tag is the tested artifact. `--main` exists but says so loudly.
+  - Tags are ordered by **version**, not by date — date order silently downgrades
+    the box the first time a hotfix is tagged out of band (a v0.3.6 released after
+    v0.4.0 would sort as "newest").
+  - **Refuses to run over a dirty working tree** rather than merging across
+    hand-edited or scp'd files.
+  - Shows the commits you don't have and the target's release notes (read from the
+    *target's* CHANGELOG, via `tools/release_notes.py` — not a second copy of the
+    extractor), then asks before doing anything.
+  - **Records the previous revision before moving**, so `--rollback` works even if
+    `install.sh` dies halfway.
+  - Repairs `.git` ownership, which past `sudo git pull`s leave root-owned and
+    which then breaks every later non-root git command.
+
+- `update.sh` is covered by the version-drift check, so it cannot quietly go stale
+  the way `create_task.py.__version__` did.
+
 ## v0.3.5 — 2026-07-13
 
 ### Changed

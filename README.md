@@ -341,27 +341,28 @@ Refresh your browser. S3 and B2 credentials now appear in the
 
 ## Updating
 
-To update to a new version of the patch:
-
 ```bash
-cd /mnt/tank/truenas-truecloud-patch
-
-# If install.sh was previously run as root, the .git directory may be owned
-# by root. Fix it first, or just pull as root:
-sudo git pull          # easiest option
-# — or —
-sudo chown -R $(whoami) .git && git pull
-
-bash install.sh
+bash update.sh              # to the newest release, with a confirmation
+bash update.sh --check      # show what would happen; change nothing
+bash update.sh --rollback   # undo the last update
 ```
 
-`install.sh` clears any stale kill switch, re-applies the updated patches,
-and restarts middlewared. Run `python3 patch/create_task.py verify` afterwards
-to confirm the patches loaded successfully.
+It preserves your nested-snapshot opt-in setting, shows you the commits and
+release notes you don't have yet, and asks before changing anything. It records
+the previous revision *before* moving, so `--rollback` works even if `install.sh`
+dies halfway.
 
-Check [CHANGELOG.md](CHANGELOG.md) to see what changed between versions.
+**Run it by hand. Never from cron or a systemd timer.** This patch injects Python
+into `middlewared` and re-applies itself at every boot, so an unattended pull would
+let any bad upstream commit reach your box with no human in the loop and take
+effect on the next reboot. v0.0.4 shipped exactly such a bug and took every app on
+the box down. The manual step *is* the safety gate — if you want convenience, watch
+the [releases](https://github.com/sudolulo/truenas-truecloud-patch/releases) feed,
+don't automate the pull.
 
----
+It updates to the newest **release tag**, not `main` — `main` can be mid-refactor,
+and a tag is the tested artifact. `--main` exists if you want unreleased code, and
+says so loudly.
 
 ## Creating a task via CLI
 

@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="0.3.5"
+VERSION="0.4.0"
 
 # The directory containing install.sh is the permanent install location.
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -96,7 +96,7 @@ fi
 
 echo "Setting permissions ..."
 chmod +x "$PATCH_DIR/patch/apply.sh" "$PATCH_DIR/patch/create_task.py" \
-          "$PATCH_DIR/recover.sh" "$PATCH_DIR/uninstall.sh"
+          "$PATCH_DIR/recover.sh" "$PATCH_DIR/uninstall.sh" "$PATCH_DIR/update.sh"
 echo "Done."
 echo ""
 
