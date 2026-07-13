@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.5.0 — 2026-07-13
+
+### Added
+
+- **A TrueNAS alert when an update is available** — the bell in the UI, not a log
+  line nobody reads. On by default, checked once a day.
+  `install.sh --no-update-alerts` turns it off.
+
+  **It does not nag.** A release whose CHANGELOG contains only a `### Docs`
+  section changed no code and raises nothing. Anything else raises INFO; a
+  `### Security` section raises WARNING. The CHANGELOG's own section headings are
+  the signal, and a security fix anywhere in the range escalates the whole span —
+  so a docs-only release sitting on top of a security fix still reports as
+  security, rather than hiding it.
+
+  **Why an AlertSource and not `midclt`:** TrueNAS cannot raise an alert from the
+  CLI. `midclt` exposes only `alert.dismiss`, `alert.list`, `alert.list_categories`,
+  `alert.list_policies` and `alert.restore` — alert *creation* is internal to
+  middlewared, and none of its ~60 one-shot classes is generic enough to reuse. So
+  registering an `AlertSource` is the only way, and it is also the least invasive
+  thing this patch does: it **adds one file and modifies none**, where the
+  providers and nested modules both append code to stock middleware files. It is
+  the native mechanism, and TrueNAS polls it itself — no cron, no systemd timer.
+
+  - Fail-safe: every error path returns `None`; it cannot take middlewared down.
+  - Read-only: `git ls-remote` plus an HTTPS fetch of the CHANGELOG. It never
+    writes to `.git`, so it cannot leave root-owned objects behind the way a
+    `git fetch` from middlewared (running as root) would.
+  - Removed by `uninstall.sh`.
+  - It only *tells* you; it never updates anything.
+
 ## v0.4.2 — 2026-07-13
 
 ### Docs

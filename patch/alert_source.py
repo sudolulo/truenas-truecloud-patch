@@ -1,0 +1,211 @@
+"""TrueNAS alert: a truecloud-patch update is available.
+
+Installed by patch/apply.sh into middlewared/alert/source/, where middlewared
+discovers and polls it natively — no cron job, no systemd timer.
+
+@PATCH_DIR@ is substituted at install time.
+
+Two rules govern this file:
+
+1. **It must never break middlewared.** It runs inside the alert framework on a
+   timer. Every failure path returns None (no alert) rather than raising.
+
+2. **It must not nag.** A release whose CHANGELOG only has a "### Docs" section
+   changed no code, and nobody wants an alert because a README was reworded. The
+   CHANGELOG's own section headings are the signal — see tools/release_notes.py.
+
+It also never writes to the repository. `git ls-remote` is read-only and the
+CHANGELOG is fetched over HTTPS, so this cannot leave root-owned objects in .git
+the way a `git fetch` from middlewared (running as root) would.
+"""
+
+import datetime
+import logging
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+
+from middlewared.alert.base import (
+    Alert,
+    AlertCategory,
+    AlertClass,
+    AlertLevel,
+    ThreadedAlertSource,
+)
+from middlewared.alert.schedule import IntervalSchedule
+
+logger = logging.getLogger(__name__)
+
+PATCH_DIR = "@PATCH_DIR@"
+DISABLED_MARKER = os.path.join(PATCH_DIR, "update_alerts_disabled")
+
+_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
+_VERSION_RE = re.compile(r'^VERSION="([^"]+)"', re.M)
+_GITHUB_RE = re.compile(r"github\.com[:/]([^/]+)/([^/.]+)")
+
+_TIMEOUT = 20
+
+
+class TrueCloudPatchUpdateAlertClass(AlertClass):
+    category = AlertCategory.SYSTEM
+    level = AlertLevel.INFO
+    title = "truecloud-patch update available"
+    text = (
+        "truecloud-patch %(current)s is installed; %(latest)s is available.%(summary)s "
+        "Update with:  bash %(dir)s/update.sh"
+    )
+
+
+class TrueCloudPatchSecurityUpdateAlertClass(AlertClass):
+    category = AlertCategory.SYSTEM
+    level = AlertLevel.WARNING
+    title = "truecloud-patch security update available"
+    text = (
+        "truecloud-patch %(current)s is installed; %(latest)s contains a SECURITY "
+        "fix.%(summary)s Update with:  bash %(dir)s/update.sh"
+    )
+
+
+class TrueCloudPatchUpdateAlertSource(ThreadedAlertSource):
+    schedule = IntervalSchedule(datetime.timedelta(hours=24))
+    run_on_backup_node = False
+
+    def check_sync(self):
+        try:
+            return self._check()
+        except Exception:
+            # An alert source must never take middlewared down with it.
+            logger.debug("truecloud-patch update check failed", exc_info=True)
+            return None
+
+    # ── internals ────────────────────────────────────────────────────────────
+
+    def _git(self, *args):
+        return subprocess.run(
+            ["git", "-C", PATCH_DIR, *args],
+            capture_output=True, text=True, timeout=_TIMEOUT, check=True,
+        ).stdout
+
+    def _check(self):
+        if os.path.exists(DISABLED_MARKER):
+            return None
+        if not os.path.isdir(os.path.join(PATCH_DIR, ".git")):
+            return None
+
+        current = self._installed_version()
+        if not current:
+            return None
+
+        latest = self._latest_release_tag()
+        if not latest:
+            return None
+
+        sys.path.insert(0, os.path.join(PATCH_DIR, "tools"))
+        try:
+            from release_notes import significance, version_tuple
+        finally:
+            sys.path.pop(0)
+
+        if version_tuple(latest) <= version_tuple(current):
+            return None
+
+        level, versions, summary = self._classify(
+            current, latest, significance
+        )
+
+        # Documentation-only releases are not worth an alert. This is the whole
+        # point: nobody should get a notification because a README was reworded.
+        if level == "docs":
+            logger.debug(
+                "truecloud-patch %s -> %s is documentation-only; not alerting",
+                current, latest,
+            )
+            return None
+
+        args = {
+            "current": f"v{current}",
+            "latest": latest,
+            "summary": summary,
+            "dir": PATCH_DIR,
+        }
+        klass = (
+            TrueCloudPatchSecurityUpdateAlertClass if level == "security"
+            else TrueCloudPatchUpdateAlertClass
+        )
+        return Alert(klass, args, key=[current, latest])
+
+    def _installed_version(self):
+        """The version of the patch actually checked out here."""
+        try:
+            with open(os.path.join(PATCH_DIR, "patch", "apply.sh"), encoding="utf-8") as fh:
+                m = _VERSION_RE.search(fh.read())
+        except OSError:
+            return None
+        return m.group(1) if m else None
+
+    def _latest_release_tag(self):
+        """Newest plain vX.Y.Z tag on the remote. Read-only: no .git writes.
+
+        Pre-release tags (-rc, -beta) are excluded: git's version sort ranks
+        v0.5.0-rc1 above v0.5.0, so including them would advertise a release
+        candidate as the latest stable.
+        """
+        try:
+            out = self._git("ls-remote", "--tags", "--refs", "origin")
+        except Exception:
+            return None
+
+        tags = []
+        for line in out.splitlines():
+            parts = line.split("refs/tags/")
+            if len(parts) == 2 and _TAG_RE.match(parts[1].strip()):
+                tags.append(parts[1].strip())
+        if not tags:
+            return None
+
+        return max(tags, key=lambda t: tuple(int(x) for x in t.lstrip("v").split(".")))
+
+    def _classify(self, current, latest, significance):
+        """(level, versions, one-line summary). Falls back to alerting."""
+        text = self._remote_changelog(latest)
+        if text is None:
+            # Cannot tell whether it matters. Alert rather than risk hiding a
+            # security fix -- but say that we could not tell.
+            return "notable", [], " (could not read the changelog)"
+
+        level, versions, headings = significance(text, current, latest)
+        if level == "docs":
+            return level, versions, ""
+
+        seen, ordered = set(), []
+        for h in headings:
+            if h not in seen:
+                seen.add(h)
+                ordered.append(h.capitalize())
+        detail = ", ".join(ordered)
+        return level, versions, f" Changes: {detail}." if detail else ""
+
+    def _remote_changelog(self, tag):
+        """CHANGELOG.md at `tag`, over HTTPS. None if it cannot be read."""
+        try:
+            remote = self._git("remote", "get-url", "origin").strip()
+        except Exception:
+            return None
+
+        m = _GITHUB_RE.search(remote)
+        if not m:
+            return None  # not a GitHub remote; skip classification
+
+        url = (
+            f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}/"
+            f"{tag}/CHANGELOG.md"
+        )
+        try:
+            with urllib.request.urlopen(url, timeout=_TIMEOUT) as resp:  # noqa: S310
+                if resp.status != 200:
+                    return None
+                return resp.read().decode("utf-8", "replace")
+        except Exception:
+            return None

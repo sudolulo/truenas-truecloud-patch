@@ -88,6 +88,60 @@ def extract_notes(text: str, version: str) -> str:
     return "\n".join(lines[start:end]).strip()
 
 
+# ── significance ──────────────────────────────────────────────────────────────
+# Used by the TrueNAS update alert to decide whether a release is worth bothering
+# anyone about. The CHANGELOG's own section headings are the signal: a release that
+# only has "### Docs" changed no code, and nobody should get an alert for a README.
+
+_SECTION_RE = re.compile(r"^###\s+(.+?)\s*$", re.M)
+
+#: Headings that mean "nothing about the running system changed".
+QUIET_SECTIONS = {"docs", "documentation"}
+
+
+def version_tuple(v: str) -> tuple:
+    """Sortable version. Pre-release suffixes are dropped, not ranked."""
+    return tuple(int(x) for x in normalise(v).split("-")[0].split("."))
+
+
+def section_headings(body: str) -> list[str]:
+    """The `### ...` headings inside one version's body, lowercased."""
+    return [h.strip().lower() for h in _SECTION_RE.findall(body)]
+
+
+def significance(text: str, current: str, latest: str):
+    """How much does upgrading `current` -> `latest` actually matter?
+
+    Returns ``(level, versions, headings)`` where level is one of:
+
+      "security"  a release in the range has a Security section  -> alert loudly
+      "notable"   something about the system changed             -> alert quietly
+      "docs"      only documentation changed                     -> DO NOT alert
+
+    Considers every release in the range, not just the newest: a docs-only v0.4.2
+    on top of a security-fixing v0.4.1 must still be reported as security.
+    """
+    cur, lat = version_tuple(current), version_tuple(latest)
+
+    versions = [
+        v for v in changelog_versions(text)
+        if cur < version_tuple(v) <= lat
+    ]
+
+    headings = []
+    for v in versions:
+        try:
+            headings.extend(section_headings(extract_notes(text, v)))
+        except KeyError:
+            continue
+
+    if any(h.startswith("security") for h in headings):
+        return "security", versions, headings
+    if [h for h in headings if h not in QUIET_SECTIONS]:
+        return "notable", versions, headings
+    return "docs", versions, headings
+
+
 def check(version: str, root: str = ROOT) -> list[str]:
     """Every reason this version is not releasable. Empty list means it is."""
     want = normalise(version)

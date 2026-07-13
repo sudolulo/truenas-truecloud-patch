@@ -59,6 +59,7 @@ that capability natively. See [Native support](#if-truenas-adds-native-support).
 | `patch/truecloud_nested.py` | Nested-dataset staging: plan, mount, verify, tear down, sweep snapshots. Also `… cleanup` as a CLI. |
 | `patch/patch_ui.py` | Widens the Angular credential dropdown. Refuses to write a bundle whose parens it unbalanced. |
 | `patch/create_task.py` | Create TrueCloud tasks with S3/B2 credentials; `verify` the patch state. |
+| `patch/alert_source.py` | The TrueNAS alert for "an update is available". Installed into `middlewared/alert/source/`. |
 | `patch/wait_restart.sh` | Waits for boot to actually settle before restarting middlewared. |
 | `tools/release_notes.py` | Extracts a version's CHANGELOG section; enforces version consistency. Used by CI. |
 
@@ -432,6 +433,51 @@ such a bug and took all 54 apps on a box down.**
 The manual step *is* the safety gate. If you want convenience, watch the
 [releases feed](https://github.com/sudolulo/truenas-truecloud-patch/releases);
 don't automate the pull.
+
+## Update alerts
+
+When a newer release exists, the patch raises a **TrueNAS alert** (the bell in the
+UI) telling you so. It's on by default and checks once a day.
+
+```bash
+bash install.sh --no-update-alerts   # turn it off
+bash install.sh --update-alerts      # turn it back on
+```
+
+**It will not nag you about a README.** A release whose CHANGELOG contains only a
+`### Docs` section changed no code, and raises nothing. Anything that touched the
+system raises an INFO alert; a release with a `### Security` section raises a
+WARNING. The CHANGELOG's own section headings are the signal, and a security fix
+anywhere in the range escalates the whole span — a docs-only release on top of a
+security fix still reports as security.
+
+### How it works, and why it's built this way
+
+TrueNAS **cannot raise an alert from the CLI** — `midclt` exposes only
+`alert.dismiss`, `alert.list`, `alert.list_categories`, `alert.list_policies` and
+`alert.restore`. Alert *creation* is internal to middlewared, and none of its ~60
+one-shot alert classes is generic enough to reuse. So the only way to get a real
+alert is to register an `AlertSource`, which is what `patch/alert_source.py` does.
+
+That is also the **least invasive** thing this patch does:
+
+| | |
+|---|---|
+| providers module | **modifies** stock files (appends code to `b2.py`, `restic.py`) |
+| nested module | **modifies** stock files (3 middleware modules) |
+| **update alert** | **adds one file. Modifies nothing.** |
+
+It's the native mechanism — the same one every built-in TrueNAS alert uses — and
+TrueNAS polls it itself, so there is no cron job and no systemd timer.
+
+- **Fail-safe.** Every error path returns `None`. It cannot take middlewared down.
+- **Read-only.** `git ls-remote` plus an HTTPS fetch of the CHANGELOG. It never
+  writes to `.git`, so it cannot leave root-owned objects behind the way a
+  `git fetch` from middlewared (which runs as root) would.
+- **Removed by `uninstall.sh`.**
+
+It only *tells* you. It never updates anything — see
+[Why there is no auto-update](#why-there-is-no-auto-update).
 
 ## Creating a task via CLI
 

@@ -32,7 +32,7 @@
 # Derive PATCH_DIR from this script's location (parent of the patch/ directory).
 PATCH_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="$PATCH_DIR/apply.log"
-VERSION="0.4.2"
+VERSION="0.5.0"
 
 # Rotate log at 512 KB to avoid unbounded growth on a system volume.
 # Keep two prior generations (.1 and .2) so the last three boots are always available.
@@ -578,6 +578,40 @@ else:
 # that is inactive (superseded, or opt-in and off) is ok -- reporting a disabled
 # opt-in feature as FAIL would make `create_task.py verify` fail on a default
 # install. `active` says whether the module is doing anything.
+# ── update-available alert ────────────────────────────────────────────────────
+# Dropped into middlewared/alert/source/, where middlewared discovers and polls it
+# natively — no cron, no timer. It only raises an alert for releases that actually
+# changed something: a docs-only release is ignored (see tools/release_notes.py).
+alert_ok = False
+alert_detail = ''
+_patch_dir = os.path.dirname(os.path.dirname(nested_src))
+alert_src = os.path.join(os.path.dirname(nested_src), 'alert_source.py')
+alert_dst = os.path.join(mw_dir, 'alert', 'source', 'truecloud_patch_update.py')
+
+if os.path.exists(os.path.join(_patch_dir, 'update_alerts_disabled')):
+    alert_detail = 'disabled (update_alerts_disabled)'
+    try:
+        os.unlink(alert_dst)
+        print('OK: Removed update alert (disabled).')
+    except OSError:
+        pass
+elif not os.path.exists(alert_src):
+    alert_detail = 'alert_source.py not found'
+    print(f'WARNING: {alert_src} missing — no update alert.')
+else:
+    try:
+        with open(alert_src, encoding='utf-8') as fh:
+            _body = fh.read()
+        # PATCH_DIR is baked in: the alert source must find the repo it belongs to.
+        with open(alert_dst, 'w', encoding='utf-8') as fh:
+            fh.write(_body.replace('@PATCH_DIR@', _patch_dir))
+        alert_ok = True
+        alert_detail = 'update alert installed'
+        print(f'OK: Installed update alert → {alert_dst}')
+    except Exception as e:
+        alert_detail = f'not applied: {e}'
+        print(f'WARNING: could not install update alert: {e}')
+
 patches = {
     'providers': {
         'ok': (not providers_needed) or bool(b2_ok and restic_ok),
@@ -588,6 +622,11 @@ patches = {
         'ok': (not nested_needed) or nested_ok,
         'active': nested_needed,
         'detail': nested_detail,
+    },
+    'update_alert': {
+        'ok': True,          # never a failure: it is a convenience, not a patch
+        'active': alert_ok,
+        'detail': alert_detail,
     },
 }
 payload = {'patched_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'patches': patches}

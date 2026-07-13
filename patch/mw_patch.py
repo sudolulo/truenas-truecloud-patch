@@ -37,6 +37,10 @@ NESTED_RELPATHS = [
 #: The importable module the nested blocks depend on.
 NESTED_MODULE = ("plugins", "cloud", "_truecloud_nested.py")
 
+#: The update-available alert source. Not a "patch" (it appends nothing to a stock
+#: file), but it is a file we install into middlewared and must therefore remove.
+ALERT_MODULE = ("alert", "source", "truecloud_patch_update.py")
+
 
 def patch_file(path, block):
     """Append `block`, replacing any block we appended before. Idempotent."""
@@ -101,8 +105,14 @@ def revert_nested(mw_dir):
 
 
 def revert_all(mw_dir):
-    """Undo every patch this project applies."""
-    return revert(mw_dir, NESTED_RELPATHS + PROVIDER_RELPATHS, NESTED_MODULE)
+    """Undo every patch this project applies, and remove every file it installs."""
+    reverted = revert(mw_dir, NESTED_RELPATHS + PROVIDER_RELPATHS, NESTED_MODULE)
+    try:
+        os.unlink(os.path.join(mw_dir, *ALERT_MODULE))
+        reverted.append(ALERT_MODULE[-1])
+    except OSError:
+        pass
+    return reverted
 
 
 def find_middlewared_dir():

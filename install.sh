@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.2"
+VERSION="0.5.0"
 
 # The directory containing install.sh is the permanent install location.
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -31,6 +31,8 @@ _NESTED_MARKER="$PATCH_DIR/nested_snapshots_enabled"
 # `git pull`) must never flip it on or off by itself: with neither flag given,
 # whatever was chosen previously is preserved.
 _nested_choice=""
+_alert_choice=""
+_ALERT_MARKER="$PATCH_DIR/update_alerts_disabled"
 
 usage() {
     cat <<USAGE
@@ -42,6 +44,8 @@ Options:
                               Stock TrueNAS refuses this; see README. Off by
                               default because it changes how backups read data.
   --disable-nested-snapshots  Turn it back off; the stock guard is restored.
+  --no-update-alerts          Do not raise a TrueNAS alert when an update exists.
+  --update-alerts             Re-enable those alerts (they are on by default).
   -h, --help                  Show this help.
 
 With neither flag, the current setting is left unchanged.
@@ -52,6 +56,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --enable-nested-snapshots)  _nested_choice="on" ;;
         --disable-nested-snapshots) _nested_choice="off" ;;
+        --no-update-alerts)         _alert_choice="off" ;;
+        --update-alerts)            _alert_choice="on" ;;
         -h|--help)                  usage; exit 0 ;;
         *)
             echo "ERROR: unknown option: $1" >&2
@@ -187,6 +193,34 @@ case "$_nested_choice" in
         else
             echo "Nested-dataset snapshots: disabled (default)."
             echo "  Enable with: bash install.sh --enable-nested-snapshots"
+        fi
+        ;;
+esac
+echo ""
+
+# ── Update alerts (on by default) ─────────────────────────────────────────────
+# TrueNAS cannot raise an alert from the CLI (midclt exposes only dismiss/list/
+# restore), so this installs an AlertSource into middlewared/alert/source/ — the
+# same mechanism every built-in TrueNAS alert uses. It ADDS a file and modifies
+# none, which makes it the least invasive thing this patch does.
+#
+# It only alerts for releases that changed something: a documentation-only release
+# raises nothing.
+
+case "$_alert_choice" in
+    off)
+        touch "$_ALERT_MARKER"
+        echo "Update alerts: DISABLED (apply.sh will remove the alert source)."
+        ;;
+    on)
+        rm -f "$_ALERT_MARKER"
+        echo "Update alerts: enabled."
+        ;;
+    *)
+        if [ -f "$_ALERT_MARKER" ]; then
+            echo "Update alerts: disabled (unchanged)."
+        else
+            echo "Update alerts: enabled (checks daily; docs-only releases are ignored)."
         fi
         ;;
 esac
