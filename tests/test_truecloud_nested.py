@@ -348,7 +348,14 @@ class TestStageNestedOrdering:
 
         assert mw.snapshots == [], "the crashed run's snapshot tree must be reclaimed"
 
-    def test_sidecar_is_removed_when_staging_fails(self, tmp_path, monkeypatch):
+    def test_sidecar_is_KEPT_when_staging_fails(self, tmp_path, monkeypatch):
+        # The caller sweeps the snapshot tree on the way out, and anything still busy
+        # SURVIVES that sweep -- with the sidecar as its only record. Removing the
+        # sidecar here would orphan those snapshots permanently.
+        #
+        # The asymmetry is the point: a sidecar left behind when the tree is already
+        # gone costs one no-op delete on the next run; a sidecar removed while the tree
+        # still exists is unrecoverable.
         import truecloud_nested as tn
 
         monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
@@ -361,7 +368,12 @@ class TestStageNestedOrdering:
                 "cloud_backup-5", DATASETS,
             )
 
-        assert not os.path.exists(sidecar_for(root))
+        assert os.path.exists(sidecar_for(root)), (
+            "sidecar removed on staging failure — any snapshot the caller's sweep "
+            "cannot delete is now orphaned forever"
+        )
+        with open(sidecar_for(root), encoding="utf-8") as fh:
+            assert fh.read().strip() == "Tap@snap"
 
 
 class TestCleanupTask:
@@ -609,3 +621,165 @@ class TestStagingRootFor:
         # os.path.join(BASE, "..") normalises to /run — teardown would rmdir it.
         root = staging_root_for(name)
         assert os.path.normpath(root).startswith("/run/truecloud-nested/")
+
+
+class TestZfsAutomountKeepsSnapshotsBusy:
+    """"dataset is busy" is EXPECTED, TRANSIENT, and used to orphan snapshots forever.
+
+    Reading `<dataset>/.zfs/snapshot/<snap>/` makes ZFS **automount** that snapshot,
+    and it stays mounted for zfs_expire_snapshot seconds (300 by default) after the
+    last access. teardown() unmounts OUR bind mounts, but not the automount underneath
+    -- so `zfs destroy` refuses with EBUSY for everything restic read recently.
+
+    Observed on a real 256-snapshot tree: 253 swept cleanly, and the 3 datasets restic
+    had touched last failed with "dataset is busy". cleanup_task then removed the
+    sidecar anyway, so nothing would ever reclaim them. A few snapshots leaked per run,
+    forever.
+    """
+
+    MOUNTS = (
+        "tmpfs /run tmpfs rw 0 0\n"
+        "Tap/apps/prometheus /mnt/Tap/apps/prometheus/.zfs/snapshot/snap1 zfs ro 0 0\n"
+        "Tap/apps/standing/data /mnt/Tap/apps/standing/data/.zfs/snapshot/snap1 zfs ro 0 0\n"
+        "Tap /mnt/Tap/.zfs/snapshot/snap1 zfs ro 0 0\n"
+        "Tap/other /mnt/Tap/other/.zfs/snapshot/OTHER zfs ro 0 0\n"
+    )
+
+    def _mounts_file(self, tmp_path):
+        p = tmp_path / "mounts"
+        p.write_text(self.MOUNTS)
+        return str(p)
+
+    def test_it_finds_the_automounts_for_this_snapshot_only(self, tmp_path):
+        import truecloud_nested as tn
+        found = tn.snapdir_automounts("snap1", mounts_file=self._mounts_file(tmp_path))
+        assert "/mnt/Tap/other/.zfs/snapshot/OTHER" not in found
+        assert len(found) == 3
+
+    def test_deepest_first(self, tmp_path):
+        # A child's automount must be released before its parent's.
+        import truecloud_nested as tn
+        found = tn.snapdir_automounts("snap1", mounts_file=self._mounts_file(tmp_path))
+        assert found[-1] == "/mnt/Tap/.zfs/snapshot/snap1"
+
+    def test_release_snapdirs_unmounts_them(self, tmp_path):
+        import truecloud_nested as tn
+        called = []
+
+        class R:
+            returncode = 0
+            stderr = ""
+
+        def runner(cmd):
+            called.append(cmd)
+            return R()
+
+        errs = tn.release_snapdirs("snap1", runner=runner,
+                                   mounts_file=self._mounts_file(tmp_path))
+        assert errs == []
+        assert all(c[0] == "umount" for c in called)
+        assert len(called) == 3
+
+
+class BusyMiddleware(FakeMiddleware):
+    """Deletes fail with EBUSY until `busy_until_attempt` passes -- like a ZFS
+    automount expiring."""
+
+    def __init__(self, snapshots, busy, busy_for=2):
+        super().__init__(snapshots)
+        self.busy = set(busy)
+        self.busy_for = busy_for
+        self.attempts = 0
+
+    def call_sync(self, method, *args):
+        if method == "zfs.snapshot.delete":
+            name = args[0]
+            opts = args[1] if len(args) > 1 else {}
+            if opts.get("recursive"):
+                raise RuntimeError("cannot destroy snapshot: dataset is busy")
+            if name in self.busy:
+                self.attempts += 1
+                if self.attempts <= self.busy_for * len(self.busy):
+                    raise RuntimeError(f"cannot destroy '{name}': dataset is busy")
+        return super().call_sync(method, *args)
+
+
+class TestDeleteRetriesAndReportsSurvivors:
+    def test_a_transient_busy_is_retried_and_wins(self, monkeypatch):
+        import truecloud_nested as tn
+        monkeypatch.setattr(tn, "release_snapdirs", lambda *a, **k: [])
+
+        mw = BusyMiddleware(
+            ["Tap@snap", "Tap/apps@snap", "Tap/apps/prometheus@snap"],
+            busy=["Tap/apps/prometheus@snap"], busy_for=1,
+        )
+        survivors = tn.delete_snapshot_tree(mw, "Tap@snap", sleep=lambda _s: None)
+        assert survivors == []
+        assert mw.snapshots == []
+
+    def test_a_permanently_busy_snapshot_is_REPORTED_not_swallowed(self, monkeypatch):
+        import truecloud_nested as tn
+        monkeypatch.setattr(tn, "release_snapdirs", lambda *a, **k: [])
+
+        mw = BusyMiddleware(
+            ["Tap@snap", "Tap/apps/prometheus@snap"],
+            busy=["Tap/apps/prometheus@snap"], busy_for=99,
+        )
+        survivors = tn.delete_snapshot_tree(mw, "Tap@snap", sleep=lambda _s: None)
+        assert survivors == ["Tap/apps/prometheus@snap"]
+        assert mw.snapshots == ["Tap/apps/prometheus@snap"]
+
+    def test_the_automounts_are_released_before_deleting(self, monkeypatch):
+        import truecloud_nested as tn
+        order = []
+        monkeypatch.setattr(tn, "release_snapdirs",
+                            lambda name, **k: order.append(("release", name)) or [])
+        mw = FakeMiddleware(["Tap@snap"])
+        real = mw.call_sync
+
+        def spy(method, *args):
+            order.append((method, args[0] if args else None))
+            return real(method, *args)
+
+        mw.call_sync = spy
+        tn.delete_snapshot_tree(mw, "Tap@snap", sleep=lambda _s: None)
+        assert order[0] == ("release", "snap"), order
+
+
+class TestSidecarSurvivesAnIncompleteSweep:
+    def test_the_sidecar_is_KEPT_when_snapshots_could_not_be_deleted(
+        self, tmp_path, monkeypatch
+    ):
+        # It is the ONLY record those snapshots exist. Removing it orphans them
+        # permanently -- which is exactly what happened on the real box.
+        import truecloud_nested as tn
+
+        monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
+        monkeypatch.setattr(tn, "release_snapdirs", lambda *a, **k: [])
+        root = tn.staging_root_for("cloud_backup-5")
+        os.makedirs(root, exist_ok=True)
+        with open(sidecar_for(root), "w", encoding="utf-8") as fh:
+            fh.write("Tap@snap")
+
+        mw = BusyMiddleware(["Tap@snap", "Tap/apps/prometheus@snap"],
+                            busy=["Tap/apps/prometheus@snap"], busy_for=99)
+        monkeypatch.setattr(tn, "delete_snapshot_tree",
+                            lambda m, s, logger=None: ["Tap/apps/prometheus@snap"])
+
+        tn.cleanup_task(mw, "cloud_backup-5")
+        assert os.path.exists(sidecar_for(root)), (
+            "sidecar removed despite survivors — they are now orphaned forever"
+        )
+
+    def test_the_sidecar_is_removed_on_a_clean_sweep(self, tmp_path, monkeypatch):
+        import truecloud_nested as tn
+
+        monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
+        root = tn.staging_root_for("cloud_backup-5")
+        os.makedirs(root, exist_ok=True)
+        with open(sidecar_for(root), "w", encoding="utf-8") as fh:
+            fh.write("Tap@snap")
+
+        monkeypatch.setattr(tn, "delete_snapshot_tree", lambda m, s, logger=None: [])
+        tn.cleanup_task(FakeMiddleware(), "cloud_backup-5")
+        assert not os.path.exists(sidecar_for(root))

@@ -58,6 +58,7 @@ import contextlib
 import os
 import stat
 import subprocess
+import time
 
 __all__ = [
     "STAGING_BASE",
@@ -362,6 +363,48 @@ def teardown(staging_root, runner=_run, mounts_file="/proc/self/mounts"):
     return errors
 
 
+def snapdir_automounts(snapshot_name, mounts_file="/proc/self/mounts"):
+    """Every ``<dataset>/.zfs/snapshot/<snap>`` ZFS automount for this snapshot."""
+    suffix = "/.zfs/snapshot/" + snapshot_name
+    found = []
+    try:
+        with open(mounts_file, encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) > 1:
+                    mp = parts[1].replace("\\040", " ")
+                    if mp.endswith(suffix):
+                        found.append(mp)
+    except OSError:
+        return []
+    return sorted(found, key=_depth, reverse=True)      # deepest first
+
+
+def release_snapdirs(snapshot_name, runner=_run, mounts_file="/proc/self/mounts"):
+    """Unmount ZFS's OWN snapshot automounts, so the snapshots can be destroyed.
+
+    Reading anything under ``<dataset>/.zfs/snapshot/<snap>/`` makes ZFS **automount**
+    that snapshot, and it stays mounted for ``zfs_expire_snapshot`` seconds (300 by
+    default) after the last access. teardown() unmounts OUR bind mounts -- but the
+    automount underneath them survives, and while it exists ``zfs destroy`` refuses
+    with *"dataset is busy"*.
+
+    Proven on a real pool: a 256-snapshot recursive tree swept cleanly except for the
+    three datasets restic had read most recently. Those failed with EBUSY, and because
+    cleanup_task removed the sidecar anyway, they were orphaned **permanently** -- a
+    small leak, but a growing one, and exactly the failure this module exists to
+    prevent.
+
+    Deepest first, so a child's automount is released before its parent's.
+    """
+    errors = []
+    for mp in snapdir_automounts(snapshot_name, mounts_file=mounts_file):
+        res = runner(["umount", mp])
+        if res.returncode != 0:
+            errors.append(f"{mp}: {(res.stderr or '').strip()}")
+    return errors
+
+
 # ── orchestration (middleware is duck-typed; no middlewared import) ───────────
 #
 # These are SYNCHRONOUS and talk to middlewared via `middleware.call_sync`, which
@@ -424,15 +467,31 @@ def get_dataset_recursive(datasets, directory):
     )
 
 
-def delete_snapshot_tree(middleware, snapshot, logger=None):
+def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
+                         sleep=time.sleep):
     """Delete the parent snapshot AND every child created by ``zfs snapshot -r``.
+
+    Returns the snapshots it could NOT delete -- callers must not throw that away.
 
     ``zfs.snapshot.delete`` is non-recursive by default and stock calls it with
     no options, so relying on stock would orphan one snapshot per descendant
     dataset on every run. Idempotent: tolerates the parent already being gone
     (stock's ``finally`` may have won the race once our mounts were released).
+
+    "dataset is busy" is EXPECTED here and is TRANSIENT. ZFS automounts
+    ``<dataset>/.zfs/snapshot/<snap>`` when it is read and keeps it mounted for
+    ``zfs_expire_snapshot`` seconds (300 by default) afterwards. So the datasets restic
+    touched last are still pinned when we try to destroy them. We release the
+    automounts explicitly and then retry -- on a real 256-snapshot tree, exactly three
+    snapshots hit this, and before the fix they were orphaned permanently.
     """
-    dataset = snapshot.partition("@")[0]
+    dataset, _, snapname = snapshot.partition("@")
+
+    # Release ZFS's own automounts first, or `zfs destroy` refuses with EBUSY on
+    # everything restic read in the last few minutes.
+    for err in release_snapdirs(snapname):
+        if logger:
+            logger.debug("truecloud-patch: could not release snapdir %s", err)
 
     # Fast path: ONE recursive delete removes the parent and every child that
     # `zfs snapshot -r` created (252 on a real pool). Deleting them individually
@@ -441,7 +500,7 @@ def delete_snapshot_tree(middleware, snapshot, logger=None):
     # exists to prevent.
     try:
         middleware.call_sync("zfs.snapshot.delete", snapshot, {"recursive": True})
-        return
+        return []
     except Exception as e:  # noqa: BLE001 - fall through to the explicit sweep
         # Usually just "parent already gone" (stock's finally won the race once our
         # mounts were released), which the sweep below handles. Log it rather than
@@ -472,14 +531,53 @@ def delete_snapshot_tree(middleware, snapshot, logger=None):
             )
         names = [snapshot]
 
-    for name in names:
+    def confirm_gone(failed):
+        """Drop any name ZFS no longer has, even though its delete raised.
+
+        A delete that raised "does not exist" SUCCEEDED as far as we care, and must
+        not be retried or reported. The query is only a refinement: if it cannot be
+        answered we keep the delete's own verdict, rather than inventing survivors --
+        a false survivor keeps the sidecar forever and is reported as a leak that
+        isn't there.
+        """
+        if not failed:
+            return []
         try:
-            middleware.call_sync("zfs.snapshot.delete", name)
-        except Exception as e:  # noqa: BLE001 - already gone is fine
-            if logger:
-                logger.warning(
-                    "truecloud-patch: could not delete snapshot %s: %r", name, e
-                )
+            live = middleware.call_sync(
+                "zfs.snapshot.query", [["name", "^", dataset]], {"select": ["name"]}
+            )
+        except Exception:  # noqa: BLE001 - cannot refine; trust the delete's verdict
+            return list(failed)
+        live = {s["name"] for s in live}
+        return [n for n in failed if n in live]
+
+    remaining = list(names)
+    for attempt in range(attempts):
+        failed = []
+        for name in remaining:
+            try:
+                middleware.call_sync("zfs.snapshot.delete", name)
+            except Exception:  # noqa: BLE001 - busy, or already gone; sorted out below
+                failed.append(name)
+
+        remaining = confirm_gone(failed)
+        if not remaining:
+            return []
+
+        if attempt < attempts - 1:
+            # EBUSY is the automount expiring. Release again (anything that walks
+            # .zfs can re-automount a snapshot) and give it a moment.
+            release_snapdirs(snapname)
+            sleep(5)
+
+    for name in remaining:
+        if logger:
+            logger.warning(
+                "truecloud-patch: could not delete snapshot %s after %d attempts "
+                "(still busy?) -- it will be reclaimed on the next run",
+                name, attempts,
+            )
+    return remaining
 
 
 def stage_nested(middleware, path, snapshot, base_dataset, base_mountpoint,
@@ -541,8 +639,18 @@ def stage_nested(middleware, path, snapshot, base_dataset, base_mountpoint,
         apply_plan(mounts)
         verify_staged(mounts)
     except Exception:
+        # Tear down the mounts, but KEEP the sidecar.
+        #
+        # The caller (SNAPSHOT_BLOCK) sweeps the snapshot tree on the way out, and if
+        # any of it is still busy it will survive -- and the sidecar is the only record
+        # that it exists. Removing it here would orphan those snapshots permanently.
+        #
+        # The asymmetry is deliberate: a sidecar left behind when the tree is already
+        # gone is harmless (the next run tries to delete a tree that is not there,
+        # finds nothing, and moves on), while a sidecar removed while the tree still
+        # exists is unrecoverable. Only a confirmed-clean sweep removes it -- see
+        # cleanup_task().
         teardown(staging_root)
-        _remove_sidecar(staging_root)
         raise
 
     if logger:
@@ -569,8 +677,32 @@ def cleanup_task(middleware, task_name, logger=None):
         for err in errors:
             logger.warning("truecloud-patch: staging teardown: %s", err)
 
-    if snapshot is not None:
-        delete_snapshot_tree(middleware, snapshot, logger=logger)
+    if snapshot is None:
+        _remove_sidecar(staging_root)
+        return
+
+    survivors = delete_snapshot_tree(middleware, snapshot, logger=logger)
+
+    # KEEP the sidecar if anything survived. It is the only record that those
+    # snapshots exist, and removing it orphans them permanently.
+    #
+    # That is not theoretical: on a real 256-snapshot tree, three snapshots were still
+    # pinned by ZFS's own .zfs/snapshot automount (which lingers for 300s after the
+    # last read), failed to delete with "dataset is busy", and the sidecar was removed
+    # anyway -- so nothing would ever have reclaimed them. A small leak, but one that
+    # grows by a few snapshots on every single run, forever.
+    #
+    # Left in place, the next run's stage_nested() sees a stale sidecar naming a
+    # different snapshot and sweeps that tree first -- by which time the automounts are
+    # long gone and the delete succeeds.
+    if survivors:
+        if logger:
+            logger.warning(
+                "truecloud-patch: %d snapshot(s) from %s could not be deleted; "
+                "keeping the sidecar so the next run reclaims them",
+                len(survivors), snapshot,
+            )
+        return
 
     _remove_sidecar(staging_root)
 

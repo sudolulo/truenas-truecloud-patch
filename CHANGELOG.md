@@ -66,6 +66,30 @@ worse than no alert, because one day it carries a security fix.
 
 ### Fixed
 
+- **A few snapshots leaked on every nested run, forever.** Found on real hardware, in
+  the one place it could be: a 256-snapshot backup of `/mnt/Tap` swept 253 cleanly and
+  left **3 behind** with `dataset is busy`.
+
+  The cause is ZFS's own automount. Reading anything under
+  `<dataset>/.zfs/snapshot/<snap>/` makes ZFS **automount that snapshot**, and it stays
+  mounted for `zfs_expire_snapshot` seconds (**300** by default) after the last access.
+  `teardown()` unmounts *our* bind mounts — but not the automount underneath — so
+  `zfs destroy` refuses for exactly the datasets restic read most recently. Then
+  `cleanup_task()` removed the sidecar anyway, destroying the only record that those
+  snapshots existed. Nothing would ever have reclaimed them.
+
+  Three changes, and the third is the one that makes it safe rather than merely
+  unlikely:
+  - `release_snapdirs()` unmounts ZFS's own `.zfs/snapshot` automounts (deepest first)
+    before deleting, so the snapshots are not busy in the first place.
+  - `delete_snapshot_tree()` **retries** the transient busy, and **returns the
+    snapshots it could not delete** instead of swallowing them.
+  - **The sidecar is now removed only on a confirmed-clean sweep** — including on the
+    staging-failure path, which used to remove it *before* the caller swept. The
+    asymmetry is deliberate: a sidecar left behind when the tree is already gone costs
+    one no-op delete on the next run, while a sidecar removed while the tree still
+    exists is unrecoverable. Survivors are reclaimed by the next run.
+
 - **Installing the patch permanently blocked updating it.** `install.sh` does
   `chmod +x update.sh`, and git recorded `update.sh` as `100644` — so the chmod was a
   *tracked modification*, and `update.sh` refuses to run over a dirty tree. Install
