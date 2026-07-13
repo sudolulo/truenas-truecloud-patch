@@ -893,3 +893,159 @@ class TestTheSidecarCarriesEveryPendingTree:
         assert len(notes) == 2
         assert "'Tap@a'" in notes[0] and "'Tap@b'" in notes[1]
         assert "[" not in "".join(notes)
+
+
+class TestGarbageCollectorSelection:
+    """`stale_snapshot_names` DELETES DATA on a name match.
+
+    A name match is a weaker claim than a recorded fact, so every way it could be wrong
+    is a test. It exists because the sidecar — which IS a recorded fact — lives in /run,
+    which is tmpfs: a reboot mid-backup destroys it and orphans a 250-snapshot tree with
+    nothing left pointing at it. This is the only thing that would ever find those.
+    """
+
+    import datetime as _dt
+    NOW = _dt.datetime(2026, 7, 14, 12, 0, 0, tzinfo=_dt.UTC)
+    CURRENT = "Tap@cloud_backup-5-20260714115900"        # 1 minute ago
+    OLD = "Tap/apps/x@cloud_backup-5-20260713030000"     # ~33 hours ago
+
+    def collect(self, names, **kw):
+        import truecloud_nested as tn
+        return tn.stale_snapshot_names(
+            "cloud_backup-5", self.CURRENT, names, self.NOW, **kw
+        )
+
+    def test_it_collects_our_own_leftovers(self):
+        assert self.collect([self.OLD]) == [self.OLD]
+
+    def test_it_NEVER_touches_the_current_run(self):
+        # Both the parent and its children share the current snapname.
+        names = [self.CURRENT, "Tap/apps/x@cloud_backup-5-20260714115900"]
+        assert self.collect(names) == []
+
+    def test_it_NEVER_touches_a_periodic_snapshot(self):
+        assert self.collect(["Tap/apps/x@auto-2026-07-13_03-00"]) == []
+
+    def test_it_NEVER_touches_a_human_made_snapshot(self):
+        assert self.collect(["Tap@before-i-broke-everything"]) == []
+
+    def test_it_NEVER_touches_another_TASK(self):
+        # cloud_backup-5 must not match cloud_backup-50. This is why the prefix
+        # carries the trailing dash.
+        assert self.collect(["Tap/apps/x@cloud_backup-50-20260713030000"]) == []
+        assert self.collect(["Tap/apps/x@cloud_backup-7-20260713030000"]) == []
+
+    def test_it_NEVER_touches_a_one_time_backup(self):
+        assert self.collect(["Tap@cloud_backup-onetime-20260713030000"]) == []
+
+    def test_it_NEVER_touches_a_snapshot_that_is_MOUNTED(self):
+        # An in-flight run pins its own snapshots. This — not the age heuristic — is
+        # what actually protects a concurrent backup.
+        assert self.collect([self.OLD], in_use={self.OLD}) == []
+
+    def test_it_NEVER_touches_a_snapshot_younger_than_the_minimum_age(self):
+        # Covers the seconds-long window between `zfs snapshot -r` and the mounts
+        # appearing, when a live run's snapshots look exactly like garbage.
+        young = "Tap/apps/x@cloud_backup-5-20260714113000"   # 30 minutes ago
+        assert self.collect([young]) == []
+        assert self.collect([young], min_age=60) == [young]
+
+    def test_a_name_it_cannot_parse_is_left_alone(self):
+        assert self.collect(["Tap@cloud_backup-5-not-a-timestamp"]) == []
+        assert self.collect(["Tap@cloud_backup-5-"]) == []
+
+    def test_a_realistic_mixed_pool(self):
+        names = [
+            self.CURRENT,                                       # ours, running
+            "Tap/apps/x@cloud_backup-5-20260714115900",         # ours, running (child)
+            self.OLD,                                           # ours, orphaned  <-
+            "Tap/apps/y@cloud_backup-5-20260712030000",         # ours, orphaned  <-
+            "Tap/apps/x@auto-2026-07-13_03-00",                 # periodic
+            "Tap/apps/x@cloud_backup-7-20260713030000",         # another task
+            "Tap@manual-keepme",                                # human
+        ]
+        assert sorted(self.collect(names)) == sorted(
+            [self.OLD, "Tap/apps/y@cloud_backup-5-20260712030000"]
+        )
+
+
+class TestMountedSnapshots:
+    def test_it_reads_snapshot_names_out_of_the_mount_table(self, tmp_path):
+        import truecloud_nested as tn
+        mounts = tmp_path / "mounts"
+        mounts.write_text(
+            "tmpfs /run tmpfs rw 0 0\n"
+            "Tap/apps/x@snap1 /run/truecloud-nested/t/apps/x zfs ro 0 0\n"
+            "Tap/apps/y@snap1 /mnt/Tap/apps/y/.zfs/snapshot/snap1 zfs ro 0 0\n"
+            "Tap/live /mnt/Tap/live zfs rw 0 0\n"
+        )
+        live = tn.mounted_snapshots(str(mounts))
+        assert live == {"Tap/apps/x@snap1", "Tap/apps/y@snap1"}
+        assert "Tap/live" not in live      # a live dataset is not a snapshot
+
+
+class TestGarbageCollectorExecution:
+    def test_it_deletes_the_stale_ones_and_nothing_else(self, monkeypatch, tmp_path):
+        import datetime as dt
+        import truecloud_nested as tn
+
+        mounts = tmp_path / "mounts"
+        mounts.write_text("")
+        now = dt.datetime(2026, 7, 14, 12, 0, 0, tzinfo=dt.UTC)
+
+        mw = FakeMiddleware([
+            "Tap@cloud_backup-5-20260714115900",             # current run
+            "Tap/apps/x@cloud_backup-5-20260713030000",      # orphan   <-
+            "Tap/apps/x@auto-2026-07-13_03-00",              # periodic
+            "Tap/apps/x@cloud_backup-7-20260713030000",      # other task
+        ])
+        remaining = tn.gc_stale_snapshots(
+            mw, "cloud_backup-5", "Tap@cloud_backup-5-20260714115900",
+            now=now, mounts_file=str(mounts),
+        )
+        assert remaining == []
+        assert mw.snapshots == [
+            "Tap@cloud_backup-5-20260714115900",
+            "Tap/apps/x@auto-2026-07-13_03-00",
+            "Tap/apps/x@cloud_backup-7-20260713030000",
+        ]
+
+    def test_a_busy_orphan_is_reported_not_swallowed(self, monkeypatch, tmp_path):
+        import datetime as dt
+        import truecloud_nested as tn
+
+        mounts = tmp_path / "mounts"
+        mounts.write_text("")
+        now = dt.datetime(2026, 7, 14, 12, 0, 0, tzinfo=dt.UTC)
+        orphan = "Tap/apps/x@cloud_backup-5-20260713030000"
+
+        mw = BusyMiddleware(
+            ["Tap@cloud_backup-5-20260714115900", orphan],
+            busy=[orphan], busy_for=99,
+        )
+        remaining = tn.gc_stale_snapshots(
+            mw, "cloud_backup-5", "Tap@cloud_backup-5-20260714115900",
+            now=now, mounts_file=str(mounts),
+        )
+        assert remaining == [orphan]
+
+    def test_it_collects_NOTHING_when_the_query_fails(self, tmp_path):
+        # Cannot enumerate => cannot know what is ours => delete nothing.
+        import datetime as dt
+        import truecloud_nested as tn
+
+        mounts = tmp_path / "mounts"
+        mounts.write_text("")
+
+        class Broken(FakeMiddleware):
+            def call_sync(self, method, *args):
+                if method == "zfs.snapshot.query":
+                    raise RuntimeError("middleware is having a day")
+                return super().call_sync(method, *args)
+
+        assert tn.gc_stale_snapshots(
+            Broken(["Tap/apps/x@cloud_backup-5-20260713030000"]),
+            "cloud_backup-5", "Tap@cloud_backup-5-20260714115900",
+            now=dt.datetime(2026, 7, 14, 12, 0, 0, tzinfo=dt.UTC),
+            mounts_file=str(mounts),
+        ) == []

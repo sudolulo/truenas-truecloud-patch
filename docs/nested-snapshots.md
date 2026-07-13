@@ -95,6 +95,21 @@ re-scan each time.
 
 ### Snapshot lifecycle
 
+> **Two mechanisms clean up, and the second exists because the first can be destroyed.**
+>
+> 1. **The sidecar** records exactly which snapshots a run pinned, and is removed only
+>    on a confirmed-clean sweep. Precise, and it survives a middlewared restart.
+> 2. **The garbage collector** finds leftovers by *name*, so it still works when the
+>    sidecar is gone — and it can be: **the sidecar lives in `/run`, which is tmpfs.** A
+>    reboot mid-backup takes it, and with it the only record of a 250-snapshot tree.
+>
+> The collector runs at the start of every backup, after the sidecar reclaim. It will
+> only touch a snapshot named `<dataset>@<task>-<timestamp>` that is not the current
+> run's, has **nothing mounted from it** (which is what protects a concurrently-running
+> backup), and is **over an hour old**. Periodic `auto-*` snapshots, other tasks'
+> snapshots, and anything you made by hand are structurally out of reach.
+
+
 > **A snapshot may survive a run, and that is expected.** ZFS **automounts**
 > `<dataset>/.zfs/snapshot/<snap>` the moment it is read, and holds it for
 > `zfs_expire_snapshot` seconds (**300** by default) after the last access. So

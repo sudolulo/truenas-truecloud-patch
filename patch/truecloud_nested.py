@@ -55,6 +55,7 @@ Therefore this module owns the whole lifecycle:
 from __future__ import annotations
 
 import contextlib
+import datetime
 import os
 import stat
 import subprocess
@@ -68,10 +69,13 @@ __all__ = [
     "cleanup_task",
     "current_mounts_under",
     "delete_snapshot_tree",
+    "gc_stale_snapshots",
+    "mounted_snapshots",
     "plan_staging",
     "sidecar_for",
     "snapshot_tree_names",
     "stage_nested",
+    "stale_snapshot_names",
     "staging_root_for",
     "teardown",
     "verify_staged",
@@ -174,6 +178,76 @@ def snapshot_tree_names(snapshot: str, all_names) -> list[str]:
         n for n in all_names
         if n == parent or (n.startswith(prefix) and n.endswith(suffix))
     ]
+
+
+#: A snapshot must be at least this old before the garbage collector will touch it.
+#:
+#: The GC identifies our leftovers by NAME, so its only real risk is deleting a
+#: snapshot belonging to a run that is still starting up -- the window between
+#: `zfs snapshot -r` and the bind mounts appearing, which is seconds. An hour is three
+#: orders of magnitude more slack than that window needs, and still reclaims a lost
+#: tree on the very next daily run.
+GC_MIN_AGE_SECONDS = 3600
+
+
+def stale_snapshot_names(task_name, current_snapshot, all_names, now,
+                         in_use=(), min_age=GC_MIN_AGE_SECONDS):
+    """Snapshots THIS task created in an earlier run and never cleaned up.
+
+    Pure, because this is the one function here that DELETES DATA on a name match, and
+    a name match is a weaker claim than a recorded fact. Everything it relies on is an
+    argument, so every way it could be wrong is a test.
+
+    Why a garbage collector exists at all, when there is already a sidecar: **the
+    sidecar lives in /run, which is tmpfs.** A reboot mid-backup destroys it, and with
+    it the only record of a 250-snapshot tree. The sidecar handles the normal case
+    precisely; this handles the case where the record itself is gone.
+
+    A snapshot is ours to collect only if ALL of these hold:
+
+      * its name is exactly ``<dataset>@<task_name>-<YYYYMMDDHHMMSS>`` -- so
+        ``cloud_backup-5`` never matches ``cloud_backup-50``'s snapshots, and never
+        matches a periodic ``auto-2026-…`` or anything a human made;
+      * it is not the snapshot the current run is using;
+      * nothing is mounted from it (`in_use`) -- an in-flight run pins its own
+        snapshots, so this alone protects a concurrent one-time backup;
+      * it is older than `min_age` -- which covers the seconds-long window in which a
+        run has taken its snapshot but not yet mounted it.
+
+    `now` is a timezone-aware datetime; timestamps in the name are UTC (stock builds
+    them with `utc_now()`).
+    """
+    prefix = task_name + "-"
+    stale = []
+
+    for name in all_names:
+        _dataset, _, snapname = name.partition("@")
+        if not snapname or not snapname.startswith(prefix):
+            continue
+        if name == current_snapshot or snapname == _snapname_of(current_snapshot):
+            continue
+        if name in in_use:
+            continue
+
+        stamp = snapname[len(prefix):]
+        try:
+            when = datetime.datetime.strptime(stamp, "%Y%m%d%H%M%S").replace(
+                tzinfo=datetime.UTC
+            )
+        except ValueError:
+            # Not our timestamp format. Something else owns this name; leave it alone.
+            continue
+
+        if (now - when).total_seconds() < min_age:
+            continue
+
+        stale.append(name)
+
+    return stale
+
+
+def _snapname_of(snapshot):
+    return snapshot.partition("@")[2] if snapshot else ""
 
 
 def _probe_snapdir(path):
@@ -598,6 +672,80 @@ def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
     return remaining
 
 
+def mounted_snapshots(mounts_file="/proc/self/mounts"):
+    """Every ZFS snapshot something is currently mounted from.
+
+    The device field of a snapshot mount IS the snapshot name (`Tap/apps/x@snap`), for
+    both our staging bind mounts and ZFS's own .zfs automounts. So this is a direct,
+    factual answer to "is anything using this snapshot right now" -- which is what
+    protects a concurrently-running backup from the garbage collector, rather than
+    trusting an age heuristic to be generous enough.
+    """
+    live = set()
+    try:
+        with open(mounts_file, encoding="utf-8") as fh:
+            for line in fh:
+                dev = line.split(" ", 1)[0]
+                if "@" in dev:
+                    live.add(dev.replace("\\040", " "))
+    except OSError:
+        return set()
+    return live
+
+
+def gc_stale_snapshots(middleware, task_name, current_snapshot, logger=None,
+                       now=None, mounts_file="/proc/self/mounts"):
+    """Delete snapshots this task left behind in an earlier run. Returns what remains.
+
+    The backstop for when the RECORD is gone, not just the snapshots: the sidecar lives
+    in /run (tmpfs), so a reboot mid-backup takes it with them. Without this, that tree
+    -- one snapshot per descendant dataset, 250+ on a real pool -- is orphaned with
+    nothing left pointing at it.
+
+    Selection is `stale_snapshot_names()`, which is pure and heavily tested, because a
+    name match is a weaker claim than a recorded fact and this deletes data on one.
+    """
+    dataset = current_snapshot.partition("@")[0]
+    now = now or datetime.datetime.now(datetime.UTC)
+
+    try:
+        snaps = middleware.call_sync(
+            "zfs.snapshot.query", [["name", "^", dataset]], {"select": ["name"]}
+        )
+    except Exception as e:  # noqa: BLE001 - cannot enumerate; collect nothing
+        if logger:
+            logger.warning(
+                "truecloud-patch: could not enumerate snapshots for GC: %r", e
+            )
+        return []
+
+    stale = stale_snapshot_names(
+        task_name, current_snapshot, [s["name"] for s in snaps], now,
+        in_use=mounted_snapshots(mounts_file),
+    )
+    if not stale:
+        return []
+
+    if logger:
+        logger.warning(
+            "truecloud-patch: %d snapshot(s) from an earlier run of %s were never "
+            "cleaned up (a lost record, e.g. a reboot mid-backup); collecting them",
+            len(stale), task_name,
+        )
+
+    remaining = []
+    for name in stale:
+        try:
+            middleware.call_sync("zfs.snapshot.delete", name)
+        except Exception as e:  # noqa: BLE001 - busy, or gone; either way, next run
+            remaining.append(name)
+            if logger:
+                logger.debug(
+                    "truecloud-patch: could not collect %s: %r", name, e
+                )
+    return remaining
+
+
 def stage_nested(middleware, path, snapshot, base_dataset, base_mountpoint,
                  task_name, datasets, logger=None):
     """Build a complete staging tree for `path` from the already-taken `snapshot`.
@@ -649,6 +797,18 @@ def stage_nested(middleware, path, snapshot, base_dataset, base_mountpoint,
             "truecloud-patch: %d snapshot(s) from an earlier run are still busy; "
             "carrying them forward to the next run", len(pending),
         )
+
+    # ...and collect anything from an earlier run that has NO record at all.
+    #
+    # The sidecar above is precise but lives in /run, which is tmpfs -- a reboot
+    # mid-backup destroys it and orphans the whole tree with nothing pointing at it.
+    # This finds those by name and is the only thing that ever will.
+    #
+    # It runs AFTER the sidecar reclaim on purpose: the recorded path is authoritative
+    # and cheap, and the GC should only ever be mopping up what the record lost.
+    pending.extend(
+        gc_stale_snapshots(middleware, task_name, snapshot, logger=logger)
+    )
 
     # Record the snapshot BEFORE mounting anything, not after. middlewared can
     # die at any point (this patch even schedules a restart at boot), and the
