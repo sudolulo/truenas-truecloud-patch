@@ -111,3 +111,61 @@ def test_patterns_compile_and_replacements_reference_group_one():
     for find, replace in _PATTERNS:
         assert isinstance(find, re.Pattern)
         assert r"\1" in replace, "replacement must preserve the binding name"
+
+
+class TestCorruptionGuard:
+    """A bad pattern must never reach the bundle.
+
+    This is not hypothetical. Commit 47cdf72 shipped a pattern that consumed one
+    closing paren and emitted one, netting an extra `)`:
+
+        c(2,"filterByProviders",["STORJ_IX","S3","B2"]))("required",!0)
+                                                      ^^ syntax error
+
+    The web UI went blank. And because MARKER was then present in the file, every
+    subsequent run reported "already patched" and skipped — so the patch could not
+    heal itself, and the bundle had to be hand-restored from the backup.
+    """
+
+    # Verbatim from 47cdf72.
+    BROKEN = (
+        re.compile(r'("filterByProviders",)\w+\(\d+,\w+,\w+\.CloudSyncProviderName\.Storj\)'),
+        r'\1["STORJ_IX","S3","B2"])',
+    )
+
+    def test_the_regression_that_blanked_the_ui_is_detectable(self):
+        find, replace = self.BROKEN
+        patched, count = find.subn(replace, REAL_25X)
+        assert count == 1, "it did match — that is why it got written"
+        assert paren_delta(patched) != paren_delta(REAL_25X), (
+            "the paren balance changes; this is the signal main() now refuses on"
+        )
+
+    def test_main_refuses_to_write_an_unbalanced_bundle(self, monkeypatch, tmp_path, capsys):
+        import patch_ui
+
+        bundle = tmp_path / "chunk-TEST.js"
+        bundle.write_text(REAL_25X, encoding="utf-8")
+
+        monkeypatch.setattr(patch_ui, "WEBUI_CANDIDATES", [str(tmp_path)])
+        monkeypatch.setattr(patch_ui, "_PATTERNS", [self.BROKEN])
+
+        patch_ui.main()
+
+        out = capsys.readouterr().out
+        assert "refusing to write" in out
+        # The bundle must be byte-for-byte untouched — a broken UI is far worse
+        # than an unpatched one.
+        assert bundle.read_text(encoding="utf-8") == REAL_25X
+
+    def test_a_good_pattern_still_writes(self, monkeypatch, tmp_path):
+        import patch_ui
+
+        bundle = tmp_path / "chunk-TEST.js"
+        bundle.write_text(REAL_25X, encoding="utf-8")
+        monkeypatch.setattr(patch_ui, "WEBUI_CANDIDATES", [str(tmp_path)])
+
+        patch_ui.main()
+
+        assert MARKER in bundle.read_text(encoding="utf-8")
+        assert (tmp_path / "chunk-TEST.js.pre-truecloud-patch").exists()

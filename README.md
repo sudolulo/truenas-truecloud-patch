@@ -252,6 +252,7 @@ mount | grep truecloud-nested                            # expect no output
 | Backup fails: `dataset '…' has no snapshot '…'; refusing to back up an incomplete tree` | Working as designed — a descendant dataset was not covered by the snapshot. The backup is refused rather than silently omitting that data. |
 | Backup fails: `snapshot '…' cannot be read (Permission denied)` | The snapshot exists but is unreadable. Middleware runs as root, so this indicates a real permissions problem, not a missing snapshot. |
 | `cloud_backup-*` snapshots accumulating | The sweep is not running. Check `apply.log` for the nested patch applying, and confirm `sync.py` carries the `TRUECLOUD_PATCH` block. |
+| Web UI blank after a patch | A bad pattern unbalanced the bundle. `apply.sh` now refuses to write in that case, but if you hit it on an older version: restore `chunk-*.js.pre-truecloud-patch` over the live chunk, then re-run `install.sh`. (`MARKER` makes an already-patched file skip, so the patch cannot heal a corrupted bundle by itself.) |
 | Stale mounts under `/run/truecloud-nested` | A crashed run. The next backup tears them down. To clear them now: `python3 patch/truecloud_nested.py cleanup` (also run by `uninstall.sh` and `recover.sh`). It names any ZFS snapshot an interrupted run left pinned. |
 
 ## Supported providers after patching

@@ -65,6 +65,11 @@ def _match_pattern(content):
     return None, None
 
 
+def _paren_delta(s):
+    """Net parenthesis balance. Patching must not change it — see main()."""
+    return s.count("(") - s.count(")")
+
+
 def find_bundle():
     """
     Search WEBUI_CANDIDATES for the JS chunk containing the filterByProviders
@@ -132,6 +137,24 @@ def main():
             f"expected exactly 1 — skipping write to avoid corrupting the bundle.\n"
             f"[truecloud-patch] File an issue at "
             f"https://github.com/sudolulo/truenas-truecloud-patch"
+        )
+        return
+
+    # Never write JS whose parentheses we have unbalanced. A pattern that eats one
+    # paren too many is a syntax error in the bundle and the entire TrueNAS web UI
+    # goes blank -- and because MARKER is then present, every later run reports
+    # "already patched" and skips, so the patch cannot heal itself. Recovery means
+    # hand-restoring the .pre-truecloud-patch backup.
+    #
+    # This is not hypothetical: it shipped once. Refuse instead.
+    if _paren_delta(patched) != _paren_delta(content):
+        print(
+            "[truecloud-patch] ERROR: the replacement would unbalance the bundle's "
+            "parentheses — refusing to write.\n"
+            "[truecloud-patch] The UI is UNCHANGED and still works. This means the "
+            "pattern no longer fits this TrueNAS build.\n"
+            "[truecloud-patch] File an issue at "
+            "https://github.com/sudolulo/truenas-truecloud-patch"
         )
         return
 
