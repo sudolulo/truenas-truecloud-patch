@@ -43,7 +43,16 @@ DISABLED_MARKER = os.path.join(PATCH_DIR, "update_alerts_disabled")
 
 _TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
 _VERSION_RE = re.compile(r'^VERSION="([^"]+)"', re.M)
-_GITHUB_RE = re.compile(r"github\.com[:/]([^/]+)/([^/.]+)")
+
+#: owner/repo out of any of:
+#:   git@github.com:sudolulo/repo.git
+#:   https://github.com/sudolulo/repo.git
+#:   ssh://git@git.onetick.ninja:55214/flan/repo.git
+#:   https://git.onetick.ninja/flan/repo.git
+#: The SSH port is deliberately not captured: it is not the web port.
+_REMOTE_RE = re.compile(
+    r"^(?:\w+://)?(?:[^@/]+@)?([^:/]+)(?::\d+)?[:/]([^/]+)/([^/]+?)(?:\.git)?/?$"
+)
 
 _TIMEOUT = 20
 
@@ -206,21 +215,40 @@ class TrueCloudPatchUpdateAlertSource(ThreadedAlertSource):
         detail = ", ".join(ordered)
         return level, versions, f" Changes: {detail}." if detail else ""
 
-    def _remote_changelog(self, tag):
-        """CHANGELOG.md at `tag`, over HTTPS. None if it cannot be read."""
+    def _changelog_url(self, tag):
+        """Where to read CHANGELOG.md at `tag`, derived from the origin remote.
+
+        Forge-agnostic on purpose. This project is canonically hosted on Gitea and
+        mirrored to GitHub, and hard-coding either one has a nastier failure than it
+        looks: when the changelog cannot be read, _classify() falls back to
+        "notable" and alerts ANYWAY, because the alternative is silently hiding a
+        security fix. So a stale URL does not disable the alert -- it makes the
+        alert fire on every release including documentation-only ones, which is
+        precisely the nagging this whole mechanism exists to prevent.
+        """
         try:
             remote = self._git("remote", "get-url", "origin").strip()
         except Exception:
             return None
 
-        m = _GITHUB_RE.search(remote)
+        m = _REMOTE_RE.match(remote)
         if not m:
-            return None  # not a GitHub remote; skip classification
+            return None
 
-        url = (
-            f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}/"
-            f"{tag}/CHANGELOG.md"
-        )
+        host, owner, repo = m.group(1), m.group(2), m.group(3)
+
+        if host.endswith("github.com"):
+            return f"https://raw.githubusercontent.com/{owner}/{repo}/{tag}/CHANGELOG.md"
+
+        # Gitea and Forgejo both serve /{owner}/{repo}/raw/tag/{tag}/{path} over the
+        # web port, which is not the SSH port the remote may name.
+        return f"https://{host}/{owner}/{repo}/raw/tag/{tag}/CHANGELOG.md"
+
+    def _remote_changelog(self, tag):
+        """CHANGELOG.md at `tag`, over HTTPS. None if it cannot be read."""
+        url = self._changelog_url(tag)
+        if not url:
+            return None
         try:
             with urllib.request.urlopen(url, timeout=_TIMEOUT) as resp:  # noqa: S310
                 if resp.status != 200:

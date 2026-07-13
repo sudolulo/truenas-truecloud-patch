@@ -4,7 +4,7 @@
 # Prerequisites: run as root on TrueNAS SCALE with middlewared running.
 # Clone this repository to a persistent ZFS pool first:
 #
-#   git clone https://github.com/sudolulo/truenas-truecloud-patch \
+#   git clone https://git.onetick.ninja/flan/truenas-truecloud-patch \
 #       /mnt/<pool>/truenas-truecloud-patch
 #   cd /mnt/<pool>/truenas-truecloud-patch && bash install.sh
 #
@@ -72,7 +72,7 @@ done
 if [ ! -f "$PATCH_DIR/patch/apply.sh" ]; then
     echo "ERROR: patch files not found at $PATCH_DIR/patch/" >&2
     echo "Run install.sh from a clone of the repository on a persistent pool:" >&2
-    echo "  git clone https://github.com/sudolulo/truenas-truecloud-patch \\" >&2
+    echo "  git clone https://git.onetick.ninja/flan/truenas-truecloud-patch \\" >&2
     echo "      /mnt/<pool>/truenas-truecloud-patch" >&2
     echo "  cd /mnt/<pool>/truenas-truecloud-patch && bash install.sh" >&2
     exit 1

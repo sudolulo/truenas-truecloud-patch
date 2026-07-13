@@ -111,7 +111,7 @@ def main():
         print(
             "[truecloud-patch] WARNING: filterByProviders pattern not found in any JS bundle.\n"
             "[truecloud-patch] The TrueNAS webui may have been restructured in this version.\n"
-            "[truecloud-patch] File an issue at https://github.com/sudolulo/truenas-truecloud-patch\n"
+            "[truecloud-patch] File an issue at https://git.onetick.ninja/flan/truenas-truecloud-patch\n"
             f"[truecloud-patch] TrueNAS version info: {_tnversion()}"
         )
         return
@@ -136,7 +136,7 @@ def main():
             f"[truecloud-patch] WARNING: {count} replacement(s) in {path}; "
             f"expected exactly 1 — skipping write to avoid corrupting the bundle.\n"
             f"[truecloud-patch] File an issue at "
-            f"https://github.com/sudolulo/truenas-truecloud-patch"
+            f"https://git.onetick.ninja/flan/truenas-truecloud-patch"
         )
         return
 
@@ -154,7 +154,7 @@ def main():
             "[truecloud-patch] The UI is UNCHANGED and still works. This means the "
             "pattern no longer fits this TrueNAS build.\n"
             "[truecloud-patch] File an issue at "
-            "https://github.com/sudolulo/truenas-truecloud-patch"
+            "https://git.onetick.ninja/flan/truenas-truecloud-patch"
         )
         return
 

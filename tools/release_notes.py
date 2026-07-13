@@ -37,8 +37,51 @@ _VERSION_RE = re.compile(r'^(?:VERSION=|__version__\s*=\s*)"([^"]+)"', re.M)
 _HEADING_RE = re.compile(r"^##\s+v?(\d+\.\d+\.\d+[^\s]*)", re.M)
 
 
+#: Work in progress lives here until a release promotes it. Batching through this
+#: section is what stops "tag, find bug, tag again" from becoming twelve releases.
+UNRELEASED = "Unreleased"
+
+_UNRELEASED_RE = re.compile(r"^##\s+Unreleased\s*$", re.M | re.I)
+_RC_RE = re.compile(r"-(rc|beta|alpha)\d*$", re.I)
+
+
 def normalise(v: str) -> str:
     return v.strip().lstrip("v")
+
+
+def is_prerelease(tag: str) -> bool:
+    """True for v1.2.3-rc1 / -beta / -alpha. Those never reach users."""
+    return bool(_RC_RE.search(tag.strip()))
+
+
+def base_version(tag: str) -> str:
+    """v1.2.3-rc2 -> 1.2.3"""
+    return _RC_RE.sub("", normalise(tag))
+
+
+def unreleased_body(text: str) -> str:
+    """Content under `## Unreleased`, or "" if the section is absent/empty."""
+    m = _UNRELEASED_RE.search(text)
+    if not m:
+        return ""
+    rest = text[m.end():]
+    nxt = _HEADING_RE.search(rest)
+    return (rest[:nxt.start()] if nxt else rest).strip()
+
+
+def promote(text: str, version: str, date: str) -> str:
+    """Rename `## Unreleased` to `## vX.Y.Z — date`.
+
+    Refuses if the section is missing or empty: a release with nothing in it is a
+    release nobody needed, and cutting one only trains people to ignore alerts.
+    """
+    if not unreleased_body(text):
+        raise ValueError(
+            "CHANGELOG.md has no `## Unreleased` content — nothing to release. "
+            "Add your changes there first."
+        )
+    m = _UNRELEASED_RE.search(text)
+    return text[:m.start()] + f"## v{normalise(version)} — {date}" + text[m.end():]
 
 
 def script_versions(root: str = ROOT) -> dict[str, str]:
@@ -143,8 +186,12 @@ def significance(text: str, current: str, latest: str):
 
 
 def check(version: str, root: str = ROOT) -> list[str]:
-    """Every reason this version is not releasable. Empty list means it is."""
-    want = normalise(version)
+    """Every reason this version is not releasable. Empty list means it is.
+
+    `version` may be a release candidate (v1.2.3-rc2); the scripts and CHANGELOG
+    are checked against its BASE version, since an rc ships the same code.
+    """
+    want = base_version(version)
     problems = []
 
     versions = script_versions(root)
@@ -169,6 +216,15 @@ def check(version: str, root: str = ROOT) -> list[str]:
     else:
         if not body:
             problems.append(f"CHANGELOG.md section for v{want} is empty")
+
+    # A stable release must not leave work stranded under `## Unreleased`. If it is
+    # finished enough to ship, it belongs in the release; if it is not, the release
+    # is premature. (An rc may legitimately have more work queued behind it.)
+    if not is_prerelease(version) and unreleased_body(text):
+        problems.append(
+            "CHANGELOG.md still has content under `## Unreleased` — either include "
+            "it in this release, or do not cut the release yet"
+        )
 
     return problems
 

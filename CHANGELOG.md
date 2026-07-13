@@ -1,5 +1,47 @@
 # Changelog
 
+Work lands under **Unreleased** and stays there until a release promotes it. That
+is deliberate: see [Releasing](README.md#releasing). Twelve releases were cut on
+2026-07-13, several of them fixing the release before — and with the update alert
+live, every one of those interrupts every user. An alert people learn to ignore is
+worse than no alert, because one day it carries a security fix.
+
+## Unreleased
+
+### Added
+
+- **`release.sh` — a two-stage release process, and a barrier that enforces it.**
+  A stable `vX.Y.Z` tag is now only publishable if a `vX.Y.Z-rcN` tag points at the
+  **same commit** and that candidate's CI run passed. Candidates are invisible to
+  users — `update.sh` and the update alert both take the newest plain `vX.Y.Z` tag —
+  so debugging happens across rc1, rc2, rc3 at nobody's expense, instead of across
+  v0.5.0, v0.5.1, v0.5.2 at everybody's.
+
+      bash release.sh 0.6.0 --rc        # candidate. Invisible to users.
+      bash release.sh 0.6.0 --promote   # stable. Refused unless an rc passed HERE.
+
+  The rule is enforced in `tools/release_gate.py`, which `release.sh` runs locally
+  (so you fail in 200 ms) and `.github/workflows/release.yml` runs again where it
+  cannot be bypassed (so failing locally is not optional). "The candidate passed,
+  then I pushed one more little fix" is refused by name — that is precisely how
+  v0.5.1 happened.
+
+### Changed
+
+- **A stable release may not leave work stranded under `## Unreleased`.** Either it
+  is finished and belongs in the release, or the release is premature. Candidates
+  are exempt: an rc may legitimately have work queued behind it.
+
+- **`release.sh` refuses to run on an installed box.** The whole repo is cloned onto
+  every box, so this file is there too; `update.sh` pins the checkout to a tag in
+  detached HEAD, and `release.sh` now recognises that and says so, rather than
+  emitting a confusing branch error.
+
+### Internal
+
+- Static-analysis annotations in `patch/alert_source.py` (`# noqa` placement). No
+  runtime change.
+
 ## v0.5.1 — 2026-07-13
 
 ### Fixed

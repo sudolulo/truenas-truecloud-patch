@@ -70,8 +70,47 @@ jobs:
 
       # Catches the failure mode this repo actually had: VERSION= drifted to
       # three different values across the scripts, and nothing noticed.
-      - name: version matches tag and CHANGELOG has a section
+      - name: "gate: version matches tag, CHANGELOG complete, nothing stranded"
         run: python3 tools/release_notes.py check "${{ steps.tag.outputs.tag }}"
+
+      # THE BARRIER. A stable release must have been a release candidate on this
+      # exact commit. Candidates are invisible to users (update.sh and the alert
+      # source both take the newest plain vX.Y.Z), so debugging happens across
+      # rc1/rc2/rc3 at no cost to anyone -- instead of across v0.5.0/v0.5.1/v0.5.2,
+      # which alerts every installed box every time.
+      #
+      # Same code release.sh runs locally, so this should never be the first place
+      # you find out. It is here because this is the only place that cannot be
+      # bypassed: it holds the token that publishes.
+      - name: "gate: this commit was a release candidate"
+        run: python3 tools/release_gate.py "${{ steps.tag.outputs.tag }}" -C .
+
+      # ...and the candidate has to have actually passed. Only CI can see this, so
+      # it cannot live in release_gate.py with the rest.
+      - name: "gate: that candidate's CI run passed"
+        if: ${{ !contains(steps.tag.outputs.tag, '-rc') && !contains(steps.tag.outputs.tag, '-beta') && !contains(steps.tag.outputs.tag, '-alpha') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          sha="$(git rev-list -n 1 "$TAG")"
+          # Every rc tag on this exact commit -- release_gate.py already proved
+          # there is at least one.
+          rcs="$(git tag --points-at "$sha" | grep -E -- '-rc[0-9]+$' || true)"
+
+          for rc in $rcs; do
+            concl="$(gh run list --workflow=release.yml --branch "$rc" \
+                       --json conclusion --jq '.[0].conclusion // ""' 2>/dev/null || true)"
+            echo "candidate $rc -> ${concl:-<no run found>}"
+            if [ "$concl" = "success" ]; then
+              echo "::notice::$TAG is promoting $rc, whose release run passed."
+              exit 0
+            fi
+          done
+
+          echo "::error::No release candidate on $sha has a passing release run."
+          echo "::error::Candidates found: ${rcs:-none}. Wait for CI, or cut a new one."
+          exit 1
 
       - name: extract release notes from CHANGELOG
         run: |

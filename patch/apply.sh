@@ -204,13 +204,89 @@ else
     _NESTED_ENABLED=0
 fi
 
-# Is either module still doing something useful?
+# ── compatibility preflight ──────────────────────────────────────────────────
+#
+# The native probes above ask "has iX made this module unnecessary?". This asks the
+# other question, the dangerous one: "has iX changed middleware so that this module
+# no longer WORKS?"
+#
+# middlewared is internal API with no stability contract, and TrueNAS 26 rewrites
+# the entire cloud_backup path from async to synchronous. Every block the nested
+# module injects is an `async def` wrapping an `await`ed original; on 26 that hands
+# sync.py a coroutine where it unpacks a tuple. The backup does not fail cleanly --
+# it fails at the point where you needed it.
+#
+# tools/compat.py records what each module assumes and checks it against the
+# middlewared ACTUALLY INSTALLED HERE. A module whose assumptions no longer hold is
+# not applied. Stock TrueNAS without a feature beats TrueNAS with a broken one.
+#
+# Fail direction, deliberately asymmetric:
+#   * a definite "assumption violated"  -> disable that module. Strong evidence.
+#   * the checker cannot run at all     -> change nothing. That is a tooling glitch,
+#     not evidence, and turning it into a disabled module would break working boxes.
+_TC_COMPAT_JSON="$PATCH_DIR/incompatible.json"
+rm -f "$_TC_COMPAT_JSON"
+
+_tc_compat=$("$PYTHON" - "$PATCH_DIR" "$_MW_DIR" "$_TC_COMPAT_JSON" <<'PYEOF' 2>/dev/null || printf 'unknown\nunknown\n')
+import json, os, sys
+
+patch_dir, mw_dir, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# APPEND, never insert(0) -- see the note by the mw_patch import below. Shadowing
+# the stdlib for this interpreter is a much worse failure than not finding compat.
+sys.path.append(os.path.join(patch_dir, 'tools'))
+try:
+    import compat
+    result = compat.check_tree(mw_dir)
+except Exception:
+    print('unknown')
+    print('unknown')
+    raise SystemExit(0)
+
+def verdict(r):
+    return 'broken' if (not r['ok'] and not r['native']) else 'ok'
+
+broken = {m: r for m, r in result.items() if verdict(r) == 'broken'}
+if broken:
+    # The alert source reads this. Written before we print, so a box that is
+    # incompatible always has the evidence on disk even if apply.sh dies later.
+    try:
+        with open(out_path, 'w', encoding='utf-8') as fh:
+            json.dump(broken, fh, indent=2)
+    except OSError:
+        pass
+
+print(verdict(result['providers']))
+print(verdict(result['nested']))
+PYEOF
+)
+
+_tc_compat_providers=$(printf '%s' "$_tc_compat" | sed -n '1p')
+_tc_compat_nested=$(printf '%s' "$_tc_compat"    | sed -n '2p')
+
+# Is either module still doing something useful -- and can it still be applied?
 _providers_needed=1
 [ "$_tc_native_b2" = "yes" ] && _providers_needed=0
 
 _nested_needed=0
 if [ "$_NESTED_ENABLED" = "1" ] && [ "$_tc_native_nested" != "yes" ]; then
     _nested_needed=1
+fi
+
+if [ "$_tc_compat_providers" = "broken" ]; then
+    echo "WARNING: truecloud-patch is NOT COMPATIBLE with this TrueNAS version."
+    echo "WARNING:   The B2/S3 providers module will NOT be applied. TrueCloud is"
+    echo "WARNING:   left stock, so B2/S3 tasks will not run until this is fixed."
+    echo "WARNING:   Details: $_TC_COMPAT_JSON"
+    _providers_needed=0
+fi
+
+if [ "$_tc_compat_nested" = "broken" ] && [ "$_NESTED_ENABLED" = "1" ]; then
+    echo "WARNING: truecloud-patch's nested-snapshot module is NOT COMPATIBLE with"
+    echo "WARNING:   this TrueNAS version and will NOT be applied. Backups still"
+    echo "WARNING:   run; datasets nested under the target are not included."
+    echo "WARNING:   Details: $_TC_COMPAT_JSON"
+    _nested_needed=0
 fi
 
 if [ "$_providers_needed" = "0" ] && [ "$_nested_needed" = "0" ]; then

@@ -123,7 +123,7 @@ cd "$PATCH_DIR"
 
 if ! git rev-parse --git-dir >/dev/null 2>&1; then
     echo "ERROR: $PATCH_DIR is not a git clone — nothing to update." >&2
-    echo "  Re-clone from https://github.com/sudolulo/truenas-truecloud-patch" >&2
+    echo "  Re-clone from https://git.onetick.ninja/flan/truenas-truecloud-patch" >&2
     exit 1
 fi
 
