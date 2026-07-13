@@ -43,23 +43,6 @@ worse than no alert, because one day it carries a security fix.
   It immediately found two real breaks: TrueNAS 26 (below), and a nested-snapshot bug
   that had been shipping for two releases (below).
 
-### Fixed
-
-- **Nested snapshots were broken on TrueNAS 24.10 and 25.04, and had been all
-  along.** `SYNC_BLOCK`'s wrapper spelled out the stock signature and forwarded five
-  arguments — but those releases declare `restic_backup(middleware, job,
-  cloud_backup, dry_run)`; `rate_limit` only arrived in 25.10. Every nested backup on
-  24.10/25.04 raised `TypeError: restic_backup() takes 4 positional arguments but 5
-  were given`. The wrapper now takes `*args, **kwargs` and forwards whatever it is
-  handed, so a trailing parameter appearing or disappearing is a non-event.
-
-  Found by the new compatibility check, not by a user — which is the whole argument
-  for having it. The check it replaced only asked whether the parameter *names* still
-  appeared somewhere in the signature, so it happily passed a call that could never
-  work.
-
-### Added
-
 - **The compatibility check now covers the middlewared methods the patch _calls_,**
   not only the symbols it wraps — and that gap was hiding a catastrophe.
 
@@ -83,6 +66,19 @@ worse than no alert, because one day it carries a security fix.
   datasets are simply not covered.
 
 ### Fixed
+
+- **Nested snapshots were broken on TrueNAS 24.10 and 25.04, and had been all
+  along.** `SYNC_BLOCK`'s wrapper spelled out the stock signature and forwarded five
+  arguments — but those releases declare `restic_backup(middleware, job,
+  cloud_backup, dry_run)`; `rate_limit` only arrived in 25.10. Every nested backup on
+  24.10/25.04 raised `TypeError: restic_backup() takes 4 positional arguments but 5
+  were given`. The wrapper now takes `*args, **kwargs` and forwards whatever it is
+  handed, so a trailing parameter appearing or disappearing is a non-event.
+
+  Found by the new compatibility check, not by a user — which is the whole argument
+  for having it. The check it replaced only asked whether the parameter *names* still
+  appeared somewhere in the signature, so it happily passed a call that could never
+  work.
 
 - **The nested module is now one synchronous implementation behind two thin
   wrappers.** TrueNAS 26 rewrites `cloud_backup` from async to **synchronous** and
