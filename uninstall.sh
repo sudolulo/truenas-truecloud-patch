@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.3.4"
+VERSION="0.3.5"
 
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 _HOOK_COMMENT='TrueCloud provider patch (S3/B2)'

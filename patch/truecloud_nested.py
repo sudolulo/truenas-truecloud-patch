@@ -279,7 +279,11 @@ def current_mounts_under(root, mounts_file="/proc/self/mounts"):
 
 
 def _run(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+    # List form, never shell=True: `cmd` is built from our own mount plan, so ZFS
+    # dataset names cannot inject. Runs as root by definition (it mounts).
+    return subprocess.run(  # noqa: S603
+        cmd, capture_output=True, text=True, check=False
+    )
 
 
 def apply_plan(mounts, runner=_run, isdir=os.path.isdir):
@@ -379,8 +383,16 @@ async def delete_snapshot_tree(middleware, snapshot, logger=None):
     try:
         await middleware.call("zfs.snapshot.delete", snapshot, {"recursive": True})
         return
-    except Exception:  # noqa: BLE001 - fall through to the explicit sweep
-        pass
+    except Exception as e:  # noqa: BLE001 - fall through to the explicit sweep
+        # Usually just "parent already gone" (stock's finally won the race once our
+        # mounts were released), which the sweep below handles. Log it rather than
+        # swallow it: if the real cause is something else, this is the only place
+        # it is visible -- the sweep would report a different, downstream failure.
+        if logger:
+            logger.debug(
+                "truecloud-patch: recursive delete of %s failed (%r); sweeping "
+                "the tree by name instead", snapshot, e,
+            )
 
     # The parent may already be gone -- stock's `finally` can win the race once
     # our mounts are released -- which fails the recursive delete while the

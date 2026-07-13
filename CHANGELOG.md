@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.3.5 — 2026-07-13
+
+### Changed
+
+- `delete_snapshot_tree` swallowed the error from its recursive-delete fast path.
+  That failure is *usually* just "parent already gone" — stock's `finally` winning
+  the race once our mounts are released, which the by-name sweep then handles. But
+  if the cause were anything else, this was the only place it was visible, and it
+  went straight to `/dev/null`. It is now logged before falling through.
+
+- Annotated the two remaining static-analysis findings as considered-and-accepted
+  rather than leaving them to be re-litigated: `subprocess` is always called in
+  list form (no shell, so ZFS dataset names cannot inject), and the partial
+  `systemctl` path is moot in a script that only runs as root.
+
 ## v0.3.4 — 2026-07-13
 
 ### Changed

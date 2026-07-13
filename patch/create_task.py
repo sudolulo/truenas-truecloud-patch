@@ -52,7 +52,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.3.4"
+__version__ = "0.3.5"
 
 _PATCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _STATUS_FILE = os.path.join(_PATCH_DIR, "hook_status.json")
@@ -95,8 +95,11 @@ def midclt_call(method, *args):
 def _middlewared_start_epoch():
     """Epoch timestamp of the running middlewared main process, or None."""
     try:
+        # Partial path (S607) is fine here: this runs as root on TrueNAS, so an
+        # attacker who can poison PATH already has root. Hard-coding a path would
+        # be less portable (/bin vs /usr/bin) for no security gain.
         pid = int(subprocess.run(
-            ["systemctl", "show", "--property=MainPID", "--value", "middlewared"],
+            ["systemctl", "show", "--property=MainPID", "--value", "middlewared"],  # noqa: S607
             capture_output=True, text=True, timeout=10, check=True,
         ).stdout.strip())
         if pid <= 0:
