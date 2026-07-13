@@ -10,7 +10,8 @@ import re
 
 import pytest
 
-WORKFLOWS = os.path.join(os.path.dirname(__file__), "..", ".github", "workflows")
+ROOT = os.path.join(os.path.dirname(__file__), "..")
+WORKFLOWS = os.path.join(ROOT, ".github", "workflows")
 
 
 def workflow_files():
@@ -84,11 +85,53 @@ class TestBothForges:
         assert "if: ${{ contains(github.server_url, 'github.com') }}" in src
         assert "if: ${{ !contains(github.server_url, 'github.com') }}" in src
 
-    def test_compat_files_an_issue_on_each_forge(self):
+    def test_compat_files_its_report_through_ONE_implementation(self):
+        # It used to be two near-identical shell steps, one per forge. Two copies of
+        # "find the issue, decide whether to comment, post it" is two chances to drift,
+        # and the Gitea one duplicated an issue for real.
         with open(os.path.join(WORKFLOWS, "compat.yml"), encoding="utf-8") as fh:
             src = fh.read()
-        assert "file a bug report (GitHub)" in src
-        assert "file a bug report (Gitea)" in src
+        assert "tools/compat_publish.py" in src
+        assert "file a bug report (GitHub)" not in src
+        assert "file a bug report (Gitea)" not in src
+
+
+class TestTheBotDoesNotSpam:
+    """It left 11 identical 3,000-character comments on one issue in a single day.
+
+    A bot that repeats itself daily gets muted — and then the next REAL finding is
+    scrolled past, which defeats the entire reason for building it.
+    """
+
+    def publisher(self):
+        with open(os.path.join(ROOT, "tools", "compat_publish.py"), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_it_compares_a_fingerprint_before_saying_anything(self):
+        src = self.publisher()
+        assert "extract_fingerprint" in src
+        assert "staying quiet" in src
+
+    def test_the_body_is_edited_in_place_not_appended_to(self):
+        src = self.publisher()
+        assert '"PATCH"' in src, "the issue body must be updated, not commented onto"
+
+    def test_it_closes_the_issue_when_everything_is_fixed(self):
+        src = self.publisher()
+        assert '"state": "closed"' in src
+
+    def test_the_matrix_refresh_opens_a_PR_rather_than_pushing_to_main(self):
+        # An unattended push to main from CI is exactly what the release barrier exists
+        # to prevent: a bot that can move main can move it somewhere nobody looked.
+        #
+        # Checked against CODE, not comments — the step's own commentary explains what
+        # it replaced, and that mention must not read as the thing itself.
+        with open(os.path.join(WORKFLOWS, "compat.yml"), encoding="utf-8") as fh:
+            code = "\n".join(
+                ln for ln in fh.read().splitlines() if not ln.lstrip().startswith("#")
+            )
+        assert "gh pr create" in code
+        assert "HEAD:main" not in code, "CI still pushes straight to main"
 
 
 class TestCompatCannotSilentlyPass:

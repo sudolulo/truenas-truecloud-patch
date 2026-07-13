@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import os
 import sys
@@ -890,6 +891,90 @@ def render_markdown(rows: list[dict]) -> str:
         out.append(f"| {label} | {cells[0]} | {cells[1]} | {hw or '—'} |")
 
     return "\n".join(out) + "\n" + _LEGEND
+
+
+FINGERPRINT = "<!-- compat-fingerprint:"
+
+
+def fingerprint(rows: list[dict]) -> str:
+    """A stable digest of WHAT IS BROKEN, and nothing else.
+
+    The bug report must be updated when the findings change and stay silent when they
+    do not. Without this the workflow commented on every run -- it left **11 identical
+    3,000-character comments** on one issue in a single day, which is not a warning
+    system, it is a mute button with extra steps.
+
+    Deliberately excludes anything that moves on its own: the matrix's `ok` rows, the
+    hardware-verified column, and the exact TrueNAS point-release (`TS-25.10.4` ->
+    `TS-25.10.5` is not news). Only the broken (ref, module, problem-id) triples count.
+    """
+    findings = sorted(
+        (r["ref"], mod, p["id"])
+        for r in rows
+        for mod, m in r["modules"].items()
+        if is_broken(m)
+        for p in m["problems"]
+    )
+    return hashlib.sha256(repr(findings).encode()).hexdigest()[:16]
+
+
+def extract_fingerprint(body: str) -> str | None:
+    """The fingerprint a previous run left in the issue body, if any."""
+    if not body:
+        return None
+    i = body.find(FINGERPRINT)
+    if i == -1:
+        return None
+    return body[i + len(FINGERPRINT):].split("-->", 1)[0].strip() or None
+
+
+def render_issue(rows: list[dict]) -> str:
+    """The bug report body: what is broken, why it matters, and nothing else up front.
+
+    Short by design. The full matrix and the healthy versions go in a fold -- somebody
+    opening this wants to know what broke and whether it can hurt them, not to re-read
+    a table they can see in the README.
+    """
+    broken = [r for r in rows if any(is_broken(m) for m in r["modules"].values())]
+
+    out = [
+        "`tools/compat.py` checks what this patch assumes about middlewared against "
+        "iXsystems' actual source, every day. Those assumptions no longer hold on the "
+        "versions below.",
+        "",
+        "**This does not break anyone today.** `apply.sh` re-checks on every boot and "
+        "**declines to apply** a module whose assumptions fail, so TrueNAS is left "
+        "stock rather than half-patched. The cost is the module's feature, not a "
+        "broken backup.",
+        "",
+    ]
+
+    for r in broken:
+        out.append(f"### `{r['ref']}`")
+        out.append("")
+        for mod, m in sorted(r["modules"].items()):
+            if not is_broken(m):
+                continue
+            out.append(f"**{mod}**")
+            out.append("")
+            for p in m["problems"]:
+                out.append(f"- {p['detail']}")
+                out.append(f"  <br><sub>{p['why']}</sub>")
+            out.append("")
+
+    out += [
+        "<details><summary>Full support matrix</summary>",
+        "",
+        render_markdown(rows),
+        "</details>",
+        "",
+        "_Filed and kept up to date by "
+        "[`compat.yml`](.github/workflows/compat.yml). It edits this body when the "
+        "findings change, and stays quiet when they do not._",
+        "",
+        f"{FINGERPRINT} {fingerprint(rows)} -->",
+    ]
+    return "\n".join(out)
 
 
 def render_matrix(rows: list[dict]) -> str:
