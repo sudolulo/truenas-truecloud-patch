@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 _PREV_FILE="$PATCH_DIR/.update_previous"
@@ -46,9 +46,59 @@ Updating preserves your nested-snapshot opt-in setting either way.
 USAGE
 }
 
+# An UNTRACKED file that the target tracks makes `git checkout` abort. The dirty-
+# tree check deliberately ignores untracked files, so this slips past it and the
+# checkout then dies mid-operation. Not hypothetical: a hand-copied
+# patch/wait_restart.sh blocked a pull on a real box exactly this way.
+#
+# Used by BOTH the update and the rollback path -- rolling back moves the tree too,
+# and would hit the identical failure.
+_abort_if_untracked_blockers() {
+    local ref="$1" blocking
+
+    # Set intersection of {untracked, not ignored} and {tracked by the target}. Two
+    # git calls, not one `ls-files --error-unmatch` per file in the target tree.
+    # --exclude-standard is deliberate: git silently overwrites *ignored* files on
+    # checkout, so those are not blockers — only untracked-and-not-ignored ones are.
+    blocking="$(comm -12 \
+        <(git ls-files --others --exclude-standard | sort) \
+        <(git ls-tree -r --name-only "$ref" | sort) \
+        | sed 's/^/    /')"
+
+    [ -n "$blocking" ] || return 0
+
+    echo "ERROR: these untracked files would be overwritten:" >&2
+    printf '%s\n\n' "$blocking" >&2
+    echo "  They exist here but git does not track them — most likely hand-copied" >&2
+    echo "  or scp'd in. Move or delete them, then re-run." >&2
+
+    # "Delete update.sh, then re-run update.sh" is impossible. If the script itself
+    # is a blocker, it was hand-copied in to bootstrap; the honest answer is to
+    # bootstrap with git instead, which installs it properly.
+    case "$blocking" in
+        *update.sh*)
+            echo "" >&2
+            echo "  update.sh itself is untracked here — you copied it in to bootstrap." >&2
+            echo "  Do that with git instead, once; it installs update.sh properly:" >&2
+            echo "" >&2
+            echo "    rm -f $PATCH_DIR/update.sh" >&2
+            echo "    git -C $PATCH_DIR checkout $ref" >&2
+            echo "    bash $PATCH_DIR/install.sh" >&2
+            echo "" >&2
+            echo "  Every later update is then just: bash update.sh" >&2
+            ;;
+    esac
+    exit 1
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
-        --to)       _target="${2:-}"; shift ;;
+        --to)
+            if [ -z "${2:-}" ]; then
+                echo "ERROR: --to needs a tag, branch, or commit." >&2
+                exit 1
+            fi
+            _target="$2"; shift ;;
         --main)     _use_main=1 ;;
         --check)    _check_only=1 ;;
         --rollback) _rollback=1 ;;
@@ -103,8 +153,15 @@ if [ "$_rollback" -eq 1 ]; then
         exit 1
     fi
     _prev="$(cat "$_PREV_FILE")"
+    if ! git rev-parse --verify --quiet "${_prev}^{commit}" >/dev/null; then
+        echo "ERROR: recorded revision '$_prev' is not a valid commit." >&2
+        echo "  The history may have been rewritten. Pick a target explicitly:" >&2
+        echo "    bash update.sh --to <tag>" >&2
+        exit 1
+    fi
+    _abort_if_untracked_blockers "$_prev"
     echo "Rolling back to $_prev ..."
-    git checkout -q "$_prev"
+    git checkout -q --detach "$_prev"
     echo "Reverted. Re-applying ..."
     echo ""
     bash "$PATCH_DIR/install.sh"
@@ -128,7 +185,13 @@ else
     # correct while tags are created in ascending version order; it breaks the
     # moment a hotfix is tagged out of band (a v0.3.6 released after v0.4.0 would
     # sort as "newest" by date and silently downgrade the box).
-    _target="$(git tag -l 'v*' --sort=-version:refname | head -1)"
+    #
+    # Filter to PLAIN vX.Y.Z: git's version sort ranks `v0.5.0-rc1` ABOVE `v0.5.0`
+    # (verified), so without this a release candidate would be installed as though
+    # it were the newest release. The release workflow deliberately supports
+    # rc/beta/alpha tags, so they will exist.
+    _target="$(git tag -l 'v*' --sort=-version:refname \
+                 | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
     if [ -z "$_target" ]; then
         echo "ERROR: no release tags found; use --main to track unreleased code." >&2
         exit 1
@@ -148,6 +211,8 @@ if [ "$_current" = "$_target_sha" ]; then
     echo "Already up to date. Nothing to do."
     exit 0
 fi
+
+_abort_if_untracked_blockers "$_target_sha"
 
 # ── Show what is coming ───────────────────────────────────────────────────────
 
@@ -217,6 +282,12 @@ echo ""
 echo "=== Update complete ==="
 echo "  $_current_desc  ->  $(git describe --tags --always)"
 echo ""
+if ! git symbolic-ref -q HEAD >/dev/null; then
+    echo "NOTE: the checkout is now pinned to a release tag (detached HEAD), which is"
+    echo "      what you want for a deployment. Plain \`git pull\` will not work here —"
+    echo "      use \`bash update.sh\` from now on."
+    echo ""
+fi
 echo "If anything looks wrong:"
 echo "  bash $PATCH_DIR/update.sh --rollback    # back to $_current_desc"
 echo "  bash $PATCH_DIR/recover.sh              # kill switch + restart"

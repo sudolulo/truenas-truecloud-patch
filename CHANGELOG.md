@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.4.1 — 2026-07-13
+
+### Fixed
+
+- **`update.sh` would have picked a release candidate as "the newest release".**
+  Git's version sort ranks `v0.5.0-rc1` *above* `v0.5.0` (verified), and the
+  release workflow deliberately supports rc/beta tags — so an RC would have been
+  installed as though it were the latest stable. Tag selection is now filtered to
+  plain `vX.Y.Z`.
+
+- **`update.sh` would have died mid-update on an untracked file.** The dirty-tree
+  guard uses `--untracked-files=no`, so an untracked file that the *target* tracks
+  slipped past it — and `git checkout` then aborts. Under `set -e` the script died
+  with a raw git error, *after* recording the rollback point. This is exactly what
+  blocked a pull on a real box (a hand-copied `patch/wait_restart.sh`). It now
+  detects the collision up front and names the files. Gitignored files are
+  correctly *not* treated as blockers — git overwrites those silently.
+
+  Special case: if `update.sh` *itself* is the blocker, you hand-copied it in to
+  bootstrap — and "delete `update.sh`, then re-run `update.sh`" is impossible. It
+  now says so and prints the git commands that bootstrap it properly.
+
+- **`--rollback` skipped that check entirely**, so it would have hit the identical
+  failure. The check is now a shared function used by both paths, and rollback also
+  validates that the recorded revision still exists (history can be rewritten).
+
+- `install.sh`'s `chmod` aborted under `set -e` if any listed file was missing. The
+  file set changes between versions, so `update.sh --rollback` to an older revision
+  must not be killed by a filename this version happens to know about.
+
+- `--to` with no value was silently ignored and fell back to the default target.
+
 ## v0.4.0 — 2026-07-13
 
 ### Added

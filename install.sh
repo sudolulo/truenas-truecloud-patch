@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 
 # The directory containing install.sh is the permanent install location.
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -95,8 +95,14 @@ fi
 # ── Set permissions ───────────────────────────────────────────────────────────
 
 echo "Setting permissions ..."
-chmod +x "$PATCH_DIR/patch/apply.sh" "$PATCH_DIR/patch/create_task.py" \
-          "$PATCH_DIR/recover.sh" "$PATCH_DIR/uninstall.sh" "$PATCH_DIR/update.sh"
+# Guard each path: under `set -e` a chmod on a missing file aborts the install.
+# The file set changes between versions, so `update.sh --rollback` to an older
+# revision must not be killed by a name this version happens to know about.
+for _exe in patch/apply.sh patch/create_task.py recover.sh uninstall.sh update.sh; do
+    if [ -f "$PATCH_DIR/$_exe" ]; then
+        chmod +x "$PATCH_DIR/$_exe"
+    fi
+done
 echo "Done."
 echo ""
 
