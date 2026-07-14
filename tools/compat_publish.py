@@ -69,11 +69,18 @@ def find_issue(api, token, title):
     existed once (an earlier version put the ref list in the title, so the identity
     changed whenever that set changed), and an order-dependent pick would alternate
     between them -- reopening one while commenting on the other.
+
+    Both forges list PRs alongside issues, but they SAY SO DIFFERENTLY: GitHub omits
+    the `pull_request` key on a plain issue, Gitea sends it as `null`. Testing for the
+    KEY therefore discards every Gitea issue as if it were a PR -- so this returned
+    None on every Gitea run, and the bot filed a brand-new duplicate report each time
+    instead of editing the one it already had. Test the VALUE; it is the only form
+    that is true on both.
     """
-    issues = _call(f"{api}/issues?state=all&per_page=100", token)
+    issues = _call(f"{api}/issues?state=all&per_page=100&limit=100", token)
     mine = [
         i for i in issues
-        if i.get("title") == title and "pull_request" not in i   # GitHub lists PRs here
+        if i.get("title") == title and not i.get("pull_request")
     ]
     return min(mine, key=lambda i: i["number"]) if mine else None
 

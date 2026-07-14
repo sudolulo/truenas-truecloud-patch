@@ -23,6 +23,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 
 import compat  # noqa: E402
+import compat_publish  # noqa: E402
 from compat import (  # noqa: E402
     NESTED,
     PROVIDERS,
@@ -574,3 +575,57 @@ class TestATransientNetworkBlipDoesNotWakeAnybody:
             "def get_restic_config(entry, credentials):\n    pass\n"
         )
         assert compat.fingerprint(self._rows(worse)) != compat.fingerprint(self._rows(broken))
+
+
+class TestTheBotFindsItsOwnIssueOnBOTHForges:
+    """`find_issue` decides "have I already filed this?" -- and it ran on two forges.
+
+    It used to skip pull requests with `"pull_request" not in i`. GitHub omits that key
+    on a plain issue; **Gitea sends it as `null`**. So on Gitea every issue looked like
+    a PR, the match list was always empty, and the bot took the "nothing filed yet"
+    branch on EVERY run: nine duplicate copies of the same report on the canonical
+    forge, four of them filed after the commit that was supposed to stop exactly this.
+
+    It is the same failure the spam fix was written to prevent, moved from comments to
+    issues -- and it survived because `find_issue` was the one function here with no
+    test. So the payload shapes are pinned, per forge, by hand.
+    """
+
+    TITLE = compat_publish.TITLE
+
+    def _find(self, monkeypatch, payload):
+        monkeypatch.setattr(compat_publish, "_call", lambda *a, **k: payload)
+        return compat_publish.find_issue("https://forge/api", "tok", self.TITLE)
+
+    def test_gitea_sends_pull_request_as_null_and_the_issue_is_still_found(self, monkeypatch):
+        found = self._find(monkeypatch, [
+            {"number": 7, "title": self.TITLE, "state": "open", "pull_request": None},
+            {"number": 1, "title": self.TITLE, "state": "open", "pull_request": None},
+        ])
+        assert found is not None, (
+            "find_issue missed a Gitea issue, so the bot files a NEW duplicate report "
+            "every run -- which is how nine of them piled up"
+        )
+        assert found["number"] == 1, "lowest-numbered wins"
+
+    def test_github_omits_the_key_entirely_and_the_issue_is_still_found(self, monkeypatch):
+        found = self._find(monkeypatch, [
+            {"number": 2, "title": self.TITLE, "state": "open"},
+        ])
+        assert found is not None and found["number"] == 2
+
+    def test_a_real_PR_with_the_same_title_is_still_skipped_on_both(self, monkeypatch):
+        # The reason the filter exists at all: both forges list PRs on /issues, and
+        # commenting on a PR instead of the bug report would be worse than useless.
+        assert self._find(monkeypatch, [
+            {"number": 3, "title": self.TITLE, "state": "open",           # Gitea PR
+             "pull_request": {"merged": False}},
+            {"number": 4, "title": self.TITLE, "state": "open",           # GitHub PR
+             "pull_request": {"url": "https://api.github.com/..."}},
+        ]) is None
+
+    def test_an_unrelated_issue_is_not_mistaken_for_the_report(self, monkeypatch):
+        assert self._find(monkeypatch, [
+            {"number": 1, "title": "TypeError when create B2 backup on Electric Eel",
+             "state": "closed", "pull_request": None},
+        ]) is None
