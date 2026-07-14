@@ -15,6 +15,7 @@ dangerous thing this file can say -- it means "TrueNAS does this now, retire the
 module" -- and it rests on nothing more than a substring match.
 """
 
+import json
 import os
 import sys
 
@@ -725,3 +726,83 @@ class TestMasterIsNotTheNextRelease:
         # ...and the ordinary rows are untouched.
         assert "| 25.10.4 |" in md
         assert "| 26.0.0-BETA.3 _(unreleased)_ |" in md
+
+
+class TestTheBodyIsTruthAndCommentsAreTheChangelog:
+    """An unchanged fingerprint used to freeze the BODY, not just silence the comments.
+
+    Two different questions were sharing one answer. "Have the findings changed?" gates
+    COMMENTS -- they notify, and a daily "still broken, same as yesterday" is what
+    teaches people to ignore the one that finally matters. But "is the body still
+    true?" gates the BODY, and editing a body notifies nobody, so keeping it honest
+    costs nothing.
+
+    Conflated, an unchanged fingerprint meant the report could never be corrected --
+    and the fingerprint deliberately ignores everything that moves on its own, which
+    includes how a row is LABELLED. Relabelling master `27-dev` would have reached the
+    README and never the issue anybody opens.
+    """
+
+    ROWS = [{"ref": "master", "unreleased": True,
+             "modules": check_files(with_(**{
+                 "plugins/cloud_backup/restic.py":
+                     "class ResticConfig:\n    cmd: list\n\n"
+                     "def get_restic_config(entry, credentials):\n    pass\n",
+             }))}]
+
+    def _run(self, monkeypatch, tmp_path, existing_body):
+        calls = []
+
+        def fake(url, token, method="GET", data=None):
+            calls.append((method, url, data))
+            if url.endswith("/issues?state=all&per_page=100&limit=100"):
+                return [{"number": 1, "title": compat_publish.TITLE,
+                         "state": "open", "body": existing_body,
+                         "pull_request": None}]
+            return {"number": 1}
+
+        monkeypatch.setattr(compat_publish, "_call", fake)
+        matrix = tmp_path / "m.json"
+        matrix.write_text(json.dumps(self.ROWS))
+        compat_publish.main([
+            "prog", "--api", "https://forge/api", "--token", "t",
+            "--matrix", str(matrix)])
+        return calls
+
+    def _writes(self, calls):
+        patched = [c for c in calls if c[0] == "PATCH"]
+        commented = [c for c in calls if c[0] == "POST" and c[1].endswith("/comments")]
+        return patched, commented
+
+    def test_identical_body_and_findings_touches_nothing(self, monkeypatch, tmp_path):
+        body = compat.render_issue(self.ROWS)
+        patched, commented = self._writes(self._run(monkeypatch, tmp_path, body))
+        assert not patched and not commented, "a quiet run must be completely silent"
+
+    def test_a_relabel_refreshes_the_body_but_says_NOTHING(self, monkeypatch, tmp_path):
+        # Same findings (same fingerprint), different rendering -- the exact shape of
+        # the master -> 27-dev relabel.
+        stale = compat.render_issue(self.ROWS).replace("27-dev", "unreleased")
+        assert compat.extract_fingerprint(stale) == compat.fingerprint(self.ROWS)
+
+        patched, commented = self._writes(self._run(monkeypatch, tmp_path, stale))
+        assert patched, "the body was left stale, so the issue keeps telling lies"
+        assert "27-dev" in patched[0][2]["body"]
+        assert not commented, (
+            "a rendering change is not news -- commenting on it is how the bot gets "
+            "muted before the next real finding"
+        )
+
+    def test_a_REAL_findings_change_still_comments(self, monkeypatch, tmp_path):
+        # ...and the fix must not have made it mute.
+        stale = compat.render_issue(self.ROWS).replace(
+            compat.fingerprint(self.ROWS), "0" * 16)
+        patched, commented = self._writes(self._run(monkeypatch, tmp_path, stale))
+        assert patched and commented, "a genuine change must still notify"
+
+    def test_a_body_differing_only_by_CRLF_is_not_rewritten(self, monkeypatch, tmp_path):
+        # Forges round-trip line endings. Without normalising, every run would rewrite
+        # the body -- silent, but it churns updated_at and looks freshly touched daily.
+        body = compat.render_issue(self.ROWS).replace("\n", "\r\n")
+        patched, _ = self._writes(self._run(monkeypatch, tmp_path, body))
+        assert not patched
