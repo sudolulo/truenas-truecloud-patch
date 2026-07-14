@@ -109,7 +109,24 @@ worse than no alert, because one day it carries a security fix.
 
 - `_write_sidecar` **swallowed `OSError`**. The sidecar is the only thing that survives
   a middlewared restart; failing to write it is not fatal, but it must never be
-  invisible.
+  invisible. `_read_sidecar` had the mirror bug — it conflated "there is no sidecar"
+  with "I could not read the sidecar", and `cleanup_task` then took the empty branch
+  and **unlinked the only record** of a tree it had failed to read.
+
+- **A dataset from another tree, mounted inside the backup path, was omitted
+  silently.** The staging plan scopes by dataset *name*, which is correct — a dataset
+  with no mountpoint cannot be scoped by path at all. But ZFS lets any dataset mount
+  anywhere, so one from an unrelated tree can sit inside the path:
+
+      Tank/photos   mountpoint=/mnt/Tap/apps/photos
+
+  It holds data inside the backed-up path, and `zfs snapshot -r Tap@…` does **not**
+  cover it: recursion follows the dataset tree, not the directory tree. So there is no
+  snapshot of it to stage, and no way to capture it consistently with the rest. It fell
+  out of the name filter and vanished — not staged, not in `skipped`, no error, backup
+  green. Stock has the same blind spot, but stock also refuses the nested config
+  outright; this patch is what relaxes that guard, so the hole is this patch's to close.
+  It now refuses, and names the offending datasets.
 
 ## v0.6.1 — 2026-07-13
 ### Fixed
