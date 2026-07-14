@@ -24,6 +24,11 @@ on:
     paths:
       # The manifest itself changed -- re-check immediately rather than waiting a day.
       - "tools/compat.py"
+      # ...and so did the thing that PUBLISHES the finding. This was missing, and it
+      # showed: the commit teaching the bot to refresh a stale report body touched only
+      # compat_publish.py, so no run fired, and the report stayed stale until the next
+      # scheduled one. A fix nobody runs is a fix nobody has.
+      - "tools/compat_publish.py"
       - ".github/workflows/compat.yml"
 
 permissions:

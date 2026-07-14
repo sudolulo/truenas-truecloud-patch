@@ -61,6 +61,11 @@ worse than no alert, because one day it carries a security fix.
   normalising line endings, so a forge round-tripping `\r\n` does not cause a rewrite
   every run) and comments remain strictly a changelog of real changes.
 
+- **A change to the publisher did not re-run the check.** `compat.yml`'s `push:` paths
+  listed `tools/compat.py` but not `tools/compat_publish.py` — so the very commit that
+  taught the bot to refresh a stale report body triggered no run, and the report stayed
+  stale until the next scheduled one. A fix nobody runs is a fix nobody has.
+
 - **The compatibility bot filed a new duplicate bug report on every Gitea run.**
   `find_issue()` skipped pull requests by testing for the *presence* of the
   `pull_request` key. GitHub omits that key on a plain issue; Gitea sends it as
