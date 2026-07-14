@@ -6,6 +6,28 @@ is deliberate: see [Releasing](docs/releasing.md). Twelve releases were cut on
 live, every one of those interrupts every user. An alert people learn to ignore is
 worse than no alert, because one day it carries a security fix.
 
+## Unreleased
+### Fixed
+
+- **The compatibility bot filed a new duplicate bug report on every Gitea run.**
+  `find_issue()` skipped pull requests by testing for the *presence* of the
+  `pull_request` key. GitHub omits that key on a plain issue; Gitea sends it as
+  `null`. So on Gitea every issue was discarded as a PR, the lookup always came back
+  empty, and the bot took the "nothing filed yet" branch and opened a fresh report
+  each run — **nine copies on the canonical forge**, four of them filed *after* the
+  commit that was meant to stop precisely this. The mirror was fine, which is why it
+  went unnoticed: GitHub's payload shape is the one the filter was written against.
+
+  It is the same failure the anti-spam fix was written to prevent, moved from
+  comments to issues, and it survived because `find_issue` was the only function in
+  `compat_publish.py` with no test. It now has one, per forge, and the daily cron —
+  which had not yet run once — no longer accumulates a report a day.
+
+  The issue list is also requested with **both** paging parameters (`per_page` for
+  GitHub, `limit` for Gitea). Each forge ignores the other's, and Gitea's default page
+  is 30, so the lookup would have started missing the report again once the pile it
+  was creating grew past one page.
+
 ## v0.7.0 — 2026-07-14
 ### Added
 
