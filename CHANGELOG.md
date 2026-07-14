@@ -94,6 +94,23 @@ worse than no alert, because one day it carries a security fix.
 - The staging-failure handler could **lose the original exception** if its own cleanup
   sweep raised. An error handler must not be able to lose the error.
 
+- **A snapshot delete that returns cleanly is not proof that anything was deleted.**
+  The recursive sweep's fast path took the call's word for it and returned "no
+  survivors" — so `cleanup_task` read that as a clean sweep and removed the sidecar,
+  the only record the tree ever existed. Roughly 250 snapshots would have been orphaned
+  on every run, with nothing left able to find them, and the backup reporting success.
+
+  This is not a hypothetical about a well-behaved API: iX has already gutted
+  `pool.snapshot.do_update` on master into a no-op whose body is commented out and
+  which returns `None`. A source check still sees the `def`; a runtime check still sees
+  a callable method. Only asking ZFS can tell. The sweep now confirms against ZFS, and
+  where it *cannot* confirm it keeps owning the tree rather than claiming success — a
+  false survivor self-heals on the next run, a lost record never does.
+
+- `_write_sidecar` **swallowed `OSError`**. The sidecar is the only thing that survives
+  a middlewared restart; failing to write it is not fatal, but it must never be
+  invisible.
+
 ## v0.6.1 — 2026-07-13
 ### Fixed
 
