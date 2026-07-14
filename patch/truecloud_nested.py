@@ -452,16 +452,30 @@ def _write_sidecar(staging_root: str, snapshots, logger=None) -> None:
             )
 
 
-def _read_sidecar(staging_root: str):
+def _read_sidecar(staging_root: str, logger=None):
     """Every snapshot tree a previous run recorded here. [] if none.
 
     Tolerates the old single-line format, which is just a one-element list.
+
+    "There is no sidecar" and "I could not READ the sidecar" are different facts, and
+    conflating them is dangerous: `cleanup_task` reads an empty list as "nothing was
+    ever staged" and then REMOVES the sidecar -- destroying the only record of a tree
+    it could not read. FileNotFoundError is the ordinary case and stays quiet; any
+    other OSError is reported, and re-raised so no caller mistakes it for "empty".
     """
     try:
         with open(sidecar_for(staging_root), encoding="utf-8") as fh:
             return [ln.strip() for ln in fh if ln.strip()]
-    except OSError:
-        return []
+    except FileNotFoundError:
+        return []                                   # genuinely nothing recorded
+    except OSError as e:
+        if logger:
+            logger.error(
+                "truecloud-patch: could not READ the snapshot record %s (%r). Not "
+                "touching it -- it may name snapshots nothing else can find.",
+                sidecar_for(staging_root), e,
+            )
+        raise
 
 
 def _remove_sidecar(staging_root: str) -> None:
@@ -655,6 +669,43 @@ def plan_staging(base_dataset, base_mountpoint, path, snapshot_name, datasets,
             )
 
         mounts.append((src, os.path.join(staging_root, os.path.relpath(mp, path))))
+
+    # ── datasets INSIDE the path but OUTSIDE the snapshot's tree ─────────────
+    #
+    # The loop above scopes by dataset NAME, which is right: a dataset with no
+    # mountpoint cannot be scoped by path at all. But ZFS lets any dataset mount
+    # anywhere, so a dataset from a DIFFERENT tree -- even a different pool -- can
+    # sit inside the backup path:
+    #
+    #     Tank/photos   mountpoint=/mnt/Tap/apps/photos
+    #
+    # It holds data inside the path, so its absence is a hole in the backup. And
+    # `zfs snapshot -r Tap@...` does NOT cover it, because recursion follows the
+    # DATASET tree, not the directory tree -- so there is no snapshot of it to
+    # stage, and no way to capture it consistently with the rest.
+    #
+    # Before this check it was neither staged, nor reported in `skipped`, nor raised:
+    # it simply fell out of the name filter and vanished. The backup reported
+    # SUCCESS with that data missing, which is the precise failure this module
+    # exists to prevent. Stock has the same blind spot, but stock also REFUSES the
+    # nested config outright -- we are the ones relaxing that guard, so the hole is
+    # ours to close.
+    foreign = sorted(
+        ds.get("name", "")
+        for ds in datasets
+        if (mp := ds.get("properties", {}).get("mountpoint", {}).get("value", ""))
+        and mp.startswith(path_prefix)
+        and not ds.get("name", "").startswith(ds_prefix)
+        and ds.get("name", "") != base_dataset
+    )
+    if foreign:
+        raise StagingError(
+            "dataset(s) outside " + repr(base_dataset) + " are mounted inside the "
+            "backup path and cannot be captured by its recursive snapshot: "
+            + ", ".join(repr(f) for f in foreign)
+            + ". Refusing to back up an incomplete tree -- move them, or back up "
+            "their own dataset separately."
+        )
 
     # Parents before children, so each mountpoint exists before we mount onto it.
     mounts.sort(key=lambda m: _depth(m[1]))

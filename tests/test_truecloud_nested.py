@@ -14,12 +14,18 @@ Two rules are under test above all else:
 
 import os
 import sys
+import time
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "patch"))
 
 import truecloud_nested as tn  # noqa: E402
+
+#: Captured at import, BEFORE the autouse fixture patches time.sleep --
+#: otherwise the seam check below compares a frozen default against the
+#: fixture's own stub and silently matches nothing.
+_REAL_SLEEP = time.sleep
 from truecloud_nested import (  # noqa: E402
     StagingError,
     apply_plan,
@@ -1698,3 +1704,168 @@ class TestTheServiceIsResolvedLazily:
 
         with pytest.raises(StagingError):
             snaps.delete("Tap@snap")              # ...only the MUTATION refuses
+
+
+class TestADatasetFromAnotherTreeMountedInsideThePath:
+    """ZFS lets any dataset mount anywhere. A backup path is a DIRECTORY, not a tree.
+
+        Tank/photos   mountpoint=/mnt/Tap/apps/photos
+
+    That dataset holds data inside the backed-up path, so its absence is a hole. And
+    `zfs snapshot -r Tap@...` does NOT cover it -- recursion follows the DATASET tree,
+    not the directory tree -- so there is no snapshot of it to stage.
+
+    It used to be scoped out by the dataset-NAME filter and then vanish: not staged,
+    not in `skipped`, no error. The backup reported SUCCESS with the data missing,
+    which is the cardinal-rule failure.
+    """
+
+    def test_it_is_refused_loudly_not_omitted_silently(self):
+        foreign = DATASETS + [ds("Tank/photos", "/mnt/Tap/apps/photos")]
+        with pytest.raises(StagingError, match="Tank/photos"):
+            plan(datasets=foreign)
+
+    def test_the_error_explains_why_it_cannot_be_captured(self):
+        foreign = DATASETS + [ds("Tank/photos", "/mnt/Tap/apps/photos")]
+        with pytest.raises(StagingError, match="recursive snapshot"):
+            plan(datasets=foreign)
+
+    def test_a_foreign_dataset_OUTSIDE_the_path_is_still_ignored(self):
+        # Only datasets inside the backed-up path matter. Everything else on the box
+        # is none of our business, and reporting it would bury the ones that are.
+        elsewhere = DATASETS + [ds("Tank/photos", "/mnt/Tank/photos")]
+        mounts, skipped = plan(datasets=elsewhere)
+        assert len(mounts) == 6
+        assert skipped == []
+
+
+class TestTheSeamsStayLateBound:
+    """A default argument is frozen into `__defaults__` at def time.
+
+    `runner=_run`, `mounts_file="/proc/self/mounts"` and `sleep=time.sleep` were all
+    written that way, so `never_touch_the_real_system` could not intercept them: 19
+    tests read the REAL mount table -- one matching name away from running a real
+    `umount` on the NAS -- and the retry loop really slept for 20 seconds.
+
+    Re-freezing any of them silently re-arms that. The fixture cannot notice, because
+    it is the thing being bypassed. So assert it directly.
+    """
+
+    def test_no_system_seam_is_frozen_into_a_default(self):
+        import inspect
+
+        offenders = []
+        for name in dir(tn):
+            fn = getattr(tn, name)
+            if not inspect.isfunction(fn):
+                continue
+            for default in fn.__defaults__ or ():
+                if default is tn._run or default is _REAL_SLEEP:
+                    offenders.append(f"{name}() freezes {getattr(default, '__name__', default)!r}")
+                if default == "/proc/self/mounts":
+                    offenders.append(f"{name}() freezes the real mount table")
+        assert not offenders, (
+            "these seams are frozen into __defaults__, so no test can intercept them "
+            "and they will reach the real system:\n  " + "\n  ".join(offenders)
+            + "\nUse the late-bound idiom: `runner=None` + `runner = runner or _run`."
+        )
+
+
+class TestOwnSnapshotCleansUpBeforeItBuilds:
+    def test_it_tears_down_a_crashed_run_before_recording_its_own(
+        self, tmp_path, monkeypatch
+    ):
+        # A previous run may have died mid-flight. Its bind mounts still pin its
+        # snapshots (so they refuse to delete with EBUSY), and stacking a new staging
+        # tree on top of a stale one is how mounts leak.
+        monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
+        order = []
+        monkeypatch.setattr(tn, "teardown", lambda *a, **kw: order.append("teardown") or [])
+        real_write = tn._write_sidecar
+        monkeypatch.setattr(
+            tn, "_write_sidecar",
+            lambda *a, **kw: order.append("write") or real_write(*a, **kw),
+        )
+        mw = FakeMiddleware(["Tap@new"])
+        tn.own_snapshot(mw, "cloud_backup-5", "Tap@new",
+                        list_snapshots=mw.list_snapshots)
+        assert order == ["teardown", "write"], (
+            "own_snapshot must tear down a crashed run's tree BEFORE recording its own"
+        )
+
+
+class TestStagingRefusesUpFrontIfItCouldNotSweep:
+    def test_a_middleware_with_no_usable_delete_refuses_before_restic_runs(
+        self, tmp_path, monkeypatch
+    ):
+        # We are about to pin a recursive snapshot with bind mounts. If we could never
+        # sweep it, the honest move is to fail NOW -- not after restic has uploaded and
+        # the snapshot is already stuck.
+        monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
+
+        class Hopeless(FakeMiddleware):
+            def get_service(self, name):
+                raise KeyError(name)
+
+        with pytest.raises(StagingError, match="no usable snapshot delete"):
+            tn.stage_nested(
+                Hopeless(), "/mnt/Tap", "Tap@snap", "Tap", "/mnt/Tap",
+                "cloud_backup-5", DATASETS, list_snapshots=lambda _d: [],
+            )
+
+
+class TestQueryFilesystemsIgnoresMiddlewareEntirely:
+    """`middleware` is accepted and IGNORED. That is the whole point of the function.
+
+    Reintroducing `if middleware: return middleware.call_sync("pool.dataset.query")` is
+    a two-line change that looks like an optimisation and reinstates the bug that
+    shipped once: middleware's query hides ix-apps/*, .system/*, .ix-virt/* -- 84 of
+    270 datasets on the real pool, including live app data -- and they would be omitted
+    from the staging plan without even reaching `skipped`.
+    """
+
+    def test_passing_a_middleware_does_not_make_it_ask_middleware(self):
+        class Loud(FakeMiddleware):
+            def call_sync(self, method, *args):
+                raise AssertionError(
+                    f"query_filesystems asked middleware ({method}). Its dataset query "
+                    f"is FILTERED; enumeration must come from ZFS."
+                )
+
+        class R:
+            returncode = 0
+            stdout = "Tap\t/mnt/Tap\tyes\nTap/ix-apps\t/mnt/Tap/ix-apps\tyes\n"
+            stderr = ""
+
+        rows = tn.query_filesystems(Loud(), runner=lambda cmd: R())
+        assert [r["name"] for r in rows] == ["Tap", "Tap/ix-apps"]
+
+
+class TestAnUnreadableZfsDuringTheByNameSweep:
+    def test_the_tree_is_still_owned_when_we_cannot_check(self):
+        # Recursive delete fails AND `zfs list` fails. We cannot know what is gone, so
+        # we must keep owning all of it: cleanup_task then KEEPS the sidecar and the
+        # next run reclaims. Reporting a clean sweep here drops the only record.
+        class NoRecursive(FakeMiddleware):
+            def call_sync(self, method, *args):
+                self.calls.append((method, args))
+                if method.endswith(".delete") and len(args) > 1:
+                    raise RuntimeError("recursive delete unavailable")
+                return None            # individual deletes "succeed" silently
+
+        calls = {"n": 0}
+
+        def flaky(dataset):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return ["Tap@snap", "Tap/apps@snap"]      # the tree, for planning
+            raise tn.ZfsError("pool I/O is currently suspended")   # ...then ZFS dies
+
+        mw = NoRecursive(["Tap@snap", "Tap/apps@snap"])
+        survivors = tn.delete_snapshot_tree(
+            mw, "Tap@snap", list_snapshots=flaky, sleep=lambda _s: None,
+        )
+        assert sorted(survivors) == ["Tap/apps@snap", "Tap@snap"], (
+            "with ZFS unreadable we cannot confirm anything was deleted. Returning [] "
+            "makes cleanup_task drop the sidecar and orphans the tree forever."
+        )
