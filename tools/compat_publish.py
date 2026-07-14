@@ -62,6 +62,19 @@ def _call(url, token, method="GET", data=None):
         return json.load(r) if r.length != 0 else {}
 
 
+def _same(a, b):
+    """Is the issue body already what we would write?
+
+    Compared after normalising line endings and trailing space: forges are free to
+    round-trip `\r\n`, and a body that only "differs" by that would be rewritten on
+    every single run -- a silent edit, but a pointless one that churns `updated_at`
+    and makes the issue look freshly touched every morning.
+    """
+    def norm(s):
+        return "\n".join(line.rstrip() for line in (s or "").replace("\r\n", "\n").split("\n")).strip()
+    return norm(a) == norm(b)
+
+
 def find_issue(api, token, title):
     """The LOWEST-numbered issue with this title, open or closed.
 
@@ -124,11 +137,24 @@ def main(argv):
     have = extract_fingerprint(issue.get("body") or "")
     n = issue["number"]
 
-    # ── the findings are UNCHANGED: say nothing ──────────────────────────────
+    # ── two different questions, and they were being answered with one answer ────
     #
-    # This is the whole point. A daily "still broken, same as yesterday" comment is
-    # what taught everyone to ignore the last one.
-    if have == want and issue["state"] == "open":
+    #   * IS THE BODY STILL TRUE?     -> if not, rewrite it. Editing an issue body
+    #     notifies NOBODY on either forge, so keeping it honest is free.
+    #   * HAVE THE FINDINGS CHANGED?  -> only then comment. Comments DO notify, and a
+    #     daily "still broken, same as yesterday" is what teaches everyone to ignore
+    #     the one that finally matters.
+    #
+    # Conflating them meant an unchanged FINGERPRINT froze the BODY. The fingerprint
+    # deliberately ignores everything that moves on its own -- healthy rows, the
+    # hardware-verified column, point releases, how a row is LABELLED -- so none of
+    # that could ever reach the report. Relabelling master `27-dev` (it is not the
+    # next release; a red row there was reading as "the version you are about to
+    # install is broken") would have shipped to the README and never to the issue
+    # anybody actually opens.
+    body_is_current = _same(issue.get("body"), body)
+
+    if have == want and issue["state"] == "open" and body_is_current:
         print(f"#{n} is already current ({want}) — staying quiet")
         return 0
 
@@ -146,8 +172,12 @@ def main(argv):
         )
         _call(f"{args.api}/issues/{n}/comments", args.token, "POST", {"body": note})
         print(f"updated #{n}: {have} -> {want}")
-    else:
+    elif issue["state"] != "open":
         print(f"reopened #{n}")
+    else:
+        # Same findings, new rendering. Silent by design: nothing has changed that
+        # anybody needs waking up for, but the report should not be telling lies.
+        print(f"#{n}: findings unchanged ({want}); body refreshed silently")
     return 0
 
 

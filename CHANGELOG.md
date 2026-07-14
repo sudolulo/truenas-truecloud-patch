@@ -48,6 +48,19 @@ worse than no alert, because one day it carries a security fix.
   count as shipped and a break in it would fail the build as a live outage — on a
   version nobody is running yet.
 
+- **An unchanged fingerprint froze the bug report's body, not just its comments.** Two
+  questions were sharing one answer. *Have the findings changed?* gates **comments** —
+  they notify, and a daily "still broken, same as yesterday" is what teaches everyone
+  to ignore the one that finally matters. *Is the body still true?* gates the **body** —
+  and editing an issue body notifies nobody on either forge, so keeping it honest is
+  free. Conflated, the report could never be corrected while the findings held steady,
+  and the fingerprint deliberately ignores everything that moves on its own — healthy
+  rows, the hardware-verified column, point releases, and how a row is labelled. The
+  `master` → `27-dev` relabel above would have reached the README and never the issue
+  anybody actually opens. The body is now rewritten whenever it is out of date (after
+  normalising line endings, so a forge round-tripping `\r\n` does not cause a rewrite
+  every run) and comments remain strictly a changelog of real changes.
+
 - **The compatibility bot filed a new duplicate bug report on every Gitea run.**
   `find_issue()` skipped pull requests by testing for the *presence* of the
   `pull_request` key. GitHub omits that key on a plain issue; Gitea sends it as
