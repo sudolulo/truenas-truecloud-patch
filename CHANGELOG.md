@@ -7,7 +7,46 @@ live, every one of those interrupts every user. An alert people learn to ignore 
 worse than no alert, because one day it carries a security fix.
 
 ## Unreleased
+### Changed
+
+- **`master` is now labelled `27-dev`, because it is not the next release.** iX
+  branches each major onto its own `release/` line and master rolls straight on to the
+  one after — on 2026-07-14 every recent commit on master targeted `27.0.0-BETA.1`
+  while 26 was still in beta. So a **BROKEN** master row, rendered as
+  "master _(unreleased)_", read as *"the version you are about to install is broken"*
+  when the breakage was a major release away on a line nobody can download. In a table
+  whose entire job is helping somebody decide whether to trust this with their backups,
+  that is a false alarm in the worst possible place. The label is derived from the
+  newest major in the matrix plus one, so it rolls over to `28-dev` by itself once 27
+  branches.
+
+  For the record, the breakage is `NAS-141498` (2026-06-24), "Convert cloud_backup
+  plugin to the typesafe pattern": it re-signatures `restic_backup` and
+  `get_restic_config`, splitting `entry`/`credentials` out of the `cloud_backup` dict.
+  It is deliberately not being chased while the 27 line is still churning.
+
 ### Fixed
+
+- **The next maintenance release was never checked, and it is the one that reaches
+  users.** Shipped versions were discovered from `TS-*` tags and unreleased ones from
+  `release/*` branches carrying `-BETA`/`-RC`. A branched-but-untagged *maintenance*
+  release is neither: `release/25.10.5` has no tag, and its line has already shipped,
+  so the "a prerelease of a shipped line is history" filter discarded it. It was
+  invisible — and it is precisely what a 25.10.4 box gets on its next update. A break
+  there would have reached real users before the daily check ever looked at it, on the
+  only line anybody is actually running.
+
+  A plain `release/X.Y.Z` branch is now checked when its line **has** shipped and it
+  sorts **newer** than that line's newest tag. Both things that must stay out fall out
+  of the same rule: `release/24.10-RC.2` sorts older than `TS-24.10.2.4` (history, not
+  a warning), and iX's typo branch `release/25.20.2.2` is on a line that has no tag at
+  all, so it is not a release line. This immediately surfaced two refs that had never
+  been checked — `release/25.10.5` and `release/24.10.2.5` — both of which pass.
+
+  `is_unreleased()` now keys off where a ref came from (branch = not yet shipped)
+  rather than looking for `-BETA`/`-RC` in its name. Otherwise `release/25.10.5` would
+  count as shipped and a break in it would fail the build as a live outage — on a
+  version nobody is running yet.
 
 - **The compatibility bot filed a new duplicate bug report on every Gitea run.**
   `find_issue()` skipped pull requests by testing for the *presence* of the

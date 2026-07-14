@@ -60,8 +60,10 @@ If something is wrong, the reason is in `apply.log` — start at
 | 24.10.2.4 | ok | ok | — |
 | 25.04.2.6 | ok | ok | — |
 | 25.10.4 | ok | ok | v0.7.0: 3 live tasks — 191-dataset nested backup of /mnt/Tap, a 215-filesystem/2-zvol backup of /mnt/Tank/backups, and a non-nested one; 0 orphans, 0 leaked mounts, byte-identical restore; the collector also reclaimed a real orphan the pool had been carrying |
+| 24.10.2.5 _(unreleased)_ | ok | ok | — |
+| 25.10.5 _(unreleased)_ | ok | ok | — |
 | 26.0.0-BETA.3 _(unreleased)_ | ok | ok | — |
-| master _(unreleased)_ | **BROKEN** | **BROKEN** | — |
+| master _(27-dev)_ | **BROKEN** | **BROKEN** | — |
 
 | verdict | meaning |
 | --- | --- |
@@ -72,6 +74,16 @@ If something is wrong, the reason is in `apply.log` — start at
 "ok" means *the patch's assumptions hold*, checked automatically against iX's
 source. It does not mean a human ran a backup on it — that is the
 **Hardware-verified** column, which is filled in by hand and only by doing it.
+
+**`master` is not the next release.** iX branches each major off to its own
+`release/` line and master rolls straight on to the one after — so master is
+`27-dev` while 26 is still in beta. A **BROKEN** master means iX has changed
+something that will reach users *a major release from now*, not in the version you
+are about to install. Read the numbered rows for that.
+
+A row like `25.10.5 _(unreleased)_` is the next maintenance release: branched by iX,
+not tagged yet, and the very next thing a 25.10.4 box gets. It is checked precisely
+because it is the one unshipped ref that reaches real users without warning.
 <!-- END COMPAT MATRIX -->
 
 The table is **regenerated daily by CI** against iXsystems' actual middleware source

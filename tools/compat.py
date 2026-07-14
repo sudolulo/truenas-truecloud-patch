@@ -871,6 +871,24 @@ def discover_refs(remote: str = REPO) -> list[str]:
       * UNRELEASED comes from the BRANCHES, because that is where a beta appears
         first: `release/26.0.0-BETA.3` had no tag yet while it was the newest beta.
         Catching breakage here, before it ships, is the whole point of this file.
+
+    THE NEXT MAINTENANCE RELEASE IS ALSO A BRANCH, and it used to fall through both
+    sieves. `release/25.10.5` is branched but not yet tagged, and 25.10 has already
+    shipped -- so it is not in `shipped` (no tag) and it was excluded from `upcoming`
+    (its line is in `shipped_lines`). It was invisible. That is the one ref a 25.10.4
+    user is actually about to be upgraded onto, so a break there reaches people
+    BEFORE the daily check ever looks at it -- the exact hole this file exists to
+    close, on the only line anybody is running.
+
+    The rule that separates it from the two things we must NOT report:
+
+      * `release/24.10-RC.2` -- a prerelease of an already-shipped line. It is
+        history, not a warning; it sorts OLDER than TS-24.10.2.4, so it is dropped.
+      * `release/25.20.2.2` -- iX's typo branch. 25.20 never shipped, so it has no
+        TS tag, so it is not a line at all and is dropped.
+
+    ...which is: a plain `release/X.Y.Z` branch counts only if its line HAS shipped
+    and it sorts NEWER than that line's newest tag. Both exclusions fall out of it.
     """
     tags = _ls_remote(remote, "--tags")
     heads = _ls_remote(remote, "--heads")
@@ -878,26 +896,45 @@ def discover_refs(remote: str = REPO) -> list[str]:
     shipped = _newest_per_line([
         t for t in tags if t.startswith("TS-") and "-BETA" not in t and "-RC" not in t
     ])
+    newest_shipped = {_version_of(t)[0][:2]: _version_of(t) for t in shipped}
+
+    release_heads = [h for h in heads if h.startswith("release/")]
 
     # A prerelease of a line that has ALREADY shipped is history, not a warning:
     # release/24.10-RC.2 still exists, and the nested module does not apply to it,
     # but 24.10 shipped long ago and TS-24.10.2.4 is fine. Reporting it would be a
     # standing red row in the matrix for a version nobody can install.
-    shipped_lines = {_version_of(t)[0][:2] for t in shipped}
     upcoming = [
         h for h in _newest_per_line([
-            h for h in heads
-            if h.startswith("release/") and ("-BETA" in h or "-RC" in h)
+            h for h in release_heads if "-BETA" in h or "-RC" in h
         ])
-        if _version_of(h)[0][:2] not in shipped_lines
+        if _version_of(h)[0][:2] not in newest_shipped
     ]
 
-    return [*shipped, *upcoming, "master"]
+    # The next maintenance release of a line that HAS shipped: branched, untagged,
+    # and the very next thing those users get. See the docstring.
+    pending = []
+    for h in _newest_per_line([
+        h for h in release_heads if "-BETA" not in h and "-RC" not in h
+    ]):
+        v = _version_of(h)
+        tagged = newest_shipped.get(v[0][:2])
+        if tagged and v > tagged:
+            pending.append(h)
+
+    return [*shipped, *pending, *upcoming, "master"]
 
 
 def is_unreleased(ref: str) -> bool:
-    """master and any BETA/RC. Breakage here is early warning, not an outage."""
-    return ref == "master" or "-BETA" in ref or "-RC" in ref
+    """Anything iX has not TAGGED. Breakage here is early warning, not an outage.
+
+    Keyed on where the ref came from, not on its name: `discover_refs` takes shipped
+    releases from `TS-*` TAGS and everything else from BRANCHES, so a `release/*` ref
+    is by construction something iX has not released yet. Testing for `-BETA`/`-RC`
+    instead would call `release/25.10.5` SHIPPED, and a break there would fail the
+    build as a live outage -- on a version nobody is running yet.
+    """
+    return ref == "master" or ref.startswith("release/")
 
 
 def matrix(refs=None, remote: str = REPO) -> list[dict]:
@@ -963,6 +1000,16 @@ _LEGEND = """
 "ok" means *the patch's assumptions hold*, checked automatically against iX's
 source. It does not mean a human ran a backup on it — that is the
 **Hardware-verified** column, which is filled in by hand and only by doing it.
+
+**`master` is not the next release.** iX branches each major off to its own
+`release/` line and master rolls straight on to the one after — so master is
+`27-dev` while 26 is still in beta. A **BROKEN** master means iX has changed
+something that will reach users *a major release from now*, not in the version you
+are about to install. Read the numbered rows for that.
+
+A row like `25.10.5 _(unreleased)_` is the next maintenance release: branched by iX,
+not tagged yet, and the very next thing a 25.10.4 box gets. It is checked precisely
+because it is the one unshipped ref that reaches real users without warning.
 """
 
 
@@ -1010,17 +1057,42 @@ def update_readme(rows: list[dict], path: str = README) -> bool:
     return True
 
 
+def dev_label(rows: list[dict]) -> str:
+    """What `master` is a development line FOR -- e.g. "27-dev".
+
+    `master` is NOT the next release, and labelling it "master _(unreleased)_" said
+    it was. On 2026-07-14 every recent commit on master targeted 27.0.0-BETA.1 while
+    26 was still in beta on its own `release/26.0.0-BETA.*` branches: master had
+    already rolled over to the major AFTER the one that has not shipped yet. So a red
+    `master` row read as "the version you are about to install is broken" when the
+    breakage was a year out, on a line nobody can even download. That is a false alarm
+    aimed squarely at the person deciding whether to trust this with their backups.
+
+    Derived, not hardcoded: the newest major we can see anywhere, plus one. iX branches
+    `release/N.0.0-BETA.1` off master and master immediately becomes N+1 -- so when 27
+    betas appear, this says 28-dev on its own.
+    """
+    majors = [
+        v[0][0] for v in (_version_of(r["ref"]) for r in rows if r["ref"] != "master")
+        if v
+    ]
+    return f"{max(majors) + 1}-dev" if majors else "unreleased"
+
+
 def render_markdown(rows: list[dict]) -> str:
     """The matrix, for the README."""
     out = [
         "| TrueNAS | B2/S3 providers | Nested snapshots | Hardware-verified |",
         "| --- | --- | --- | --- |",
     ]
+    dev = dev_label(rows)
     for row in rows:
         m = row["modules"]
         ref = row["ref"]
         label = ref.removeprefix("TS-").removeprefix("release/")
-        if row["unreleased"]:
+        if ref == "master":
+            label = f"master _({dev})_"
+        elif row["unreleased"]:
             label = f"{label} _(unreleased)_"
 
         cells = []
@@ -1138,7 +1210,13 @@ def render_matrix(rows: list[dict]) -> str:
     hardware-verified column lives in COMPATIBILITY.md and is maintained by hand,
     because nothing else can honestly fill it in.
     """
-    w = max((len(r["ref"]) for r in rows), default=10)
+    dev = dev_label(rows)
+    # Same relabel as the README: a red `master` is a warning about the major AFTER
+    # next, and "master" alone reads as "the release you are about to install".
+    names = {r["ref"]: (f"master ({dev})" if r["ref"] == "master" else r["ref"])
+             for r in rows}
+
+    w = max((len(n) for n in names.values()), default=10)
     lines = [
         f"{'TrueNAS'.ljust(w)}  {'providers':<10}  {'nested':<10}",
         f"{'-' * w}  {'-' * 10}  {'-' * 10}",
@@ -1146,7 +1224,7 @@ def render_matrix(rows: list[dict]) -> str:
     for row in rows:
         m = row["modules"]
         lines.append(
-            f"{row['ref'].ljust(w)}  "
+            f"{names[row['ref']].ljust(w)}  "
             f"{_verdict(m[PROVIDERS]):<10}  {_verdict(m[NESTED]):<10}"
         )
     return "\n".join(lines)
