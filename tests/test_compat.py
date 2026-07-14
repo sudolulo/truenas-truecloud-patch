@@ -416,3 +416,142 @@ class TestMiddlewareMethodsWeCall:
         }))
         whys = " ".join(p["why"] for p in r[NESTED]["problems"])
         assert "orphan" in whys
+
+
+class TestTheMethodCheckIsNotJustANamespaceCheck:
+    """compat must verify the METHOD, not merely that the namespace still exists.
+
+    Deleting the method check entirely used to leave all 304 tests green -- so the
+    "namespace AND method" claim was unenforced and silently revertible. It is the
+    half of the predicate that catches iX gutting a method while keeping its service,
+    which they have already done to `pool.snapshot.do_update` on master.
+    """
+
+    def test_a_namespace_that_no_longer_defines_delete_is_broken(self):
+        gutted = (
+            "class PoolSnapshotService(CRUDService):\n"
+            "    class Config:\n"
+            "        namespace = 'pool.snapshot'\n"
+            "    def query(self, filters, options):\n        pass\n"
+            # do_delete is GONE -- the service is still registered and still a
+            # CRUDService, so it still INHERITS a callable `delete`.
+        )
+        r = check_files(with_(**{
+            "plugins/pool_/snapshot.py": gutted,
+            "plugins/zfs_/snapshot.py": None,      # no fallback either
+        }))
+        assert is_broken(r[NESTED]), (
+            "a namespace with no delete must be BROKEN. Checking only that the "
+            "namespace exists would apply the patch to a box that cannot sweep its "
+            "own snapshots."
+        )
+
+    def test_the_alternative_still_saves_it_when_only_the_primary_is_gutted(self):
+        gutted = (
+            "class PoolSnapshotService(CRUDService):\n"
+            "    class Config:\n"
+            "        namespace = 'pool.snapshot'\n"
+            "    def query(self, filters, options):\n        pass\n"
+        )
+        r = check_files(with_(**{
+            "plugins/pool_/snapshot.py": gutted,
+            "plugins/zfs_/snapshot.py": ZFS_ERA_SNAPSHOT,
+        }))
+        assert r[NESTED]["ok"], r[NESTED]["problems"]
+
+
+class TestUnreadableIsNeverOkAndNeverBroken:
+    """A rate limit is not a regression, and it is not a clean bill of health either.
+
+    compat runs ~30 unauthenticated GitHub requests per matrix; 429 is a real outcome.
+    It also runs at BOOT against the installed tree, where a read can fail with EACCES.
+
+      * treating unreadable as BROKEN repaints the README, files a bug report, and
+        makes apply.sh refuse the module on a box where it works.
+      * treating it as OK injects a module whose delete may be gone.
+
+    Both mutations used to pass the whole suite.
+    """
+
+    def test_both_spellings_unreadable_is_unknown_not_broken(self):
+        r = check_files(with_(**{
+            "plugins/pool_/snapshot.py": Unreadable("HTTP 429"),
+            "plugins/zfs_/snapshot.py": Unreadable("HTTP 429"),
+        }))
+        assert not is_broken(r[NESTED]), "a 429 is not iX deleting the snapshot service"
+        assert r[NESTED]["unknown"]
+
+    def test_an_unreadable_primary_with_a_healthy_alternative_is_ok(self):
+        r = check_files(with_(**{
+            "plugins/pool_/snapshot.py": Unreadable("HTTP 429"),
+            "plugins/zfs_/snapshot.py": ZFS_ERA_SNAPSHOT,
+        }))
+        assert r[NESTED]["ok"], r[NESTED]["problems"]
+        assert not r[NESTED]["unknown"], (
+            "one spelling answered the question; the other's 429 is irrelevant"
+        )
+
+    def test_a_missing_primary_with_an_unreadable_alternative_is_unknown(self):
+        # We cannot tell whether the box is broken. Saying either would be a guess.
+        r = check_files(with_(**{
+            "plugins/pool_/snapshot.py": None,
+            "plugins/zfs_/snapshot.py": Unreadable("HTTP 429"),
+        }))
+        assert not is_broken(r[NESTED])
+        assert r[NESTED]["unknown"]
+
+
+class TestGetServiceIsChecked:
+    """The runtime resolves the snapshot namespace through `middleware.get_service`.
+
+    It is not a plugin method, so the manifest had no way to express it and never
+    checked it. If it vanishes, `_can_delete` reports BOTH namespaces unusable and
+    every nested backup fails -- on a box the preflight had declared healthy.
+    """
+
+    def test_a_middleware_without_get_service_is_broken(self):
+        r = check_files(with_(**{"utils/plugins.py": None}))
+        assert is_broken(r[NESTED])
+        details = " ".join(p["detail"] for p in r[NESTED]["problems"])
+        assert "get_service" in details
+
+
+class TestATransientNetworkBlipDoesNotWakeAnybody:
+    """The fingerprint must digest what iX BROKE, not what GitHub failed to serve.
+
+    `unknown` problems (a 429 on one of ~30 unauthenticated fetches, an EACCES at boot)
+    used to be folded into an already-broken module's problem list, so one blip flipped
+    the fingerprint, `compat_publish` rewrote the issue body, and the next clean run
+    rewrote it back. Daily churn is what teaches people to ignore the bot -- which is
+    the whole thing this fingerprint exists to prevent.
+    """
+
+    def _rows(self, files):
+        return [{"ref": "master", "modules": check_files(files)}]
+
+    def test_an_unreadable_file_does_not_change_the_fingerprint_of_a_broken_ref(self):
+        broken = with_(**{
+            "plugins/cloud/snapshot.py":
+                "async def create_snapshot(name, path, middleware):\n    return 1, 2\n",
+        })
+        clean = compat.fingerprint(self._rows(broken))
+
+        blipped = dict(broken)
+        blipped["rclone/remote/b2.py"] = Unreadable("HTTP 429")
+        assert compat.fingerprint(self._rows(blipped)) == clean, (
+            "a rate-limited fetch changed the fingerprint, so the bot rewrites the "
+            "issue body and then rewrites it back tomorrow"
+        )
+
+    def test_a_REAL_new_finding_still_changes_it(self):
+        # ...and the anti-noise measure must not have made it deaf.
+        broken = with_(**{
+            "plugins/cloud/snapshot.py":
+                "async def create_snapshot(name, path, middleware):\n    return 1, 2\n",
+        })
+        worse = dict(broken)
+        worse["plugins/cloud_backup/restic.py"] = (
+            "class ResticConfig:\n    cmd: list\n\n"
+            "def get_restic_config(entry, credentials):\n    pass\n"
+        )
+        assert compat.fingerprint(self._rows(worse)) != compat.fingerprint(self._rows(broken))

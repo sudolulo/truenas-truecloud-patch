@@ -54,6 +54,46 @@ worse than no alert, because one day it carries a security fix.
   `zfs.dataset.query`, which returns all 270 datasets. The bug existed only in the
   unreleased TrueNAS 26 port.
 
+- **The patch now owns the snapshot sweep even when it does not stage anything.**
+  Stock decides whether to take a *recursive* snapshot by its own rule, and on
+  TrueNAS 26 that rule stopped being ours.
+
+  Up to 25.10, stock's `create_snapshot` called `get_dataset_recursive()` — the same
+  function this module vendors — so "stock went recursive" and "we have something to
+  stage" were the *same question*, and stock's non-recursive delete was correct for
+  everything the patch declined to stage. TrueNAS 26 uses `filesystem.statfs`:
+  `recursive = (path == the dataset's mountpoint)`. The two rules now disagree for a
+  dataset whose only descendants are **ZVOLs** or **legacy/none-mountpoint** datasets
+  — stock snapshots it recursively, while the patch sees nothing to stage.
+
+  The patch then handed the snapshot back to stock, which destroys the parent only.
+  With no staging tree there was no sidecar, and the garbage collector only ever ran
+  from the staging path — so nothing on the box would ever have found the children.
+  Reproduced on the test VM: one orphaned snapshot per zvol, on every run, forever,
+  with the backup reporting success. Ownership of the sweep is no longer conditional
+  on staging.
+
+- **The runtime resolved a *namespace*; the checker verified a *method*.** Those are
+  different questions, and the gap is a false "ok". `get_service()` only proves a
+  namespace is registered — it says nothing about whether `delete` still exists on it.
+  So if iX guts the method while keeping the service (they have already done exactly
+  that to `pool.snapshot.do_update` on master), `tools/compat.py` would fall through
+  to `zfs.snapshot`, report the box healthy, and let the patch apply — while the
+  runtime picked `pool.snapshot` and failed *every* delete, orphaning the whole tree.
+  Both sides now ask the same question, and a test binds the two lists together.
+
+- `query_filesystems()` **dropped malformed `zfs list` rows silently** — the last
+  remaining silent-omission path, and a direct contradiction of this module's cardinal
+  rule. It raises now. A missing `zfs` binary raised `FileNotFoundError` rather than
+  `ZfsError`; also fixed.
+
+- The snapshot retry loop **discarded the delete error** and reported every survivor
+  as "(still busy?)" — naming the one cause that is benign and self-healing, and
+  hiding the ones that are permanent. It keeps and reports the real error.
+
+- The staging-failure handler could **lose the original exception** if its own cleanup
+  sweep raised. An error handler must not be able to lose the error.
+
 ## v0.6.1 — 2026-07-13
 ### Fixed
 

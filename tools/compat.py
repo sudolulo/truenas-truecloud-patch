@@ -494,7 +494,10 @@ def check_source(a: Assumption, src: str | None) -> tuple[str, str | None]:
     breaks a box that was working.
     """
     if src is None:
-        return "broken", f"{a.path} does not exist"
+        # Name the SYMBOL, not just the file. Whoever reads the bug report needs to
+        # know what the patch can no longer reach, and "utils/plugins.py does not
+        # exist" does not tell them that `get_service` is gone.
+        return "broken", f"{a.path} does not exist, so `{a.symbol}` is gone"
 
     try:
         tree = ast.parse(src)
@@ -629,6 +632,7 @@ def check(loader, modules=None) -> dict:
             out[a.module]["unknown"] = True
             out[a.module]["problems"].append({
                 "id": a.id, "detail": f"could not read {a.path}: {e}", "why": a.why,
+                "state": "unknown",
             })
             continue
 
@@ -636,12 +640,12 @@ def check(loader, modules=None) -> dict:
         if status == "broken":
             out[a.module]["ok"] = False
             out[a.module]["problems"].append({
-                "id": a.id, "detail": detail, "why": a.why,
+                "id": a.id, "detail": detail, "why": a.why, "state": "broken",
             })
         elif status == "unknown":
             out[a.module]["unknown"] = True
             out[a.module]["problems"].append({
-                "id": a.id, "detail": detail, "why": a.why,
+                "id": a.id, "detail": detail, "why": a.why, "state": "unknown",
             })
 
     # The methods the injected code CALLS, not just the symbols it wraps.
@@ -680,11 +684,13 @@ def check(loader, modules=None) -> dict:
             out[c.module]["unknown"] = True
             out[c.module]["problems"].append({
                 "id": c.id, "detail": "; ".join(details), "why": c.why,
+                "state": "unknown",
             })
         else:
             out[c.module]["ok"] = False
             out[c.module]["problems"].append({
                 "id": c.id, "detail": "; ".join(details), "why": c.why,
+                "state": "broken",
             })
 
     for module, (path, phrase, native_when_present) in NATIVE_PROBES.items():
@@ -1026,6 +1032,12 @@ def fingerprint(rows: list[dict]) -> str:
         for mod, m in r["modules"].items()
         if is_broken(m)
         for p in m["problems"]
+        # `unknown` problems are things we could not READ (a 429, an EACCES), not
+        # things iX changed. On a ref that is broken for some other reason they would
+        # otherwise join the digest, so one transient network blip rewrites the issue
+        # body and the next clean run rewrites it back. That is the daily-noise
+        # failure this fingerprint exists to prevent, wearing a different hat.
+        if p.get("state", "broken") == "broken"
     )
     return hashlib.sha256(repr(findings).encode()).hexdigest()[:16]
 
