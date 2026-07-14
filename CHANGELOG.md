@@ -6,7 +6,7 @@ is deliberate: see [Releasing](docs/releasing.md). Twelve releases were cut on
 live, every one of those interrupts every user. An alert people learn to ignore is
 worse than no alert, because one day it carries a security fix.
 
-## Unreleased
+## v0.7.0 — 2026-07-14
 ### Added
 
 - **TrueNAS 26 support, verified on a real TrueNAS 26 install.** 26 deletes

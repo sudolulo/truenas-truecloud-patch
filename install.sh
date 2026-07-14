@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="0.6.1"
+VERSION="0.7.0"
 
 # The directory containing install.sh is the permanent install location.
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"

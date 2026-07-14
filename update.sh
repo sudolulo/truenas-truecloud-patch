@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-VERSION="0.6.1"
+VERSION="0.7.0"
 
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 _PREV_FILE="$PATCH_DIR/.update_previous"
