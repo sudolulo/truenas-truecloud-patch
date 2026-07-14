@@ -629,3 +629,99 @@ class TestTheBotFindsItsOwnIssueOnBOTHForges:
             {"number": 1, "title": "TypeError when create B2 backup on Electric Eel",
              "state": "closed", "pull_request": None},
         ]) is None
+
+
+class TestTheNextMaintenanceReleaseIsChecked:
+    """`release/25.10.5` fell through every sieve, and it is the one that reaches users.
+
+    Shipped versions come from `TS-*` TAGS; unreleased ones come from `release/*`
+    BRANCHES that carry `-BETA`/`-RC`. A branched-but-untagged MAINTENANCE release is
+    neither: no tag, and its line (25.10) has already shipped, so the "prereleases of
+    a shipped line are history" filter threw it out. It was invisible.
+
+    That is backwards. `release/24.10-RC.2` is history -- nobody can install it. But
+    `release/25.10.5` is the FUTURE of a shipped line: it is what a 25.10.4 box gets
+    on its next update. A break there ships to real users before the daily check has
+    ever looked at it.
+    """
+
+    TAGS = ["TS-24.10.2.4", "TS-25.04.2.6", "TS-25.10.4"]
+    HEADS = [
+        "release/25.10.4.1",
+        "release/25.10.5",          # branched, untagged -- the next maintenance release
+        "release/24.10-RC.2",       # history: its line shipped long ago
+        "release/25.20.2.2",        # iX's typo branch: 25.20 is not a TrueNAS version
+        "release/26.0.0-BETA.3",
+        "master",
+    ]
+
+    def _refs(self, monkeypatch):
+        monkeypatch.setattr(
+            compat, "_ls_remote",
+            lambda remote, what: self.TAGS if what == "--tags" else self.HEADS)
+        return compat.discover_refs("origin")
+
+    def test_the_next_maintenance_release_is_checked(self, monkeypatch):
+        assert "release/25.10.5" in self._refs(monkeypatch), (
+            "the next thing a 25.10.4 box updates to is not checked, so a break in it "
+            "reaches users before the bot ever sees it"
+        )
+
+    def test_a_superseded_maintenance_branch_is_not(self, monkeypatch):
+        # 25.10.4.1 sorts OLDER than the newest tag TS-25.10.4? No -- it is NEWER, and
+        # both are on the 25.10 line, so only the newest branch on the line is taken.
+        refs = self._refs(monkeypatch)
+        assert "release/25.10.4.1" not in refs, "only the newest branch per line"
+
+    def test_the_typo_branch_stays_out(self, monkeypatch):
+        # 25.20 has no TS tag, so it is not a release line at all. A typo branch in the
+        # matrix reads as a real supported release we are silently broken on.
+        assert "release/25.20.2.2" not in self._refs(monkeypatch)
+
+    def test_a_prerelease_of_an_already_shipped_line_stays_out(self, monkeypatch):
+        assert "release/24.10-RC.2" not in self._refs(monkeypatch)
+
+    def test_an_untagged_branch_counts_as_UNRELEASED(self, monkeypatch):
+        # The exit code keys off this. Calling 25.10.5 "shipped" would fail the build
+        # as a live outage on a version nobody is running yet.
+        assert compat.is_unreleased("release/25.10.5")
+        assert compat.is_unreleased("master")
+        assert not compat.is_unreleased("TS-25.10.4")
+
+
+class TestMasterIsNotTheNextRelease:
+    """A red `master` row used to read as "the version you are about to install".
+
+    On 2026-07-14 master was 27-dev -- every recent commit targeted 27.0.0-BETA.1 --
+    while 26 was still in beta on its own branches. So `master BROKEN` meant "iX will
+    break us a major release from now", but the matrix said "master _(unreleased)_",
+    which any reader takes as the next thing out the door. For a table whose whole job
+    is helping somebody decide whether to trust this with their backups, that is a
+    false alarm in the worst possible place.
+    """
+
+    def _rows(self, refs):
+        return [{"ref": r, "unreleased": compat.is_unreleased(r), "modules": {}}
+                for r in refs]
+
+    def test_master_is_labelled_with_the_major_AFTER_the_newest_known_one(self):
+        rows = self._rows(["TS-25.10.4", "release/26.0.0-BETA.3", "master"])
+        assert compat.dev_label(rows) == "27-dev"
+
+    def test_it_rolls_over_on_its_own_when_the_next_beta_branches(self):
+        # Derived, not hardcoded: when release/27.0.0-BETA.1 appears, master is 28-dev.
+        rows = self._rows(["TS-26.0.0", "release/27.0.0-BETA.1", "master"])
+        assert compat.dev_label(rows) == "28-dev"
+
+    def test_the_rendered_matrix_says_dev_not_unreleased(self):
+        healthy = check_files(with_())
+        rows = [
+            {"ref": r, "unreleased": compat.is_unreleased(r), "modules": healthy}
+            for r in ("TS-25.10.4", "release/26.0.0-BETA.3", "master")
+        ]
+        md = compat.render_markdown(rows)
+        assert "master _(27-dev)_" in md
+        assert "master _(unreleased)_" not in md
+        # ...and the ordinary rows are untouched.
+        assert "| 25.10.4 |" in md
+        assert "| 26.0.0-BETA.3 _(unreleased)_ |" in md
