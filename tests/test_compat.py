@@ -304,9 +304,23 @@ class TestAsyncFlavour:
         broken["plugins/cloud_backup/sync.py"] = Unreadable("HTTP 429")
         assert compat.async_flavour(loader(broken)) is None
 
-    def test_the_real_truenas_versions(self):
-        # Pinning the actual fact this whole port exists for.
-        assert compat.async_flavour(loader(GOOD)) is True
+    def test_it_reads_STOCK_source_not_our_own_injected_block(self):
+        # This was a byte-identical copy of test_async_middleware_is_detected under a
+        # name that promised more. The fact worth pinning: apply.sh re-runs on an
+        # ALREADY-PATCHED overlay, so the probe must cut our block off first -- our own
+        # SNAPSHOT_SYNC wrapper is a plain `def create_snapshot`, and reading it would
+        # report a 25.10 box as synchronous and inject the wrong flavour.
+        patched = dict(GOOD)
+        patched["plugins/cloud/snapshot.py"] = (
+            GOOD["plugins/cloud/snapshot.py"]
+            + "\n# TRUECLOUD_PATCH\n"
+            + 'def create_snapshot(middleware, path, name="x"):\n    return "s", "p"\n'
+        )
+        assert compat.async_flavour(loader(patched)) is True, (
+            "the flavour probe read our own injected block and concluded the box is "
+            "synchronous -- it would then inject a sync wrapper into an async "
+            "middleware, and every nested backup would break"
+        )
 
 
 class TestMiddlewareMethodsWeCall:
@@ -530,6 +544,11 @@ class TestATransientNetworkBlipDoesNotWakeAnybody:
         return [{"ref": "master", "modules": check_files(files)}]
 
     def test_an_unreadable_file_does_not_change_the_fingerprint_of_a_broken_ref(self):
+        # The blip must land in the SAME module that is broken. Put it in `providers`
+        # (which is healthy) and `fingerprint()` skips the whole module via
+        # `is_broken(m)` -- so the `state` filter under test never runs and the test
+        # passes no matter what the code does. `nested` is the broken one here, so the
+        # unreadable file goes in `nested` too.
         broken = with_(**{
             "plugins/cloud/snapshot.py":
                 "async def create_snapshot(name, path, middleware):\n    return 1, 2\n",
@@ -537,7 +556,7 @@ class TestATransientNetworkBlipDoesNotWakeAnybody:
         clean = compat.fingerprint(self._rows(broken))
 
         blipped = dict(broken)
-        blipped["rclone/remote/b2.py"] = Unreadable("HTTP 429")
+        blipped["plugins/cloud_backup/sync.py"] = Unreadable("HTTP 429")   # nested
         assert compat.fingerprint(self._rows(blipped)) == clean, (
             "a rate-limited fetch changed the fingerprint, so the bot rewrites the "
             "issue body and then rewrites it back tomorrow"

@@ -143,13 +143,28 @@ class TestPlanStaging:
         )
 
     def test_parents_are_mounted_before_children(self):
-        # A child's mountpoint dir only exists inside its parent's snapshot, so
-        # mounting a child first would fail.
-        mounts, _ = plan()
+        # A child's mountpoint dir only exists inside its PARENT's snapshot, so
+        # mounting a child first fails.
+        #
+        # The default fixture is already in depth order, so it never exercised the
+        # sort at all -- deleting `mounts.sort(key=_depth)` passed the whole suite.
+        # These datasets are deliberately in the WRONG order by name: `Tap/aaa` is
+        # three levels deep and `Tap/zzz` is one, so anything that preserves input
+        # order (or sorts by name) mounts the child first and would fail for real.
+        awkward = [
+            ds("Tap", "/mnt/Tap"),
+            ds("Tap/aaa", "/mnt/Tap/zzz/deep/deeper"),
+            ds("Tap/zzz", "/mnt/Tap/zzz"),
+            ds("Tap/mmm", "/mnt/Tap/zzz/deep"),
+        ]
+        mounts, _ = plan(datasets=awkward)
+
         seen = set()
         for _src, target in mounts:
             if target != ROOT:
-                assert os.path.dirname(target) in seen
+                assert os.path.dirname(target) in seen, (
+                    f"{target} is mounted before its parent exists"
+                )
             seen.add(target)
 
     def test_backup_path_below_dataset_root(self):
@@ -1087,6 +1102,27 @@ class TestGarbageCollectorSelection:
         # Both the parent and its children share the current snapname.
         names = [self.CURRENT, "Tap/apps/x@cloud_backup-5-20260714115900"]
         assert self.collect(names) == []
+
+    def test_it_NEVER_touches_the_current_run_EVEN_WHEN_IT_IS_OLD(self):
+        # The one that matters, and the one that was not tested: a backup running
+        # longer than the age floor. The old test's `current` was a minute old, so the
+        # floor excluded it anyway and the same-snapname guard never ran -- deleting
+        # that guard passed the whole suite.
+        #
+        # A first full upload of a 100 GB pool takes hours. If the GC collected the
+        # snapshot of the run that is CURRENTLY READING FROM IT, restic would be
+        # yanked out from under itself mid-backup.
+        import datetime as dt
+
+        old_current = "Tap@cloud_backup-5-20260714000000"          # 12 hours old
+        names = [old_current, "Tap/apps/x@cloud_backup-5-20260714000000"]
+        assert tn.stale_snapshot_names(
+            "cloud_backup-5", old_current, names,
+            dt.datetime(2026, 7, 14, 12, 0, 0, tzinfo=dt.UTC),
+        ) == [], (
+            "the GC collected the snapshot of the run that is using it. A long first "
+            "upload would be destroyed mid-flight."
+        )
 
     def test_it_NEVER_touches_a_periodic_snapshot(self):
         assert self.collect(["Tap/apps/x@auto-2026-07-13_03-00"]) == []
