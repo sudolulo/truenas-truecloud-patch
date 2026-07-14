@@ -301,37 +301,61 @@ def check_call(c: MiddlewareCall, src: str | None,
     except SyntaxError as e:
         return "unknown", f"{path} does not parse: {e}"
 
-    # namespace = 'zfs.snapshot' on some Service class in this file...
-    namespaces = {
-        n.value.value
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Assign)
-        and isinstance(n.value, ast.Constant)
-        and isinstance(n.value.value, str)
-        and any(isinstance(t, ast.Name) and t.id == "namespace" for t in n.targets)
-    }
-    if namespace not in namespaces:
-        return "broken", (
-            f"{path} no longer declares namespace {namespace!r} "
-            f"(found: {sorted(namespaces) or 'none'}), so `{method}` is gone"
-        )
-
-    # ...and it defines the method.
+    # Find the CLASS that declares this namespace, and look for the method THERE.
+    #
+    # Not anywhere in the file. `ast.walk` over the whole module made *any* function
+    # called `delete` satisfy the check -- one on an unrelated class, or even a nested
+    # local function inside `do_query`. That is a FALSE OK, and it breaks the one
+    # invariant this checker and the runtime share: `_defines_delete()` looks in
+    # `vars(klass)` for a PLUGIN class on the service's MRO. If iX gutted
+    # `PoolSnapshotService.do_delete` while some other class in the same file still had
+    # a `delete`, compat would say ok, apply.sh would patch, and the runtime would then
+    # correctly refuse `pool.snapshot`, fall through to a `zfs.snapshot` that does not
+    # exist on 26, and fail every nested backup on a box the preflight called healthy.
+    #
+    # Same question on both sides: does the class that OWNS this namespace define the
+    # method?
     #
     # A CRUDService exposes `create`/`update`/`delete` from methods NAMED
-    # `do_create`/`do_update`/`do_delete`. Both spellings are live right now:
-    # 24.10 and 25.04 declare `do_delete`, 25.10 renamed it to `delete`, and all
-    # three answer to `zfs.snapshot.delete`. Accepting only the literal name reported
-    # the two older releases as broken -- a false BROKEN that would have switched off
-    # nested snapshots on boxes where they work.
-    defined = {
-        n.name for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
-    }
-    if not any(sp in defined for sp in accepted_spellings(name)):
-        return "broken", f"{path} no longer defines `{method}`"
+    # `do_create`/`do_update`/`do_delete`. Both spellings are live: 24.10 and 25.04
+    # declare `do_delete`, 25.10 renamed it to `delete`, and all answer to
+    # `<ns>.delete`. Accepting only the literal name reported working releases as
+    # broken.
+    owners = []
+    all_namespaces = set()
+    for cls in (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)):
+        declared = {
+            n.value.value
+            for n in ast.walk(cls)
+            if isinstance(n, ast.Assign)
+            and isinstance(n.value, ast.Constant)
+            and isinstance(n.value.value, str)
+            and any(isinstance(t, ast.Name) and t.id == "namespace" for t in n.targets)
+        }
+        all_namespaces |= declared
+        if namespace in declared:
+            owners.append(cls)
 
-    return "ok", None
+    if not owners:
+        return "broken", (
+            f"{path} no longer declares namespace {namespace!r} "
+            f"(found: {sorted(all_namespaces) or 'none'}), so `{method}` is gone"
+        )
+
+    wanted = accepted_spellings(name)
+    for cls in owners:
+        # Direct members of the class, not its nested scopes: a `def delete` inside
+        # another method is a local function, not a service method.
+        if any(
+            isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef) and n.name in wanted
+            for n in cls.body
+        ):
+            return "ok", None
+
+    return "broken", (
+        f"{path} still declares namespace {namespace!r}, but its class no longer "
+        f"defines `{'` or `'.join(wanted)}` -- so `{method}` is gone"
+    )
 
 
 #: Things that mean iX has done the job themselves and the module should RETIRE,

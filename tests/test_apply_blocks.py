@@ -642,3 +642,112 @@ def test_the_flavour_mapping_is_not_inverted():
             f"the {block} flavour mapping is missing or inverted: _flavour is True for "
             f"an ASYNC middleware, so it must select {block}_ASYNC"
         )
+
+
+# ── the compat preflight ─────────────────────────────────────────────────────
+#
+# This is the guard that stands between a broken middleware and a live NAS: at every
+# boot, apply.sh checks the patch's assumptions against the middlewared actually
+# installed, and REFUSES to apply a module whose assumptions no longer hold.
+#
+# It had no test. An audit turned it into a no-op eight different ways -- `verdict()`
+# always returning 'ok', the broken branch never firing, the kill switch never honoured
+# -- and the suite stayed green every time. The most consequential safety net in the
+# project was unguarded.
+
+def preflight_heredoc():
+    """The preflight's Python, lifted out of apply.sh and made runnable.
+
+    Extracted, not reimplemented: a reimplementation would happily pass while the
+    SHIPPED preflight stayed broken, which is exactly the failure being guarded.
+    """
+    with open(APPLY_SH, encoding="utf-8") as fh:
+        sh = fh.read()
+    # Line-based: the compat heredoc opens with `<<'PYEOF'` on the _tc_compat line and
+    # closes at the next bare PYEOF. (A regex that matched `<< 'PYEOF'` silently found
+    # the OTHER heredoc and ran a different script entirely.)
+    lines = sh.splitlines()
+    start = next(
+        i for i, ln in enumerate(lines)
+        if ln.startswith("_tc_compat=$(") and "<<'PYEOF'" in ln
+    )
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].strip() == "PYEOF")
+    m = "\n".join(lines[start + 1:end])
+    assert m, "could not find the compat preflight heredoc in apply.sh"
+    return m
+
+
+def run_preflight(result, tmp_path):
+    """Run the SHIPPED preflight against a fake compat.check_tree result.
+
+    The heredoc does `import sys`, so a fake `sys` in the namespace is immediately
+    rebound to the real module -- drive the real one instead.
+    """
+    import contextlib
+    import io
+    import sys
+    import types
+
+    src = preflight_heredoc()
+    fake = types.ModuleType("compat")
+    fake.check_tree = lambda _mw: result
+
+    saved_mod = sys.modules.get("compat")
+    saved_argv = sys.argv
+    sys.modules["compat"] = fake
+    sys.argv = ["x", "/patch", "/mw", str(tmp_path / "compat.json")]
+
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            exec(compile(src, "apply.sh:preflight", "exec"), {"__name__": "__main__"})  # noqa: S102
+    except SystemExit:
+        pass
+    finally:
+        sys.argv = saved_argv
+        if saved_mod is not None:
+            sys.modules["compat"] = saved_mod
+        else:
+            sys.modules.pop("compat", None)
+    return buf.getvalue().splitlines()
+
+
+def _mod(ok=True, native=False, unknown=False, problems=()):
+    return {"ok": ok, "native": native, "unknown": unknown, "problems": list(problems)}
+
+
+class TestTheBootPreflightRefusesABrokenMiddleware:
+    def test_a_healthy_tree_is_ok(self, tmp_path):
+        out = run_preflight({"providers": _mod(), "nested": _mod()}, tmp_path)
+        assert out[:2] == ["ok", "ok"]
+
+    def test_a_broken_module_is_reported_broken(self, tmp_path):
+        out = run_preflight({
+            "providers": _mod(),
+            "nested": _mod(ok=False, problems=[
+                {"id": "x", "detail": "gone", "why": "orphans every run"},
+            ]),
+        }, tmp_path)
+        assert "broken" in out, (
+            "the preflight did not report a module whose assumptions FAILED. It would "
+            "be injected into a middleware it does not fit -- broken backups, "
+            "discovered at restore time."
+        )
+
+    def test_a_module_that_went_NATIVE_is_also_not_applied(self, tmp_path):
+        # 'native' answers "do we still need it?", 'ok' answers "is it safe to inject?".
+        # Applying a module TrueNAS now implements itself is not safe either.
+        out = run_preflight({
+            "providers": _mod(),
+            "nested": _mod(ok=False, native=True),
+        }, tmp_path)
+        assert "broken" in out
+
+    def test_an_UNKNOWN_verdict_is_not_reported_as_broken(self, tmp_path):
+        # A network error or an unreadable file is not iX deleting our symbols. Calling
+        # it broken would switch a working module off on a healthy box.
+        out = run_preflight({
+            "providers": _mod(unknown=True),
+            "nested": _mod(unknown=True),
+        }, tmp_path)
+        assert "broken" not in out

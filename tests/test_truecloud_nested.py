@@ -1869,3 +1869,150 @@ class TestAnUnreadableZfsDuringTheByNameSweep:
             "with ZFS unreadable we cannot confirm anything was deleted. Returning [] "
             "makes cleanup_task drop the sidecar and orphans the tree forever."
         )
+
+
+class TestTheSnapshotRecordIsNeverLostToAnUnreadableFile:
+    """"There is no sidecar" and "I could not READ the sidecar" are different facts.
+
+    Conflating them let `cleanup_task` take its `if not pinned` branch and UNLINK the
+    only record of a tree it had just failed to read.
+    """
+
+    def test_an_unreadable_sidecar_raises_rather_than_reading_as_empty(self, tmp_path):
+        sc = tmp_path / "cloud_backup-5.snapshot"
+        sc.write_text("Tap@snap\n")
+        sc.chmod(0)
+        try:
+            with pytest.raises(OSError):
+                tn._read_sidecar(str(tmp_path / "cloud_backup-5"))
+        finally:
+            sc.chmod(0o600)
+
+    def test_a_missing_sidecar_is_simply_empty(self, tmp_path):
+        assert tn._read_sidecar(str(tmp_path / "nope")) == []
+
+    def test_cleanup_all_still_UNMOUNTS_when_a_sidecar_cannot_be_read(self, tmp_path):
+        # cleanup_all is what recover.sh and uninstall.sh call, i.e. it runs precisely
+        # when the box is already stuck. Its job is to get the mounts off. Aborting on
+        # one unreadable sidecar leaves the staging tree mounted -- which pins the
+        # snapshots, which is the state the caller is trying to escape.
+        sc = tmp_path / "cloud_backup-5.snapshot"
+        sc.write_text("Tap@snap\n")
+        sc.chmod(0)
+
+        unmounted = []
+
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def runner(cmd):
+            unmounted.append(cmd)
+            return R()
+
+        mounts = tmp_path / "mounts"
+        mounts.write_text(f"Tap@s {tmp_path}/cloud_backup-5 zfs ro 0 0\n")
+        out, _errors = tn.cleanup_all(
+            base=str(tmp_path), runner=runner, mounts_file=str(mounts),
+            glob_fn=lambda pat: [str(sc)],
+        )
+
+        assert sc.exists(), (
+            "cleanup_all DELETED the sidecar it had just failed to read. It has no idea "
+            "what that file names, and it may be the only record those snapshots exist."
+        )
+        sc.chmod(0o600)
+
+        assert any("umount" in " ".join(c) for c in unmounted), (
+            "cleanup_all stopped at the unreadable sidecar and never unmounted. The "
+            "staging tree stays mounted, pinning the snapshots -- which is exactly the "
+            "state recover.sh exists to escape."
+        )
+        assert "could not read the snapshot record" in "\n".join(out).lower()
+
+
+class TestTheMountTableIsNeverGuessedAt:
+    def test_an_unreadable_mount_table_raises_rather_than_saying_nothing_is_mounted(self):
+        # Returning an empty set means "no snapshot is in use", which silently switches
+        # OFF the GC's only protection for a CONCURRENTLY RUNNING backup's snapshots.
+        # A first upload can easily run past the 1h age floor.
+        with pytest.raises(OSError):
+            tn.mounted_snapshots(mounts_file="/nonexistent/mounts")
+
+    def test_the_GC_actually_passes_in_use_through(self, tmp_path, monkeypatch):
+        # The `in_use` guard is well tested as a pure function -- but nothing checked
+        # that gc_stale_snapshots WIRES it in. Deleting the argument passed the suite.
+        monkeypatch.setattr(tn, "STAGING_BASE", str(tmp_path))
+        import datetime as dt
+
+        old = "Tap/apps/x@cloud_backup-5-20260713030000"
+        mounts = tmp_path / "mounts"
+        mounts.write_text(f"{old} /some/where zfs ro 0 0\n")   # ...it is MOUNTED
+
+        mw = FakeMiddleware(["Tap@cloud_backup-5-20260714115900", old])
+        remaining = tn.gc_stale_snapshots(
+            mw, "cloud_backup-5", "Tap@cloud_backup-5-20260714115900",
+            now=dt.datetime(2026, 7, 14, 12, 0, 0, tzinfo=dt.UTC),
+            mounts_file=str(mounts), list_snapshots=mw.list_snapshots,
+        )
+        assert remaining == []
+        assert old in mw.snapshots, (
+            "the GC destroyed a snapshot that is still MOUNTED -- i.e. one a "
+            "concurrently running backup is reading from"
+        )
+
+
+class TestPrefixCollisionsBetweenPools:
+    """`Tap` and `Tap2` are different pools. String prefixes do not know that."""
+
+    def test_the_sweep_does_not_touch_a_similarly_named_pool(self):
+        mw = FakeMiddleware(["Tap@snap", "Tap/apps@snap", "Tap2/data@snap"])
+        tn.delete_snapshot_tree(mw, "Tap@snap", list_snapshots=lambda _d: list(mw.snapshots))
+        assert mw.snapshots == ["Tap2/data@snap"], (
+            "the sweep destroyed a snapshot in Tap2, a DIFFERENT POOL, because 'Tap2' "
+            "starts with 'Tap'"
+        )
+
+    def test_the_planner_does_not_stage_a_similarly_named_dataset(self):
+        noisy = DATASETS + [ds("Tap2/apps", "/mnt/Tap2/apps")]
+        mounts, skipped = plan(datasets=noisy)
+        assert len(mounts) == 6
+        assert skipped == []
+
+    def test_a_similarly_named_MOUNTPOINT_does_not_trip_the_foreign_check(self):
+        # /mnt/Tap2/x is not inside /mnt/Tap.
+        noisy = DATASETS + [ds("Tank/x", "/mnt/Tap2/x")]
+        mounts, skipped = plan(datasets=noisy)
+        assert len(mounts) == 6
+
+    def test_Tap2_is_not_a_child_of_Tap_even_when_mounted_inside_it(self):
+        # The one that actually bites: `Tap2/x` starts with the STRING "Tap", so a
+        # scope test that forgets the trailing "/" treats it as an in-tree descendant
+        # and STAGES it -- from a snapshot `zfs snapshot -r Tap@...` never took, since
+        # Tap2 is a different pool. It must be seen as FOREIGN and refused.
+        noisy = DATASETS + [ds("Tap2/x", "/mnt/Tap/apps/x")]
+        with pytest.raises(StagingError, match="Tap2/x"):
+            plan(datasets=noisy)
+
+
+class TestTheForeignCheckDoesNotBreakWorkingConfigs:
+    def test_an_UNMOUNTED_foreign_dataset_is_skipped_not_refused(self):
+        # A locked/encrypted dataset contributes nothing to the live tree, so its
+        # absence is not a hole -- exactly as for an in-tree one. Raising here would
+        # turn a working nightly backup into a permanent failure the first time
+        # somebody locked a dataset.
+        datasets = DATASETS + [
+            ds("Tank/photos", "/mnt/Tap/apps/photos", mounted="no"),
+        ]
+        mounts, skipped = plan(datasets=datasets)
+        assert len(mounts) == 6
+        assert ("Tank/photos", "dataset is not mounted (locked/encrypted?)") in skipped
+
+    def test_a_foreign_dataset_mounted_EXACTLY_AT_the_path_is_refused(self):
+        # One character wide: `mp.startswith(path + "/")` misses `mp == path`. And this
+        # case is the worse one -- it SHADOWS the base dataset's own directory, so we
+        # would stage what is hidden underneath instead of the data actually there.
+        datasets = DATASETS + [ds("Tank/x", "/mnt/Tap")]
+        with pytest.raises(StagingError, match="Tank/x"):
+            plan(datasets=datasets)

@@ -690,19 +690,36 @@ def plan_staging(base_dataset, base_mountpoint, path, snapshot_name, datasets,
     # exists to prevent. Stock has the same blind spot, but stock also REFUSES the
     # nested config outright -- we are the ones relaxing that guard, so the hole is
     # ours to close.
-    foreign = sorted(
-        ds.get("name", "")
-        for ds in datasets
-        if (mp := ds.get("properties", {}).get("mountpoint", {}).get("value", ""))
-        and mp.startswith(path_prefix)
-        and not ds.get("name", "").startswith(ds_prefix)
-        and ds.get("name", "") != base_dataset
-    )
+    foreign = []
+    for ds in datasets:
+        name = ds.get("name", "")
+        if name.startswith(ds_prefix) or name == base_dataset:
+            continue                                   # in-tree: handled above
+
+        props = ds.get("properties", {})
+        mp = props.get("mountpoint", {}).get("value", "")
+        # `mp == path` as well as below it. A foreign dataset mounted exactly AT the
+        # backup path is the same hole -- and it is worse, because it shadows the base
+        # dataset's own directory, so we would stage what is hidden underneath instead
+        # of the data actually visible there.
+        if not mp or (mp != path and not mp.startswith(path_prefix)):
+            continue                                   # not inside the backed-up path
+
+        if props.get("mounted", {}).get("value", "yes") == "no":
+            # An unmounted (locked/encrypted) dataset contributes nothing to the live
+            # tree, so its absence is not a hole -- exactly as for an in-tree one, 40
+            # lines above. Raising here would turn a working nightly backup into a
+            # permanent failure the first time somebody locked a dataset.
+            skipped.append((name, "dataset is not mounted (locked/encrypted?)"))
+            continue
+
+        foreign.append(name)
+
     if foreign:
         raise StagingError(
             "dataset(s) outside " + repr(base_dataset) + " are mounted inside the "
             "backup path and cannot be captured by its recursive snapshot: "
-            + ", ".join(repr(f) for f in foreign)
+            + ", ".join(repr(f) for f in sorted(foreign))
             + ". Refusing to back up an incomplete tree -- move them, or back up "
             "their own dataset separately."
         )
@@ -1118,7 +1135,12 @@ def mounted_snapshots(mounts_file=None):
                 if "@" in dev:
                     live.add(dev.replace("\\040", " "))
     except OSError:
-        return set()
+        # An empty set says "nothing is mounted", which silently switches OFF the GC's
+        # protection for snapshots a CONCURRENT run is using -- leaving only the age
+        # floor between us and destroying a snapshot out from under a backup that is
+        # still uploading. If we cannot read the mount table we do not KNOW what is in
+        # use, and must not pretend we do.
+        raise
     return live
 
 
@@ -1418,8 +1440,21 @@ def cleanup_all(base=None, runner=None, mounts_file=None,
     # Report orphaned snapshots BEFORE removing the sidecars that name them --
     # a sidecar is the only record that an interrupted run's snapshot tree (one
     # snapshot per descendant dataset) is still on disk.
+    unreadable = set()
     for sc in sorted(glob_fn(os.path.join(base, "*.snapshot"))):
-        for snap in read_sidecar(sc[: -len(".snapshot")]):
+        try:
+            recorded = read_sidecar(sc[: -len(".snapshot")])
+        except OSError as e:
+            unreadable.add(sc)
+            # REPORT it and carry on. This function's job is to get the mounts off, and
+            # it is called precisely when the box is already in a bad state
+            # (recover.sh, uninstall.sh). Letting one unreadable sidecar abort the run
+            # would leave the staging tree mounted -- which pins the snapshots, which is
+            # the exact situation the caller is trying to escape.
+            lines.append(f"  WARNING: could not read the snapshot record {sc} ({e}).")
+            lines.append("           It may name snapshots nothing else can find.")
+            continue
+        for snap in recorded:
             lines.append(f"  NOTE: an interrupted backup left snapshot '{snap}' behind.")
             lines.append(f"        Remove it and its children:  zfs destroy -r '{snap}'")
 
@@ -1435,6 +1470,12 @@ def cleanup_all(base=None, runner=None, mounts_file=None,
 
     if not errors:
         for sc in glob_fn(os.path.join(base, "*.snapshot")):
+            if sc in unreadable:
+                # Do NOT delete a record we could not read. We have no idea what it
+                # names, and it may be the only thing that knows those snapshots exist.
+                # Removing it here would be the very bug the read guard was added for,
+                # committed by the cleanup path instead of the backup path.
+                continue
             with contextlib.suppress(OSError):
                 os.unlink(sc)
         with contextlib.suppress(OSError):
