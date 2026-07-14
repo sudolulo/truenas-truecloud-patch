@@ -34,7 +34,7 @@ feature exists to prevent, and it would be worse than not having the feature.
 
 Snapshot lifecycle -- read this before changing anything
 --------------------------------------------------------
-``zfs.snapshot.delete`` defaults to ``recursive=False``, and stock
+The snapshot delete call defaults to ``recursive=False``, and stock
 ``restic_backup()`` calls it with no options. Stock gets away with that because
 its validation means ``recursive`` is never actually True in the field. Enabling
 nested datasets makes recursive snapshots real, so the parent
@@ -62,17 +62,25 @@ import subprocess
 import time
 
 __all__ = [
+    "DELETE_METHODS",
+    "SNAPSHOT_SERVICES",
     "STAGING_BASE",
     "StagingError",
+    "ZfsError",
     "apply_plan",
     "cleanup_all",
     "cleanup_task",
     "current_mounts_under",
     "delete_snapshot_tree",
     "gc_stale_snapshots",
+    "list_snapshot_names",
     "mounted_snapshots",
+    "own_snapshot",
+    "pick_snapshot_service",
     "plan_staging",
+    "query_filesystems",
     "sidecar_for",
+    "snapshot_service",
     "snapshot_tree_names",
     "stage_nested",
     "stale_snapshot_names",
@@ -81,8 +89,299 @@ __all__ = [
     "verify_staged",
 ]
 
+
+# ── how this module talks to the system ──────────────────────────────────────
+#
+#   READ the truth from ZFS.  MAKE CHANGES through middleware.
+#
+# That split is not stylistic. It was forced by finding, on a real TrueNAS 26 box,
+# that middleware's query APIs apply a VISIBILITY POLICY:
+#
+#   zfs list                 274 datasets      205 from pool.dataset.query
+#   zfs list -t snapshot     274 snapshots     205 from pool.snapshot.query
+#
+# The missing 69 are the datasets TrueNAS considers its own -- `ix-apps/*`,
+# `.system/*`, `.ix-virt/*` -- and on the real pool that is 84 of 270, including
+# `ix-apps`, which holds live application data. Enumerating from that view would
+# have silently omitted every one of them from the staging plan and from the
+# snapshot sweep: a green backup missing data, and one orphaned snapshot per
+# hidden dataset on every run. Both are exactly what this module exists to
+# prevent.
+#
+# This went unnoticed because the patch used to call the PRIVATE `zfs.dataset.query`
+# and `zfs.snapshot.query`, which return everything. TrueNAS 26 deleted them, and
+# the public replacements are NOT like-for-like -- they are filtered. So
+# enumeration now reads ZFS directly, which no policy can filter and which behaves
+# identically on every release.
+#
+# MUTATION still goes through middleware, so TrueNAS's own bookkeeping stays
+# consistent -- and an exact-name delete works fine even on a dataset the query
+# hides. The one wrinkle is that no single snapshot namespace spans every
+# supported release, so it is resolved at runtime rather than pinned:
+#
+#   24.10, 25.04   `zfs.snapshot`  (public back then; `pool.snapshot` does not exist)
+#   25.10          both -- `pool.snapshot` public, `zfs.snapshot` demoted to private
+#   26             `pool.snapshot` only -- `plugins/zfs_/` is gone
+#
+#: Snapshot CRUD namespaces, best first. `tools/compat.py` checks this exact list
+#: (MiddlewareCall.also) with the same predicate the runtime uses -- the namespace
+#: exists AND it defines `delete`/`do_delete` -- and a test binds the two lists
+#: together, so what CI verifies and what runs cannot drift apart.
+SNAPSHOT_SERVICES = ("pool.snapshot", "zfs.snapshot")
+
+
+#: The CRUDService method spellings that answer to `<namespace>.delete`. A
+#: CRUDService exposes `delete` from a method NAMED `do_delete`; both are live
+#: across the matrix. `tools/compat.py` accepts exactly this pair.
+DELETE_METHODS = ("delete", "do_delete")
+
+
+def pick_snapshot_service(can_delete):
+    """First namespace in SNAPSHOT_SERVICES that can actually DELETE for us.
+
+    Pure: `can_delete(namespace) -> bool`. Returns None if no namespace can,
+    which is a middleware we have never seen and must not guess about.
+
+    The predicate is "can delete", NOT "the service is registered", and the
+    difference is the whole point. `get_service()` only proves the namespace is
+    in the registry; it says nothing about whether `delete` still exists on it.
+    `tools/compat.py` checks namespace AND method, so if the runtime settled for
+    the weaker test the two could disagree — and would, in the one way that
+    matters: iX guts a method while keeping its service (they have already done
+    exactly that to `pool.snapshot.do_update` on master). compat would try
+    `pool.snapshot`, find `delete` gone, fall through to `zfs.snapshot`, and
+    report **ok**; the runtime would take `pool.snapshot` because the service is
+    still registered, and then fail on every single delete — orphaning the whole
+    tree while the backup reports success.
+
+    Same predicate on both sides, so they cannot drift.
+    """
+    for name in SNAPSHOT_SERVICES:
+        if can_delete(name):
+            return name
+    return None
+
+
+#: Where middlewared's own service framework lives. Classes from this package are
+#: PLUMBING, not implementations -- see `_defines_delete`.
+FRAMEWORK_PACKAGE = "middlewared.service"
+
+
+def _defines_delete(service):
+    """Does this service ITSELF implement a delete -- or merely inherit the framework's?
+
+    The distinction is the whole fix, and getting it wrong is silent.
+
+    `CRUDService` defines `delete` on the BASE class and dispatches to `self.do_delete`
+    at call time. So `getattr(service, "delete")` is a bound method on EVERY
+    CRUDService subclass, whether or not that subclass still implements one:
+
+        middlewared.plugins.pool_.snapshot.PoolSnapshotService  defines ['do_delete']
+        middlewared.service.crud_service.CRUDService            defines ['delete']
+
+    An earlier version of this check asked `callable(getattr(service, "delete"))` and
+    was therefore answering "is this a CRUDService?" -- exactly the weaker "is the
+    namespace registered?" question that `pick_snapshot_service` exists to avoid. It
+    would have picked a gutted `pool.snapshot` and failed every delete.
+
+    So walk the MRO and ignore the framework's generic plumbing: a delete is real only
+    where a PLUGIN class defines it. That mirrors `tools/compat.py`, which looks for
+    the `def` in the plugin file declaring the namespace.
+    """
+    for klass in type(service).__mro__:
+        module = getattr(klass, "__module__", "") or ""
+        if module == FRAMEWORK_PACKAGE or module.startswith(FRAMEWORK_PACKAGE + "."):
+            continue                       # the framework's generic CRUD dispatcher
+        if any(m in vars(klass) for m in DELETE_METHODS):
+            return True
+    return False
+
+
+def _can_delete(middleware, namespace):
+    """Is `<namespace>.delete` actually implemented on this middleware?"""
+    try:
+        service = middleware.get_service(namespace)
+    except Exception:
+        # KeyError for an unregistered namespace; AttributeError if `get_service`
+        # itself ever goes away. Both mean "cannot use it", and guessing YES on a
+        # service that is not really there fails later, mid-backup, holding a
+        # snapshot -- the worst possible moment to find out.
+        return False
+    return _defines_delete(service)
+
+
+def snapshot_service(middleware):
+    """The snapshot namespace this middleware can actually delete through."""
+    name = pick_snapshot_service(lambda n: _can_delete(middleware, n))
+    if name is None:
+        raise StagingError(
+            "middleware exposes no usable snapshot delete ("
+            + " / ".join(f"{n}.delete" for n in SNAPSHOT_SERVICES)
+            + "). Refusing to stage a nested backup, because the snapshot it "
+            "creates could not then be swept."
+        )
+    return name
+
+
+class _Snapshots:
+    """This module's entire interface to snapshots, in one object.
+
+    "READ the truth from ZFS, MAKE CHANGES through middleware" is the rule the whole
+    module rests on. It used to live in a comment, while `middleware` and the ZFS
+    reader were threaded through five functions **as a pair** -- and the namespace was
+    re-resolved in each of them. That is one collaborator, not two, so it is one
+    object; the rule is now structural rather than remembered.
+
+    Deliberately private and constructed inside the public functions: `apply.sh`
+    injects calls to those functions into middlewared itself, so their signatures are
+    a boot-time contract with a live NAS and are not worth churning for tidiness.
+    """
+
+    def __init__(self, middleware, list_snapshots=None):
+        self._mw = middleware
+        self._list = list_snapshots or list_snapshot_names
+        self._service = None
+
+    @property
+    def service(self):
+        """The namespace we delete through. Resolved once, on first use.
+
+        Lazy on purpose: resolving it raises when middleware has no usable delete,
+        and the read-only paths must not blow up over a mutation they never make.
+        """
+        if self._service is None:
+            self._service = snapshot_service(self._mw)
+        return self._service
+
+    def names(self, dataset):
+        """Every snapshot at or under `dataset`, from ZFS. Raises if it cannot be read.
+
+        Never from middleware: its snapshot query hides the internal datasets
+        (205 of 274 on the test box), and a snapshot the sweep cannot SEE is a
+        snapshot nothing will ever collect.
+        """
+        return self._list(dataset)
+
+    def delete(self, name, recursive=False):
+        """Delete one snapshot -- through middleware, so its bookkeeping stays right.
+
+        An exact-name delete works even on a dataset the query hides; it is only
+        enumeration that lies.
+        """
+        options = ({"recursive": True},) if recursive else ()
+        return self._mw.call_sync(f"{self.service}.delete", name, *options)
+
+
+class ZfsError(Exception):
+    """`zfs list` failed. Enumeration is unreliable, so the caller must not guess."""
+
+
+def _zfs_lines(args, runner=None, fields=None):
+    """`zfs <args>` as a list of tab-split rows. Raises ZfsError if it fails.
+
+    Never returns a partial or empty list on failure: a caller that cannot tell
+    "no datasets" from "the command broke" will happily stage nothing, or sweep
+    nothing, and report success.
+
+    `fields`, if given, is the exact number of tab-separated columns every row must
+    have. A row that does not is an ERROR, not something to skip. `zfs list -H`
+    neither quotes nor escapes, so a mountpoint containing a tab or a newline would
+    split wrong -- and quietly dropping that row would remove a dataset from the
+    staging plan without it appearing in `skipped` either. Silent omission is the
+    one thing this module may never do, so it raises instead.
+    """
+    runner = runner or _run
+    try:
+        r = runner(["zfs", *args])
+    except OSError as e:
+        # `zfs` missing from middlewared's PATH raises FileNotFoundError, which is
+        # not a ZfsError and would sail past callers that only expect one.
+        raise ZfsError(f"could not run zfs: {e}") from e
+
+    if r.returncode != 0:
+        raise ZfsError((r.stderr or "").strip() or f"zfs {' '.join(args)} failed")
+
+    rows = [ln.split("\t") for ln in r.stdout.splitlines() if ln.strip()]
+    if fields is not None:
+        bad = [r for r in rows if len(r) != fields]
+        if bad:
+            raise ZfsError(
+                f"zfs {' '.join(args)} returned {len(bad)} row(s) that do not have "
+                f"{fields} tab-separated fields (first: {bad[0]!r}). Refusing to "
+                f"guess -- a dropped row is a dataset silently missing from the backup."
+            )
+    return rows
+
+
+def query_filesystems(middleware=None, runner=None):
+    """Every FILESYSTEM dataset, in the shape the planner speaks -- read from ZFS.
+
+    NOT from `pool.dataset.query`, and this is the single most important decision
+    in this file.
+
+    middleware's dataset query applies a VISIBILITY POLICY: it hides the datasets
+    TrueNAS considers its own -- `ix-apps/*`, `.system/*`, `.ix-virt/*`. That is
+    **84 of 270 datasets** on the real pool, and `ix-apps` holds live application
+    data. Building the staging plan from that view would silently omit every one of
+    them. Worse, `plan_staging()` would never even SEE them, so they would not turn
+    up in its `skipped` list either -- no warning, no failure, just a green backup
+    quietly missing data. That is exactly the failure this whole module exists to
+    prevent, and it is the failure the cardinal rule at the top of this file is
+    about.
+
+    It worked before only because the patch called the PRIVATE `zfs.dataset.query`,
+    which returned everything. TrueNAS 26 deleted it. The public replacement is not
+    a like-for-like: it is a filtered view.
+
+    So: **read the truth from ZFS, make changes through middleware.** ZFS cannot
+    apply a policy to what it reports, and `zfs list` behaves identically on every
+    release -- which also means one code path instead of a version conditional.
+
+    `middleware` is accepted and ignored, so callers need not care where the data
+    comes from.
+    """
+    rows = _zfs_lines(
+        ["list", "-H", "-p", "-o", "name,mountpoint,mounted", "-t", "filesystem"],
+        runner=runner, fields=3,
+    )
+    return [
+        {
+            "name": name,
+            "properties": {
+                "mountpoint": {"value": mountpoint},
+                # `zfs list` prints yes/no; the planner already speaks that.
+                "mounted": {"value": mounted},
+            },
+        }
+        for name, mountpoint, mounted in rows
+    ]
+
+
+def list_snapshot_names(dataset, runner=None):
+    """Every snapshot at or under `dataset` -- read from ZFS, for the same reason.
+
+    `pool.snapshot.query` filters exactly like the dataset query does: on this box
+    it returned 205 of 274 snapshots, hiding the internal datasets' snapshots. A
+    sweep built on that view leaves one orphan per hidden dataset, on every run,
+    forever -- which is the bug this module was written to fix in the first place.
+
+    (An EXACT-name delete still works on a hidden dataset, so mutations may keep
+    going through middleware. It is only enumeration that lies.)
+    """
+    rows = _zfs_lines(
+        ["list", "-H", "-o", "name", "-t", "snapshot", "-r", dataset],
+        runner=runner, fields=1,
+    )
+    return [r[0] for r in rows]
+
 #: Where staging trees are assembled. tmpfs; bind mounts consume no space.
 STAGING_BASE = "/run/truecloud-nested"
+
+#: The kernel's mount table. Late-bound (never a default argument) so a
+#: test can point it somewhere harmless -- a default is frozen at def time,
+#: which is how 19 tests ended up reading the REAL table, one matching name
+#: away from running a real `umount` on the NAS.
+MOUNTS_FILE = "/proc/self/mounts"
 
 # Which snapshot a staging tree pins is recorded ONLY in the sidecar file, never
 # also in memory. An in-process dict would be a second source of truth that a
@@ -118,7 +417,7 @@ def sidecar_for(staging_root: str) -> str:
     return staging_root + ".snapshot"
 
 
-def _write_sidecar(staging_root: str, snapshots) -> None:
+def _write_sidecar(staging_root: str, snapshots, logger=None) -> None:
     """Record every snapshot tree this task still owns. One per line.
 
     A LIST, not a single name -- and that is not over-engineering, it is a bug fix.
@@ -135,22 +434,48 @@ def _write_sidecar(staging_root: str, snapshots) -> None:
     """
     if isinstance(snapshots, str):
         snapshots = [snapshots]
-    with contextlib.suppress(OSError):
+    try:
         os.makedirs(os.path.dirname(staging_root), exist_ok=True)
         with open(sidecar_for(staging_root), "w", encoding="utf-8") as fh:
             fh.write("\n".join(dict.fromkeys(snapshots)))   # de-duped, order kept
+    except OSError as e:
+        # This used to be suppressed silently, and it is the LAST thing that should be.
+        # The sidecar is the only record that these snapshots exist; if the write fails
+        # (a full /run, say) cleanup_task finds nothing to sweep, and only the by-name
+        # collector -- an hour later -- has any chance of finding them. Failing to
+        # write it is not fatal, but it must never be invisible.
+        if logger:
+            logger.error(
+                "truecloud-patch: COULD NOT RECORD the snapshot(s) %s (%r). If this "
+                "run does not clean them up itself, only the by-name collector will "
+                "ever find them.", ", ".join(snapshots), e,
+            )
 
 
-def _read_sidecar(staging_root: str):
+def _read_sidecar(staging_root: str, logger=None):
     """Every snapshot tree a previous run recorded here. [] if none.
 
     Tolerates the old single-line format, which is just a one-element list.
+
+    "There is no sidecar" and "I could not READ the sidecar" are different facts, and
+    conflating them is dangerous: `cleanup_task` reads an empty list as "nothing was
+    ever staged" and then REMOVES the sidecar -- destroying the only record of a tree
+    it could not read. FileNotFoundError is the ordinary case and stays quiet; any
+    other OSError is reported, and re-raised so no caller mistakes it for "empty".
     """
     try:
         with open(sidecar_for(staging_root), encoding="utf-8") as fh:
             return [ln.strip() for ln in fh if ln.strip()]
-    except OSError:
-        return []
+    except FileNotFoundError:
+        return []                                   # genuinely nothing recorded
+    except OSError as e:
+        if logger:
+            logger.error(
+                "truecloud-patch: could not READ the snapshot record %s (%r). Not "
+                "touching it -- it may name snapshots nothing else can find.",
+                sidecar_for(staging_root), e,
+            )
+        raise
 
 
 def _remove_sidecar(staging_root: str) -> None:
@@ -271,7 +596,7 @@ def plan_staging(base_dataset, base_mountpoint, path, snapshot_name, datasets,
                  staging_root, probe=_probe_snapdir):
     """Compute the bind-mount plan for staging a nested tree. Pure function.
 
-    ``datasets`` is a list of dicts shaped like ``zfs.dataset.query`` results:
+    ``datasets`` is what :func:`query_filesystems` returns:
     ``{"name": str, "properties": {"mountpoint": {"value": str},
     "mounted": {"value": "yes"|"no"}}}``.
 
@@ -345,13 +670,68 @@ def plan_staging(base_dataset, base_mountpoint, path, snapshot_name, datasets,
 
         mounts.append((src, os.path.join(staging_root, os.path.relpath(mp, path))))
 
+    # ── datasets INSIDE the path but OUTSIDE the snapshot's tree ─────────────
+    #
+    # The loop above scopes by dataset NAME, which is right: a dataset with no
+    # mountpoint cannot be scoped by path at all. But ZFS lets any dataset mount
+    # anywhere, so a dataset from a DIFFERENT tree -- even a different pool -- can
+    # sit inside the backup path:
+    #
+    #     Tank/photos   mountpoint=/mnt/Tap/apps/photos
+    #
+    # It holds data inside the path, so its absence is a hole in the backup. And
+    # `zfs snapshot -r Tap@...` does NOT cover it, because recursion follows the
+    # DATASET tree, not the directory tree -- so there is no snapshot of it to
+    # stage, and no way to capture it consistently with the rest.
+    #
+    # Before this check it was neither staged, nor reported in `skipped`, nor raised:
+    # it simply fell out of the name filter and vanished. The backup reported
+    # SUCCESS with that data missing, which is the precise failure this module
+    # exists to prevent. Stock has the same blind spot, but stock also REFUSES the
+    # nested config outright -- we are the ones relaxing that guard, so the hole is
+    # ours to close.
+    foreign = []
+    for ds in datasets:
+        name = ds.get("name", "")
+        if name.startswith(ds_prefix) or name == base_dataset:
+            continue                                   # in-tree: handled above
+
+        props = ds.get("properties", {})
+        mp = props.get("mountpoint", {}).get("value", "")
+        # `mp == path` as well as below it. A foreign dataset mounted exactly AT the
+        # backup path is the same hole -- and it is worse, because it shadows the base
+        # dataset's own directory, so we would stage what is hidden underneath instead
+        # of the data actually visible there.
+        if not mp or (mp != path and not mp.startswith(path_prefix)):
+            continue                                   # not inside the backed-up path
+
+        if props.get("mounted", {}).get("value", "yes") == "no":
+            # An unmounted (locked/encrypted) dataset contributes nothing to the live
+            # tree, so its absence is not a hole -- exactly as for an in-tree one, 40
+            # lines above. Raising here would turn a working nightly backup into a
+            # permanent failure the first time somebody locked a dataset.
+            skipped.append((name, "dataset is not mounted (locked/encrypted?)"))
+            continue
+
+        foreign.append(name)
+
+    if foreign:
+        raise StagingError(
+            "dataset(s) outside " + repr(base_dataset) + " are mounted inside the "
+            "backup path and cannot be captured by its recursive snapshot: "
+            + ", ".join(repr(f) for f in sorted(foreign))
+            + ". Refusing to back up an incomplete tree -- move them, or back up "
+            "their own dataset separately."
+        )
+
     # Parents before children, so each mountpoint exists before we mount onto it.
     mounts.sort(key=lambda m: _depth(m[1]))
     return mounts, skipped
 
 
-def current_mounts_under(root, mounts_file="/proc/self/mounts"):
+def current_mounts_under(root, mounts_file=None):
     """Mountpoints at or under ``root``, deepest first. Used for teardown."""
+    mounts_file = mounts_file or MOUNTS_FILE
     found = []
     try:
         with open(mounts_file, encoding="utf-8") as fh:
@@ -379,12 +759,13 @@ def _run(cmd):
     )
 
 
-def apply_plan(mounts, runner=_run, isdir=os.path.isdir):
+def apply_plan(mounts, runner=None, isdir=os.path.isdir):
     """Execute the bind-mount plan. Blocking; call via ``run_in_thread``.
 
     Raises StagingError on the first failure, after rolling back what was
     mounted -- a half-built tree must never be handed to the backup tool.
     """
+    runner = runner or _run
     if not mounts:
         raise StagingError("empty staging plan")
 
@@ -437,12 +818,14 @@ def verify_staged(mounts, ismount=os.path.ismount, listdir=os.listdir):
     return True
 
 
-def teardown(staging_root, runner=_run, mounts_file="/proc/self/mounts"):
+def teardown(staging_root, runner=None, mounts_file=None):
     """Unmount the staging tree (deepest first) and remove the root.
 
     Idempotent, and does not depend on an in-memory plan -- so it also cleans up
     leftovers from a crashed run.
     """
+    mounts_file = mounts_file or MOUNTS_FILE
+    runner = runner or _run
     errors = []
     for mp in current_mounts_under(staging_root, mounts_file=mounts_file):
         res = runner(["umount", mp])
@@ -455,8 +838,9 @@ def teardown(staging_root, runner=_run, mounts_file="/proc/self/mounts"):
     return errors
 
 
-def snapdir_automounts(snapshot_name, mounts_file="/proc/self/mounts"):
+def snapdir_automounts(snapshot_name, mounts_file=None):
     """Every ``<dataset>/.zfs/snapshot/<snap>`` ZFS automount for this snapshot."""
+    mounts_file = mounts_file or MOUNTS_FILE
     suffix = "/.zfs/snapshot/" + snapshot_name
     found = []
     try:
@@ -472,7 +856,7 @@ def snapdir_automounts(snapshot_name, mounts_file="/proc/self/mounts"):
     return sorted(found, key=_depth, reverse=True)      # deepest first
 
 
-def release_snapdirs(snapshot_name, runner=_run, mounts_file="/proc/self/mounts"):
+def release_snapdirs(snapshot_name, runner=None, mounts_file=None):
     """Unmount ZFS's OWN snapshot automounts, so the snapshots can be destroyed.
 
     Reading anything under ``<dataset>/.zfs/snapshot/<snap>/`` makes ZFS **automount**
@@ -489,6 +873,8 @@ def release_snapdirs(snapshot_name, runner=_run, mounts_file="/proc/self/mounts"
 
     Deepest first, so a child's automount is released before its parent's.
     """
+    mounts_file = mounts_file or MOUNTS_FILE
+    runner = runner or _run
     errors = []
     for mp in snapdir_automounts(snapshot_name, mounts_file=mounts_file):
         res = runner(["umount", mp])
@@ -560,7 +946,7 @@ def get_dataset_recursive(datasets, directory):
 
 
 def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
-                         sleep=time.sleep):
+                         sleep=None, list_snapshots=None):
     """Delete the parent snapshot AND every child created by ``zfs snapshot -r``.
 
     Returns the snapshots it could NOT delete -- callers must not throw that away.
@@ -578,6 +964,8 @@ def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
     snapshots hit this, and before the fix they were orphaned permanently.
     """
     dataset, _, snapname = snapshot.partition("@")
+    snaps = _Snapshots(middleware, list_snapshots)
+    sleep = sleep or time.sleep
 
     # Release ZFS's own automounts first, or `zfs destroy` refuses with EBUSY on
     # everything restic read in the last few minutes.
@@ -591,15 +979,55 @@ def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
     # through 252 sequential deletes leaves exactly the orphans this function
     # exists to prevent.
     try:
-        middleware.call_sync("zfs.snapshot.delete", snapshot, {"recursive": True})
-        return []
-    except Exception as e:  # noqa: BLE001 - fall through to the explicit sweep
-        # Usually just "parent already gone" (stock's finally won the race once our
-        # mounts were released), which the sweep below handles. Log it rather than
-        # swallow it: if the real cause is something else, this is the only place
-        # it is visible -- the sweep would report a different, downstream failure.
+        snaps.delete(snapshot, recursive=True)
+
+        # CONFIRM it. A delete that returns without raising is not proof that anything
+        # was destroyed, and this is the one place where believing it is catastrophic:
+        # `cleanup_task` reads an empty survivor list as "clean sweep" and REMOVES THE
+        # SIDECAR -- the only record the tree ever existed. ~250 snapshots would be
+        # orphaned per run, with nothing left to find them, and the backup green.
+        #
+        # Not paranoia about a hypothetical: iX has already gutted
+        # `pool.snapshot.do_update` on master into a no-op whose body is commented out
+        # and which returns None. An AST check still sees the `def`, and a callable
+        # check still sees the method. Only asking ZFS can tell.
+        #
+        # It costs one `zfs list` (~350ms against 2148 snapshots) on an 18-minute
+        # backup, and only on the path that would otherwise skip verification entirely.
+        try:
+            left = snapshot_tree_names(snapshot, snaps.names(dataset))
+        except Exception as e:  # noqa: BLE001 - cannot confirm; do not claim success
+            if logger:
+                logger.warning(
+                    "truecloud-patch: deleted %s but could not confirm it is gone "
+                    "(%r); keeping it recorded so the next run re-checks", snapshot, e,
+                )
+            # Keep OWNING it. Reporting a clean sweep here makes cleanup_task drop the
+            # sidecar; if the delete had in fact done nothing, the tree is orphaned
+            # with no record. A survivor we later find already gone costs one
+            # idempotent retry; a lost record costs the snapshots, permanently.
+            return [snapshot]
+
+        if not left:
+            return []
+
         if logger:
-            logger.debug(
+            logger.warning(
+                "truecloud-patch: the recursive delete of %s reported success but "
+                "%d snapshot(s) are still there; sweeping them by name",
+                snapshot, len(left),
+            )
+        # Fall through to the by-name sweep, which retries and reports survivors.
+    except Exception as e:  # noqa: BLE001 - fall through to the explicit sweep
+        # "Parent already gone" is the EXPECTED race (stock's finally won, once our
+        # mounts were released) and happens on every clean run, so it is debug.
+        # Anything else is a real fault -- a namespace that cannot delete, a schema
+        # change, a permission error -- and this is the only place it is visible,
+        # because the sweep below will report a different, downstream failure. At
+        # debug it would never reach disk on stock middlewared, which logs at INFO.
+        if logger:
+            expected = "does not exist" in str(e).lower()
+            (logger.debug if expected else logger.warning)(
                 "truecloud-patch: recursive delete of %s failed (%r); sweeping "
                 "the tree by name instead", snapshot, e,
             )
@@ -608,13 +1036,14 @@ def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
     # our mounts are released -- which fails the recursive delete while the
     # children survive. Sweep them by name.
     try:
-        snaps = middleware.call_sync(
-            "zfs.snapshot.query", [["name", "^", dataset]], {"select": ["name"]}
-        )
+        # From ZFS, not middleware: the snapshot query hides internal datasets'
+        # snapshots (205 of 274 on the test box), and a sweep that cannot see them
+        # orphans one per hidden dataset on every run. See list_snapshot_names().
+        #
         # An empty result means the tree is already gone -- delete nothing, and
         # do not fall back to the parent, which would only log a spurious
         # "does not exist" warning on every clean run.
-        names = snapshot_tree_names(snapshot, [s["name"] for s in snaps])
+        names = snapshot_tree_names(snapshot, snaps.names(dataset))
     except Exception as e:  # noqa: BLE001 - fall back to at least the parent
         if logger:
             logger.warning(
@@ -623,36 +1052,52 @@ def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
             )
         names = [snapshot]
 
-    def confirm_gone(failed):
-        """Drop any name ZFS no longer has, even though its delete raised.
+    def still_there(tried, failed):
+        """Which of `tried` does ZFS STILL have? The delete's verdict is not evidence.
 
-        A delete that raised "does not exist" SUCCEEDED as far as we care, and must
-        not be retried or reported. The query is only a refinement: if it cannot be
-        answered we keep the delete's own verdict, rather than inventing survivors --
-        a false survivor keeps the sidecar forever and is reported as a leak that
-        isn't there.
+        ZFS is the authority, not the API's return value, and the difference is not
+        academic in either direction:
+
+        * A delete that RAISED "does not exist" succeeded as far as we care, and must
+          not be retried or reported as a leak.
+        * A delete that RETURNED CLEANLY may have done nothing at all. iX has already
+          gutted `pool.snapshot.do_update` on master into a no-op whose body is
+          commented out and which returns None. Trusting that verdict makes
+          `cleanup_task` see "no survivors", drop the sidecar -- the only record -- and
+          orphan the whole tree, forever, silently.
+
+        If ZFS cannot be read we cannot check either way -- so keep owning ALL of them.
+        The two mistakes are not symmetric:
+
+        * a false survivor SELF-HEALS. The sidecar is kept, the next run reclaims it,
+          the delete raises "does not exist", and the record clears.
+        * a lost record does NOT. The snapshots are orphaned with nothing pointing at
+          them, and only the by-name collector -- an hour later, and only if ZFS is
+          readable by then -- has any chance of finding them.
         """
-        if not failed:
-            return []
         try:
-            live = middleware.call_sync(
-                "zfs.snapshot.query", [["name", "^", dataset]], {"select": ["name"]}
-            )
-        except Exception:  # noqa: BLE001 - cannot refine; trust the delete's verdict
-            return list(failed)
-        live = {s["name"] for s in live}
-        return [n for n in failed if n in live]
+            live = set(snaps.names(dataset))
+        except Exception:  # noqa: BLE001 - cannot check; keep owning them
+            return list(tried)
+        return [n for n in tried if n in live]
 
     remaining = list(names)
+    last_error = {}
     for attempt in range(attempts):
         failed = []
         for name in remaining:
             try:
-                middleware.call_sync("zfs.snapshot.delete", name)
-            except Exception:  # noqa: BLE001 - busy, or already gone; sorted out below
+                snaps.delete(name)
+            except Exception as e:  # noqa: BLE001 - busy, or already gone; sorted below
+                # KEEP the reason. This used to discard it and then report every
+                # survivor as "(still busy?)" -- which names the one cause that is
+                # benign and self-healing, and hides the ones that are permanent (a
+                # namespace that cannot delete, a permission error, a schema change).
+                # A misleading diagnosis is worse than none: it tells you to wait.
+                last_error[name] = e
                 failed.append(name)
 
-        remaining = confirm_gone(failed)
+        remaining = still_there(remaining, failed)
         if not remaining:
             return []
 
@@ -666,13 +1111,13 @@ def delete_snapshot_tree(middleware, snapshot, logger=None, attempts=4,
         if logger:
             logger.warning(
                 "truecloud-patch: could not delete snapshot %s after %d attempts "
-                "(still busy?) -- it will be reclaimed on the next run",
-                name, attempts,
+                "(last error: %r) -- it stays recorded and the next run reclaims it",
+                name, attempts, last_error.get(name),
             )
     return remaining
 
 
-def mounted_snapshots(mounts_file="/proc/self/mounts"):
+def mounted_snapshots(mounts_file=None):
     """Every ZFS snapshot something is currently mounted from.
 
     The device field of a snapshot mount IS the snapshot name (`Tap/apps/x@snap`), for
@@ -681,6 +1126,7 @@ def mounted_snapshots(mounts_file="/proc/self/mounts"):
     protects a concurrently-running backup from the garbage collector, rather than
     trusting an age heuristic to be generous enough.
     """
+    mounts_file = mounts_file or MOUNTS_FILE
     live = set()
     try:
         with open(mounts_file, encoding="utf-8") as fh:
@@ -689,12 +1135,17 @@ def mounted_snapshots(mounts_file="/proc/self/mounts"):
                 if "@" in dev:
                     live.add(dev.replace("\\040", " "))
     except OSError:
-        return set()
+        # An empty set says "nothing is mounted", which silently switches OFF the GC's
+        # protection for snapshots a CONCURRENT run is using -- leaving only the age
+        # floor between us and destroying a snapshot out from under a backup that is
+        # still uploading. If we cannot read the mount table we do not KNOW what is in
+        # use, and must not pretend we do.
+        raise
     return live
 
 
 def gc_stale_snapshots(middleware, task_name, current_snapshot, logger=None,
-                       now=None, mounts_file="/proc/self/mounts"):
+                       now=None, mounts_file=None, list_snapshots=None):
     """Delete snapshots this task left behind in an earlier run. Returns what remains.
 
     The backstop for when the RECORD is gone, not just the snapshots: the sidecar lives
@@ -705,13 +1156,15 @@ def gc_stale_snapshots(middleware, task_name, current_snapshot, logger=None,
     Selection is `stale_snapshot_names()`, which is pure and heavily tested, because a
     name match is a weaker claim than a recorded fact and this deletes data on one.
     """
+    mounts_file = mounts_file or MOUNTS_FILE
     dataset = current_snapshot.partition("@")[0]
     now = now or datetime.datetime.now(datetime.UTC)
+    snaps = _Snapshots(middleware, list_snapshots)
 
     try:
-        snaps = middleware.call_sync(
-            "zfs.snapshot.query", [["name", "^", dataset]], {"select": ["name"]}
-        )
+        # From ZFS: middleware's snapshot query hides internal datasets, and an
+        # orphan it cannot see is an orphan nothing will ever collect.
+        all_names = snaps.names(dataset)
     except Exception as e:  # noqa: BLE001 - cannot enumerate; collect nothing
         if logger:
             logger.warning(
@@ -720,7 +1173,7 @@ def gc_stale_snapshots(middleware, task_name, current_snapshot, logger=None,
         return []
 
     stale = stale_snapshot_names(
-        task_name, current_snapshot, [s["name"] for s in snaps], now,
+        task_name, current_snapshot, all_names, now,
         in_use=mounted_snapshots(mounts_file),
     )
     if not stale:
@@ -736,7 +1189,7 @@ def gc_stale_snapshots(middleware, task_name, current_snapshot, logger=None,
     remaining = []
     for name in stale:
         try:
-            middleware.call_sync("zfs.snapshot.delete", name)
+            snaps.delete(name)
         except Exception as e:  # noqa: BLE001 - busy, or gone; either way, next run
             remaining.append(name)
             if logger:
@@ -746,27 +1199,43 @@ def gc_stale_snapshots(middleware, task_name, current_snapshot, logger=None,
     return remaining
 
 
-def stage_nested(middleware, path, snapshot, base_dataset, base_mountpoint,
-                 task_name, datasets, logger=None):
-    """Build a complete staging tree for `path` from the already-taken `snapshot`.
+def own_snapshot(middleware, task_name, snapshot, logger=None, list_snapshots=None):
+    """Take ownership of `snapshot`'s whole tree: reclaim, collect, and record it.
 
-    `snapshot` is a full ZFS snapshot name ("Tap@cloud_backup-5-2026...").
+    Call this on EVERY ``snapshot = true`` cloud_backup run — **whether or not the
+    tree gets staged**. That unconditionality is the fix for a real leak, so do not
+    make it conditional again.
 
-    `datasets` is the FILESYSTEM dataset list. **It MUST have been enumerated
-    AFTER `snapshot` was taken.** A list read beforehand can miss a dataset
-    created in the gap: the recursive snapshot would capture it, but the staging
-    plan would not, and its data would be silently omitted from the backup.
-    Enumerated afterwards, an unsnapshotted dataset instead trips the isdir()
-    check in plan_staging and fails the run loudly.
+    Stock decides whether to take a RECURSIVE snapshot by its own rule, and that
+    rule is not ours:
 
-    Returns the staging root to hand to the backup tool.
+    ``<= 25.10``
+        stock's ``create_snapshot`` calls ``get_dataset_recursive()`` — the very
+        function this module vendors. "Stock went recursive" and "we have something
+        to stage" were therefore the *same question*, and a non-staged snapshot
+        provably had no children. Stock's non-recursive delete was correct.
 
-    Raises StagingError if the tree cannot be staged completely -- the caller
-    must let that propagate so the backup fails instead of silently uploading a
-    partial tree. The caller is responsible for deleting `snapshot` in that case
-    (see SNAPSHOT_BLOCK in apply.sh).
+    ``26``
+        stock uses ``filesystem.statfs``: ``recursive = (path == the dataset's
+        mountpoint)``. Now the two rules disagree. A dataset whose only descendants
+        are **ZVOLs** or **legacy/none-mountpoint** datasets gets a RECURSIVE
+        snapshot — while ``get_dataset_recursive()`` reports nothing to stage,
+        because neither kind is a mounted filesystem under ``path``.
+
+    In that gap stock takes one snapshot per descendant and then deletes only the
+    parent (its ``finally`` destroys ``path=snapshot``, non-recursively). Nothing
+    would ever have found the children: no staging tree, so no sidecar, and the GC
+    only ever ran from :func:`stage_nested`. One orphan per zvol/legacy descendant,
+    on every run, forever — while the backup reports SUCCESS. That is the exact
+    failure this module exists to prevent, reintroduced by a gate.
+
+    So ownership of the sweep is no longer conditional on staging. It is cheap:
+    :func:`delete_snapshot_tree` is idempotent, and on a genuinely childless
+    snapshot it is one recursive destroy of a snapshot stock has usually already
+    removed.
+
+    Returns the staging root; the sidecar sits beside it.
     """
-    snapshot_name = snapshot.split("@", 1)[1]
     staging_root = staging_root_for(task_name)
 
     # A previous run may have crashed mid-flight; never build on top of that.
@@ -790,7 +1259,8 @@ def stage_nested(middleware, path, snapshot, base_dataset, base_mountpoint,
                 "truecloud-patch: reclaiming snapshot tree from an earlier "
                 "run: %s", stale,
             )
-        pending.extend(delete_snapshot_tree(middleware, stale, logger=logger))
+        pending.extend(delete_snapshot_tree(
+            middleware, stale, logger=logger, list_snapshots=list_snapshots))
 
     if pending and logger:
         logger.warning(
@@ -806,16 +1276,54 @@ def stage_nested(middleware, path, snapshot, base_dataset, base_mountpoint,
     #
     # It runs AFTER the sidecar reclaim on purpose: the recorded path is authoritative
     # and cheap, and the GC should only ever be mopping up what the record lost.
-    pending.extend(
-        gc_stale_snapshots(middleware, task_name, snapshot, logger=logger)
-    )
+    pending.extend(gc_stale_snapshots(
+        middleware, task_name, snapshot, logger=logger,
+        list_snapshots=list_snapshots,
+    ))
 
     # Record the snapshot BEFORE mounting anything, not after. middlewared can
     # die at any point (this patch even schedules a restart at boot), and the
     # sidecar is the only thing that survives it -- an in-process dict would take
     # the sole record of a 160-snapshot tree with it. Writing it after apply_plan
     # would leave exactly the crash window the sidecar exists to close.
-    _write_sidecar(staging_root, [*pending, snapshot])
+    _write_sidecar(staging_root, [*pending, snapshot], logger=logger)
+    return staging_root
+
+
+def stage_nested(middleware, path, snapshot, base_dataset, base_mountpoint,
+                 task_name, datasets, logger=None, list_snapshots=None):
+    """Build a complete staging tree for `path` from the already-taken `snapshot`.
+
+    `snapshot` is a full ZFS snapshot name ("Tap@cloud_backup-5-2026...").
+
+    `datasets` is the FILESYSTEM dataset list. **It MUST have been enumerated
+    AFTER `snapshot` was taken.** A list read beforehand can miss a dataset
+    created in the gap: the recursive snapshot would capture it, but the staging
+    plan would not, and its data would be silently omitted from the backup.
+    Enumerated afterwards, an unsnapshotted dataset instead trips the isdir()
+    check in plan_staging and fails the run loudly.
+
+    Returns the staging root to hand to the backup tool.
+
+    Raises StagingError if the tree cannot be staged completely -- the caller
+    must let that propagate so the backup fails instead of silently uploading a
+    partial tree. The caller is responsible for deleting `snapshot` in that case
+    (see SNAPSHOT_BLOCK in apply.sh).
+    """
+    snapshot_name = snapshot.split("@", 1)[1]
+
+    # Refuse BEFORE staging, not after restic has run. We are about to pin a recursive
+    # snapshot with bind mounts; if this middleware has no usable snapshot delete we
+    # could never sweep it, and the honest move is to fail now rather than take a
+    # snapshot we cannot clean up. (`_Snapshots` resolves lazily on purpose -- the
+    # read-only paths must not raise over a mutation they never make -- so the staging
+    # path asks explicitly.)
+    snapshot_service(middleware)
+
+    staging_root = own_snapshot(
+        middleware, task_name, snapshot, logger=logger,
+        list_snapshots=list_snapshots,
+    )
 
     try:
         mounts, skipped = plan_staging(
@@ -853,7 +1361,7 @@ def stage_nested(middleware, path, snapshot, base_dataset, base_mountpoint,
     return staging_root
 
 
-def cleanup_task(middleware, task_name, logger=None):
+def cleanup_task(middleware, task_name, logger=None, list_snapshots=None):
     """Tear down a task's staging tree and delete the snapshot it pinned.
 
     Safe to call unconditionally: a no-op when the task was never staged.
@@ -877,7 +1385,8 @@ def cleanup_task(middleware, task_name, logger=None):
     # finish reclaiming.
     survivors = []
     for snapshot in pinned:
-        survivors.extend(delete_snapshot_tree(middleware, snapshot, logger=logger))
+        survivors.extend(delete_snapshot_tree(
+            middleware, snapshot, logger=logger, list_snapshots=list_snapshots))
 
     # KEEP the sidecar if anything survived. It is the only record that those
     # snapshots exist, and removing it orphans them permanently.
@@ -900,7 +1409,7 @@ def cleanup_task(middleware, task_name, logger=None):
             )
         # The SURVIVORS, not the trees we asked to delete. Writing the original list
         # back would keep re-sweeping trees that are already gone.
-        _write_sidecar(staging_root, survivors)
+        _write_sidecar(staging_root, survivors, logger=logger)
         return
 
     _remove_sidecar(staging_root)
@@ -909,7 +1418,7 @@ def cleanup_task(middleware, task_name, logger=None):
 # ── offline cleanup (uninstall.sh / recover.sh) ───────────────────────────────
 
 
-def cleanup_all(base=None, runner=_run, mounts_file="/proc/self/mounts",
+def cleanup_all(base=None, runner=None, mounts_file=None,
                 glob_fn=None, read_sidecar=_read_sidecar):
     """Tear down every staging tree. Used by uninstall.sh and recover.sh.
 
@@ -920,6 +1429,8 @@ def cleanup_all(base=None, runner=_run, mounts_file="/proc/self/mounts",
 
     Returns ``(lines, errors)``: report lines to print, and unmount errors.
     """
+    mounts_file = mounts_file or MOUNTS_FILE
+    runner = runner or _run
     import glob as _glob
 
     base = base or STAGING_BASE
@@ -929,8 +1440,21 @@ def cleanup_all(base=None, runner=_run, mounts_file="/proc/self/mounts",
     # Report orphaned snapshots BEFORE removing the sidecars that name them --
     # a sidecar is the only record that an interrupted run's snapshot tree (one
     # snapshot per descendant dataset) is still on disk.
+    unreadable = set()
     for sc in sorted(glob_fn(os.path.join(base, "*.snapshot"))):
-        for snap in read_sidecar(sc[: -len(".snapshot")]):
+        try:
+            recorded = read_sidecar(sc[: -len(".snapshot")])
+        except OSError as e:
+            unreadable.add(sc)
+            # REPORT it and carry on. This function's job is to get the mounts off, and
+            # it is called precisely when the box is already in a bad state
+            # (recover.sh, uninstall.sh). Letting one unreadable sidecar abort the run
+            # would leave the staging tree mounted -- which pins the snapshots, which is
+            # the exact situation the caller is trying to escape.
+            lines.append(f"  WARNING: could not read the snapshot record {sc} ({e}).")
+            lines.append("           It may name snapshots nothing else can find.")
+            continue
+        for snap in recorded:
             lines.append(f"  NOTE: an interrupted backup left snapshot '{snap}' behind.")
             lines.append(f"        Remove it and its children:  zfs destroy -r '{snap}'")
 
@@ -946,6 +1470,12 @@ def cleanup_all(base=None, runner=_run, mounts_file="/proc/self/mounts",
 
     if not errors:
         for sc in glob_fn(os.path.join(base, "*.snapshot")):
+            if sc in unreadable:
+                # Do NOT delete a record we could not read. We have no idea what it
+                # names, and it may be the only thing that knows those snapshots exist.
+                # Removing it here would be the very bug the read guard was added for,
+                # committed by the cleanup path instead of the backup path.
+                continue
             with contextlib.suppress(OSError):
                 os.unlink(sc)
         with contextlib.suppress(OSError):

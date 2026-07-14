@@ -133,7 +133,41 @@ ASSUMPTIONS = [
         params=["middleware", "job", "cloud_backup"],
         why="SYNC_BLOCK wraps it to tear down bind mounts in a finally",
     ),
+    Assumption(
+        # Not a plugin method -- a method on the middleware OBJECT itself, which the
+        # manifest had no way to express and therefore never checked.
+        #
+        # The nested module calls `middleware.get_service(<ns>)` to decide whether to
+        # sweep snapshots through `pool.snapshot` or `zfs.snapshot` (see
+        # SNAPSHOT_SERVICES). If it ever disappears, `_can_delete()` catches the
+        # AttributeError, reports BOTH namespaces unusable, and every nested backup
+        # fails -- loudly, but only at RUN time, on a box the preflight had already
+        # declared healthy. Checking it costs one file read.
+        "get-service", NESTED, "utils/plugins.py",
+        "LoadPluginsMixin.get_service", kind="method",
+        params=["self", "name"],
+        why="snapshot_service() resolves the snapshot namespace through it; without "
+            "it the module cannot sweep the snapshot it just took",
+    ),
 ]
+
+
+def accepted_spellings(name):
+    """The method names that satisfy a call to `<namespace>.<name>`.
+
+    A CRUDService exposes `create`/`update`/`delete` from methods NAMED
+    `do_create`/`do_update`/`do_delete`. Both are live across the matrix: 24.10 and
+    25.04 declare `do_delete`, 25.10 renamed it to `delete`, and all of them answer
+    to `<ns>.delete`. Accepting only the literal name reported working releases as
+    BROKEN and would have switched nested snapshots off on boxes where they work.
+    """
+    return (name, f"do_{name}")
+
+
+#: The spellings that satisfy `<ns>.delete`. A test binds this to the runtime's
+#: `truecloud_nested.DELETE_METHODS`, so the checker and the patch cannot come to
+#: disagree about what "can delete" means on the same box.
+DELETE_NAMES = accepted_spellings("delete")
 
 
 class MiddlewareCall:
@@ -162,86 +196,166 @@ class MiddlewareCall:
     the whole design: declining is always the cheaper mistake.
     """
 
-    def __init__(self, ident, module, method, path, why=""):
+    def __init__(self, ident, module, method, path, why="", also=()):
         self.id = ident
         self.module = module
-        self.method = method              # "zfs.snapshot.delete"
+        self.method = method              # "pool.snapshot.delete"
         self.path = path                  # plugin file that declares it
         self.why = why
+        #: Equally acceptable spellings of the SAME call, as (method, path) pairs.
+        #:
+        #: No single snapshot namespace spans every supported release. 24.10 and
+        #: 25.04 expose the CRUD service as the public `zfs.snapshot`; 25.10
+        #: promoted it to `pool.snapshot` and demoted `zfs.snapshot` to private;
+        #: 26 deleted `plugins/zfs_/` entirely. Pinning either one alone marks
+        #: half the matrix BROKEN and declines to apply on versions that work
+        #: perfectly well.
+        #:
+        #: The call is satisfied if ANY option is present. The runtime picks the
+        #: same way -- see `pick_snapshot_service()` in the nested module -- so
+        #: what this checks and what the patch does cannot drift apart.
+        self.also = tuple(also)
 
     @property
-    def namespace(self):
-        return self.method.rsplit(".", 1)[0]
+    def options(self):
+        """Every (method, path) that would satisfy this call, best first."""
+        return ((self.method, self.path), *self.also)
 
-    @property
-    def name(self):
-        return self.method.rsplit(".", 1)[1]
+    @staticmethod
+    def namespace_of(method):
+        return method.rsplit(".", 1)[0]
+
+    @staticmethod
+    def name_of(method):
+        return method.rsplit(".", 1)[1]
 
 
 #: Every middlewared method the nested module calls at runtime.
+#: The middleware methods the nested module CALLS.
+#:
+#: These used to be the PRIVATE `zfs.*` service (`zfs.dataset.query`,
+#: `zfs.snapshot.delete`, `zfs.snapshot.query`). TrueNAS 26 deleted
+#: `plugins/zfs_/` outright and every one of them vanished -- silently, because a
+#: private service carries no stability contract and nothing warned us. The patch
+#: would have applied cleanly and then failed on the first backup.
+#:
+#: The replacements are the PUBLIC `pool.*` API, and switching to it is not merely
+#: a TrueNAS 26 fix -- it is the correct call on every version:
+#:
+#:   * It is public, documented, and covered by iX's deprecation policy, so it
+#:     cannot be deleted from under us the way `zfs.*` just was.
+#:   * The same methods, in the same files, exist on 24.10 through 26. One code
+#:     path, no version conditionals.
+#:   * Both spellings take `recursive`, so ONE call sweeps the whole tree instead
+#:     of ~250 individual deletes, any of which could be missed.
 MIDDLEWARE_CALLS = [
     MiddlewareCall(
-        "call-zfs-dataset-query", NESTED, "zfs.dataset.query",
-        "plugins/zfs_/dataset.py",
-        why="SNAPSHOT_BLOCK enumerates FILESYSTEM datasets to build the staging plan",
-    ),
-    MiddlewareCall(
-        "call-zfs-snapshot-delete", NESTED, "zfs.snapshot.delete",
-        "plugins/zfs_/snapshot.py",
+        "call-snapshot-delete", NESTED, "pool.snapshot.delete",
+        "plugins/pool_/snapshot.py",
+        also=[("zfs.snapshot.delete", "plugins/zfs_/snapshot.py")],
         why="delete_snapshot_tree() sweeps the recursive snapshot. Without it every "
             "run orphans one snapshot per descendant dataset (250 on a real pool)",
     ),
-    MiddlewareCall(
-        "call-zfs-snapshot-query", NESTED, "zfs.snapshot.query",
-        "plugins/zfs_/snapshot.py",
-        why="delete_snapshot_tree()'s fallback sweep enumerates the tree by name",
-    ),
 ]
 
+# There is deliberately NO entry here for a dataset or snapshot QUERY.
+#
+# The patch used to call `zfs.dataset.query` / `zfs.snapshot.query` (private, and
+# deleted in TrueNAS 26). The obvious port was to the public `pool.dataset.query` /
+# `pool.snapshot.query` -- and that port was WRONG in a way no source check could
+# ever have caught, because the methods are all present and correctly shaped.
+#
+# They are simply filtered. On a real box they return 205 of 274 datasets and 205
+# of 274 snapshots, hiding `ix-apps/*`, `.system/*` and `.ix-virt/*` -- 84 of 270
+# on the production pool, including live application data. Staging from that view
+# silently omits them; sweeping from it orphans one snapshot per hidden dataset,
+# forever.
+#
+# So the module enumerates from ZFS itself and there is no middleware assumption
+# left to check. That is the point: the fewer things we assume about middleware,
+# the less there is for iX to break. Only the MUTATION is still a middleware call,
+# and that is the one entry above.
 
-def check_call(c: MiddlewareCall, src: str | None) -> tuple[str, str | None]:
-    """Is `c.method` still registered by middlewared?"""
+
+def check_call(c: MiddlewareCall, src: str | None,
+               method: str | None = None, path: str | None = None,
+               ) -> tuple[str, str | None]:
+    """Is `method` still registered by middlewared?
+
+    `method`/`path` name WHICH spelling of the call is being tried -- a call may
+    have several equally acceptable ones (see MiddlewareCall.also). They default
+    to the preferred spelling.
+    """
+    method = method or c.method
+    path = path or c.path
+    namespace = MiddlewareCall.namespace_of(method)
+    name = MiddlewareCall.name_of(method)
+
     if src is None:
         return "broken", (
-            f"{c.path} no longer exists, so `{c.method}` is gone"
+            f"{path} no longer exists, so `{method}` is gone"
         )
 
     try:
         tree = ast.parse(_stock(src))
     except SyntaxError as e:
-        return "unknown", f"{c.path} does not parse: {e}"
+        return "unknown", f"{path} does not parse: {e}"
 
-    # namespace = 'zfs.snapshot' on some Service class in this file...
-    namespaces = {
-        n.value.value
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Assign)
-        and isinstance(n.value, ast.Constant)
-        and isinstance(n.value.value, str)
-        and any(isinstance(t, ast.Name) and t.id == "namespace" for t in n.targets)
-    }
-    if c.namespace not in namespaces:
-        return "broken", (
-            f"{c.path} no longer declares namespace {c.namespace!r} "
-            f"(found: {sorted(namespaces) or 'none'}), so `{c.method}` is gone"
-        )
-
-    # ...and it defines the method.
+    # Find the CLASS that declares this namespace, and look for the method THERE.
+    #
+    # Not anywhere in the file. `ast.walk` over the whole module made *any* function
+    # called `delete` satisfy the check -- one on an unrelated class, or even a nested
+    # local function inside `do_query`. That is a FALSE OK, and it breaks the one
+    # invariant this checker and the runtime share: `_defines_delete()` looks in
+    # `vars(klass)` for a PLUGIN class on the service's MRO. If iX gutted
+    # `PoolSnapshotService.do_delete` while some other class in the same file still had
+    # a `delete`, compat would say ok, apply.sh would patch, and the runtime would then
+    # correctly refuse `pool.snapshot`, fall through to a `zfs.snapshot` that does not
+    # exist on 26, and fail every nested backup on a box the preflight called healthy.
+    #
+    # Same question on both sides: does the class that OWNS this namespace define the
+    # method?
     #
     # A CRUDService exposes `create`/`update`/`delete` from methods NAMED
-    # `do_create`/`do_update`/`do_delete`. Both spellings are live right now:
-    # 24.10 and 25.04 declare `do_delete`, 25.10 renamed it to `delete`, and all
-    # three answer to `zfs.snapshot.delete`. Accepting only the literal name reported
-    # the two older releases as broken -- a false BROKEN that would have switched off
-    # nested snapshots on boxes where they work.
-    defined = {
-        n.name for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
-    }
-    if c.name not in defined and f"do_{c.name}" not in defined:
-        return "broken", f"{c.path} no longer defines `{c.method}`"
+    # `do_create`/`do_update`/`do_delete`. Both spellings are live: 24.10 and 25.04
+    # declare `do_delete`, 25.10 renamed it to `delete`, and all answer to
+    # `<ns>.delete`. Accepting only the literal name reported working releases as
+    # broken.
+    owners = []
+    all_namespaces = set()
+    for cls in (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)):
+        declared = {
+            n.value.value
+            for n in ast.walk(cls)
+            if isinstance(n, ast.Assign)
+            and isinstance(n.value, ast.Constant)
+            and isinstance(n.value.value, str)
+            and any(isinstance(t, ast.Name) and t.id == "namespace" for t in n.targets)
+        }
+        all_namespaces |= declared
+        if namespace in declared:
+            owners.append(cls)
 
-    return "ok", None
+    if not owners:
+        return "broken", (
+            f"{path} no longer declares namespace {namespace!r} "
+            f"(found: {sorted(all_namespaces) or 'none'}), so `{method}` is gone"
+        )
+
+    wanted = accepted_spellings(name)
+    for cls in owners:
+        # Direct members of the class, not its nested scopes: a `def delete` inside
+        # another method is a local function, not a service method.
+        if any(
+            isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef) and n.name in wanted
+            for n in cls.body
+        ):
+            return "ok", None
+
+    return "broken", (
+        f"{path} still declares namespace {namespace!r}, but its class no longer "
+        f"defines `{'` or `'.join(wanted)}` -- so `{method}` is gone"
+    )
 
 
 #: Things that mean iX has done the job themselves and the module should RETIRE,
@@ -404,7 +518,10 @@ def check_source(a: Assumption, src: str | None) -> tuple[str, str | None]:
     breaks a box that was working.
     """
     if src is None:
-        return "broken", f"{a.path} does not exist"
+        # Name the SYMBOL, not just the file. Whoever reads the bug report needs to
+        # know what the patch can no longer reach, and "utils/plugins.py does not
+        # exist" does not tell them that `get_service` is gone.
+        return "broken", f"{a.path} does not exist, so `{a.symbol}` is gone"
 
     try:
         tree = ast.parse(src)
@@ -539,6 +656,7 @@ def check(loader, modules=None) -> dict:
             out[a.module]["unknown"] = True
             out[a.module]["problems"].append({
                 "id": a.id, "detail": f"could not read {a.path}: {e}", "why": a.why,
+                "state": "unknown",
             })
             continue
 
@@ -546,37 +664,57 @@ def check(loader, modules=None) -> dict:
         if status == "broken":
             out[a.module]["ok"] = False
             out[a.module]["problems"].append({
-                "id": a.id, "detail": detail, "why": a.why,
+                "id": a.id, "detail": detail, "why": a.why, "state": "broken",
             })
         elif status == "unknown":
             out[a.module]["unknown"] = True
             out[a.module]["problems"].append({
-                "id": a.id, "detail": detail, "why": a.why,
+                "id": a.id, "detail": detail, "why": a.why, "state": "unknown",
             })
 
     # The methods the injected code CALLS, not just the symbols it wraps.
+    #
+    # A call may have several equally acceptable spellings, because no single
+    # snapshot namespace spans every supported release (24.10 has `zfs.snapshot`,
+    # 26 has only `pool.snapshot`). It is satisfied if ANY of them is present --
+    # exactly as the runtime resolves it -- and BROKEN only when they all vanish.
     for c in MIDDLEWARE_CALLS:
         if c.module not in out:
             continue
-        try:
-            text = src(c.path)
-        except Unreadable as e:
-            out[c.module]["unknown"] = True
-            out[c.module]["problems"].append({
-                "id": c.id, "detail": f"could not read {c.path}: {e}", "why": c.why,
-            })
+
+        satisfied, unknown, details = False, False, []
+        for method, path in c.options:
+            try:
+                text = src(path)
+            except Unreadable as e:
+                unknown = True
+                details.append(f"could not read {path}: {e}")
+                continue
+
+            status, detail = check_call(c, text, method, path)
+            if status == "ok":
+                satisfied = True
+                break
+            if status == "unknown":
+                unknown = True
+            details.append(detail)
+
+        if satisfied:
             continue
 
-        status, detail = check_call(c, text)
-        if status == "broken":
-            out[c.module]["ok"] = False
-            out[c.module]["problems"].append({
-                "id": c.id, "detail": detail, "why": c.why,
-            })
-        elif status == "unknown":
+        # Every spelling failed. If we could not READ one of them we do not know
+        # that it is broken -- a rate-limited fetch is not a regression.
+        if unknown:
             out[c.module]["unknown"] = True
             out[c.module]["problems"].append({
-                "id": c.id, "detail": detail, "why": c.why,
+                "id": c.id, "detail": "; ".join(details), "why": c.why,
+                "state": "unknown",
+            })
+        else:
+            out[c.module]["ok"] = False
+            out[c.module]["problems"].append({
+                "id": c.id, "detail": "; ".join(details), "why": c.why,
+                "state": "broken",
             })
 
     for module, (path, phrase, native_when_present) in NATIVE_PROBES.items():
@@ -804,6 +942,10 @@ def is_broken(r: dict) -> bool:
 #: a strictly weaker claim than "a restore worked". Add a row only after doing it.
 HARDWARE_VERIFIED = {
     "25.10.4": "nested + providers; 252-snapshot recursive backup of /mnt/Tap, 18m",
+    "26.0.0-BETA.1": (
+        "nested + providers; 274-snapshot recursive backup of a 292-dataset pool, "
+        "restored a 4-deep child dataset byte-identical"
+    ),
 }
 
 _LEGEND = """
@@ -914,6 +1056,12 @@ def fingerprint(rows: list[dict]) -> str:
         for mod, m in r["modules"].items()
         if is_broken(m)
         for p in m["problems"]
+        # `unknown` problems are things we could not READ (a 429, an EACCES), not
+        # things iX changed. On a ref that is broken for some other reason they would
+        # otherwise join the digest, so one transient network blip rewrites the issue
+        # body and the next clean run rewrites it back. That is the daily-noise
+        # failure this fingerprint exists to prevent, wearing a different hat.
+        if p.get("state", "broken") == "broken"
     )
     return hashlib.sha256(repr(findings).encode()).hexdigest()[:16]
 

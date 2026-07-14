@@ -6,6 +6,128 @@ is deliberate: see [Releasing](docs/releasing.md). Twelve releases were cut on
 live, every one of those interrupts every user. An alert people learn to ignore is
 worse than no alert, because one day it carries a security fix.
 
+## Unreleased
+### Added
+
+- **TrueNAS 26 support, verified on a real TrueNAS 26 install.** 26 deletes
+  `plugins/zfs_/` outright, taking the private `zfs.dataset.query`,
+  `zfs.snapshot.query` and `zfs.snapshot.delete` with it. Every one of those was on
+  the nested module's critical path, so nested snapshots were **BROKEN** on 26 and
+  `apply.sh` correctly refused to apply the module there.
+
+  Snapshot **deletion** now resolves its namespace at runtime — `pool.snapshot` on
+  25.10 and 26, `zfs.snapshot` on 24.10 and 25.04, because no single namespace spans
+  every supported release. `tools/compat.py` checks the same list the runtime uses,
+  so what CI verifies and what runs cannot drift apart.
+
+  Hardware-verified on TrueNAS 26.0.0-BETA.1: a 274-snapshot recursive backup of a
+  292-dataset pool, then a **byte-identical restore of a four-level-deep child
+  dataset**.
+
+### Fixed
+
+- **Enumeration no longer trusts middleware's dataset and snapshot queries — they
+  are filtered.** This is the important one, and it is the bug that a test VM caught
+  and no amount of source analysis ever could have.
+
+  The obvious port of the deleted private `zfs.dataset.query` was the public
+  `pool.dataset.query`. It exists, it is documented, it is covered by iX's
+  deprecation policy — and it is **not a like-for-like replacement**. It applies a
+  *visibility policy*: it hides the datasets TrueNAS considers its own — `ix-apps/*`,
+  `.system/*`, `.ix-virt/*`. On a real pool that is **84 of 270 datasets**, and
+  `ix-apps` holds **live application data**.
+
+  Staging from that view would have silently omitted every one of them. Worse,
+  `plan_staging()` would never have seen them, so they would not have appeared in its
+  `skipped` list either — no warning, no failure, just a green backup quietly missing
+  data. That is precisely the failure this module exists to prevent. The snapshot
+  query lies the same way (205 of 274), so the sweep would have orphaned one snapshot
+  per hidden dataset, on every run, forever.
+
+  The module now **reads the truth from ZFS and makes changes through middleware**:
+  enumeration is `zfs list`, which no policy can filter and which behaves identically
+  on every release; mutation stays a middleware call, so TrueNAS's own bookkeeping
+  stays consistent. A failing `zfs list` raises rather than returning an empty list —
+  "no datasets" and "the command broke" must never look the same.
+
+  **No shipped release is affected.** v0.6.1 and earlier call the *private*
+  `zfs.dataset.query`, which returns all 270 datasets. The bug existed only in the
+  unreleased TrueNAS 26 port.
+
+- **The patch now owns the snapshot sweep even when it does not stage anything.**
+  Stock decides whether to take a *recursive* snapshot by its own rule, and on
+  TrueNAS 26 that rule stopped being ours.
+
+  Up to 25.10, stock's `create_snapshot` called `get_dataset_recursive()` — the same
+  function this module vendors — so "stock went recursive" and "we have something to
+  stage" were the *same question*, and stock's non-recursive delete was correct for
+  everything the patch declined to stage. TrueNAS 26 uses `filesystem.statfs`:
+  `recursive = (path == the dataset's mountpoint)`. The two rules now disagree for a
+  dataset whose only descendants are **ZVOLs** or **legacy/none-mountpoint** datasets
+  — stock snapshots it recursively, while the patch sees nothing to stage.
+
+  The patch then handed the snapshot back to stock, which destroys the parent only.
+  With no staging tree there was no sidecar, and the garbage collector only ever ran
+  from the staging path — so nothing on the box would ever have found the children.
+  Reproduced on the test VM: one orphaned snapshot per zvol, on every run, forever,
+  with the backup reporting success. Ownership of the sweep is no longer conditional
+  on staging.
+
+- **The runtime resolved a *namespace*; the checker verified a *method*.** Those are
+  different questions, and the gap is a false "ok". `get_service()` only proves a
+  namespace is registered — it says nothing about whether `delete` still exists on it.
+  So if iX guts the method while keeping the service (they have already done exactly
+  that to `pool.snapshot.do_update` on master), `tools/compat.py` would fall through
+  to `zfs.snapshot`, report the box healthy, and let the patch apply — while the
+  runtime picked `pool.snapshot` and failed *every* delete, orphaning the whole tree.
+  Both sides now ask the same question, and a test binds the two lists together.
+
+- `query_filesystems()` **dropped malformed `zfs list` rows silently** — the last
+  remaining silent-omission path, and a direct contradiction of this module's cardinal
+  rule. It raises now. A missing `zfs` binary raised `FileNotFoundError` rather than
+  `ZfsError`; also fixed.
+
+- The snapshot retry loop **discarded the delete error** and reported every survivor
+  as "(still busy?)" — naming the one cause that is benign and self-healing, and
+  hiding the ones that are permanent. It keeps and reports the real error.
+
+- The staging-failure handler could **lose the original exception** if its own cleanup
+  sweep raised. An error handler must not be able to lose the error.
+
+- **A snapshot delete that returns cleanly is not proof that anything was deleted.**
+  The recursive sweep's fast path took the call's word for it and returned "no
+  survivors" — so `cleanup_task` read that as a clean sweep and removed the sidecar,
+  the only record the tree ever existed. Roughly 250 snapshots would have been orphaned
+  on every run, with nothing left able to find them, and the backup reporting success.
+
+  This is not a hypothetical about a well-behaved API: iX has already gutted
+  `pool.snapshot.do_update` on master into a no-op whose body is commented out and
+  which returns `None`. A source check still sees the `def`; a runtime check still sees
+  a callable method. Only asking ZFS can tell. The sweep now confirms against ZFS, and
+  where it *cannot* confirm it keeps owning the tree rather than claiming success — a
+  false survivor self-heals on the next run, a lost record never does.
+
+- `_write_sidecar` **swallowed `OSError`**. The sidecar is the only thing that survives
+  a middlewared restart; failing to write it is not fatal, but it must never be
+  invisible. `_read_sidecar` had the mirror bug — it conflated "there is no sidecar"
+  with "I could not read the sidecar", and `cleanup_task` then took the empty branch
+  and **unlinked the only record** of a tree it had failed to read.
+
+- **A dataset from another tree, mounted inside the backup path, was omitted
+  silently.** The staging plan scopes by dataset *name*, which is correct — a dataset
+  with no mountpoint cannot be scoped by path at all. But ZFS lets any dataset mount
+  anywhere, so one from an unrelated tree can sit inside the path:
+
+      Tank/photos   mountpoint=/mnt/Tap/apps/photos
+
+  It holds data inside the backed-up path, and `zfs snapshot -r Tap@…` does **not**
+  cover it: recursion follows the dataset tree, not the directory tree. So there is no
+  snapshot of it to stage, and no way to capture it consistently with the rest. It fell
+  out of the name filter and vanished — not staged, not in `skipped`, no error, backup
+  green. Stock has the same blind spot, but stock also refuses the nested config
+  outright; this patch is what relaxes that guard, so the hole is this patch's to close.
+  It now refuses, and names the offending datasets.
+
 ## v0.6.1 — 2026-07-13
 ### Fixed
 

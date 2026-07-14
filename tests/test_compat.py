@@ -51,23 +51,43 @@ GOOD = {
         "async def restic_backup(middleware, job, cloud_backup, dry_run=False, "
         "rate_limit=None):\n    pass\n"
     ),
-    # The middlewared METHODS the injected code calls. TrueNAS 26 deleted both of
-    # these files, taking zfs.dataset.query / zfs.snapshot.query / zfs.snapshot.delete
-    # with them -- see TestMiddlewareMethodsWeCall.
-    "plugins/zfs_/dataset.py": (
-        "class ZFSDataset(CRUDService):\n"
+    # The middlewared METHODS the injected code calls. These now go through the
+    # PUBLIC pool.* API: TrueNAS 26 deleted plugins/zfs_/ outright, taking the whole
+    # private zfs.* service with it -- see TestMiddlewareMethodsWeCall.
+    #
+    # This default tree is a MODERN box (25.10/26): it has pool.snapshot and no
+    # zfs.snapshot. The older shape is built explicitly where it is tested.
+    # Not a plugin: a method on the middleware OBJECT. `snapshot_service()` resolves
+    # the snapshot namespace through it, so if it vanishes the module cannot sweep the
+    # snapshot it just took.
+    "utils/plugins.py": (
+        "class LoadPluginsMixin:\n"
+        "    def get_service(self, name):\n        pass\n"
+    ),
+    "plugins/pool_/dataset.py": (
+        "class PoolDatasetService(CRUDService):\n"
         "    class Config:\n"
-        "        namespace = 'zfs.dataset'\n"
+        "        namespace = 'pool.dataset'\n"
         "    def query(self, filters, options):\n        pass\n"
     ),
-    "plugins/zfs_/snapshot.py": (
-        "class ZFSSnapshot(CRUDService):\n"
+    "plugins/pool_/snapshot.py": (
+        "class PoolSnapshotService(CRUDService):\n"
         "    class Config:\n"
-        "        namespace = 'zfs.snapshot'\n"
+        "        namespace = 'pool.snapshot'\n"
         "    def query(self, filters, options):\n        pass\n"
         "    def delete(self, id_, options={}):\n        pass\n"
     ),
 }
+
+#: A 24.10/25.04 box: `pool.snapshot` does not exist yet and the snapshot CRUD
+#: service still answers to the (then-public) `zfs.snapshot`.
+ZFS_ERA_SNAPSHOT = (
+    "class ZFSSnapshot(CRUDService):\n"
+    "    class Config:\n"
+    "        namespace = 'zfs.snapshot'\n"
+    "    def query(self, filters, options):\n        pass\n"
+    "    def do_delete(self, id_, options={}):\n        pass\n"
+)
 
 
 def loader(files):
@@ -284,9 +304,23 @@ class TestAsyncFlavour:
         broken["plugins/cloud_backup/sync.py"] = Unreadable("HTTP 429")
         assert compat.async_flavour(loader(broken)) is None
 
-    def test_the_real_truenas_versions(self):
-        # Pinning the actual fact this whole port exists for.
-        assert compat.async_flavour(loader(GOOD)) is True
+    def test_it_reads_STOCK_source_not_our_own_injected_block(self):
+        # This was a byte-identical copy of test_async_middleware_is_detected under a
+        # name that promised more. The fact worth pinning: apply.sh re-runs on an
+        # ALREADY-PATCHED overlay, so the probe must cut our block off first -- our own
+        # SNAPSHOT_SYNC wrapper is a plain `def create_snapshot`, and reading it would
+        # report a 25.10 box as synchronous and inject the wrong flavour.
+        patched = dict(GOOD)
+        patched["plugins/cloud/snapshot.py"] = (
+            GOOD["plugins/cloud/snapshot.py"]
+            + "\n# TRUECLOUD_PATCH\n"
+            + 'def create_snapshot(middleware, path, name="x"):\n    return "s", "p"\n'
+        )
+        assert compat.async_flavour(loader(patched)) is True, (
+            "the flavour probe read our own injected block and concluded the box is "
+            "synchronous -- it would then inject a sync wrapper into an async "
+            "middleware, and every nested backup would break"
+        )
 
 
 class TestMiddlewareMethodsWeCall:
@@ -303,52 +337,86 @@ class TestMiddlewareMethodsWeCall:
     per descendant dataset (250 on a real pool) on every run, forever.
     """
 
-    ZFS_SNAPSHOT = (
-        "class ZFSSnapshot(CRUDService):\n"
-        "    class Config:\n"
-        "        namespace = 'zfs.snapshot'\n"
-        "    def query(self, filters, options):\n        pass\n"
-        "    def delete(self, id_, options={}):\n        pass\n"
-    )
-    ZFS_DATASET = (
-        "class ZFSDataset(CRUDService):\n"
-        "    class Config:\n"
-        "        namespace = 'zfs.dataset'\n"
-        "    def query(self, filters, options):\n        pass\n"
-    )
+    POOL_SNAPSHOT = GOOD["plugins/pool_/snapshot.py"]
 
     def _tree(self, **over):
         files = dict(GOOD)
-        files["plugins/zfs_/snapshot.py"] = self.ZFS_SNAPSHOT
-        files["plugins/zfs_/dataset.py"] = self.ZFS_DATASET
         files.update(over)
         return files
 
+    #: A 26 box: pool.snapshot only.
+    def _modern(self, **over):
+        return self._tree(**over)
+
+    #: A 24.10/25.04 box: zfs.snapshot only -- plugins/pool_/snapshot.py does not
+    #: exist yet.
+    def _zfs_era(self, **over):
+        return self._tree(**{
+            "plugins/pool_/snapshot.py": None,
+            "plugins/zfs_/snapshot.py": ZFS_ERA_SNAPSHOT,
+            **over,
+        })
+
     def test_present_methods_are_ok(self):
-        r = check_files(self._tree())
+        r = check_files(self._modern())
         assert r[NESTED]["ok"], r[NESTED]["problems"]
 
-    def test_a_deleted_plugin_file_is_broken(self):
-        # Literally TrueNAS 26: plugins/zfs_/snapshot.py does not exist.
-        r = check_files(self._tree(**{"plugins/zfs_/snapshot.py": None}))
+    def test_the_OLD_zfs_era_snapshot_service_also_satisfies_the_call(self):
+        # 24.10 and 25.04 have no `pool.snapshot` at all -- the CRUD service is the
+        # then-public `zfs.snapshot`. Pinning only the modern spelling marked both of
+        # those releases BROKEN and would have switched nested snapshots OFF on boxes
+        # where they work perfectly. The runtime picks the same way; see
+        # pick_snapshot_service().
+        r = check_files(self._zfs_era())
+        assert r[NESTED]["ok"], r[NESTED]["problems"]
+
+    def test_it_is_broken_only_when_NEITHER_namespace_exists(self):
+        # The real failure: middleware drops the last spelling we know how to call.
+        r = check_files(self._tree(**{
+            "plugins/pool_/snapshot.py": None,
+            "plugins/zfs_/snapshot.py": None,
+        }))
         assert is_broken(r[NESTED])
         details = " ".join(p["detail"] for p in r[NESTED]["problems"])
-        assert "zfs.snapshot.delete" in details
+        assert "pool.snapshot.delete" in details
+        assert "zfs.snapshot.delete" in details, (
+            "the report must say BOTH spellings were tried, or whoever reads it will "
+            "think we simply never looked for the one their box has"
+        )
+
+    def test_we_do_NOT_depend_on_a_middleware_dataset_query_at_all(self):
+        # iX could delete plugins/pool_/dataset.py tomorrow and the patch would not
+        # care, because the staging plan is enumerated from ZFS, not from middleware.
+        #
+        # That is deliberate, and it was expensive to learn. `pool.dataset.query`
+        # exists and is correctly shaped -- and it LIES: it applies a visibility
+        # policy that hides ix-apps/*, .system/* and .ix-virt/* (84 of 270 datasets
+        # on the real pool, including live app data). No source check could ever
+        # have caught that; only running it could. So there is no assumption here
+        # left to break.
+        r = check_files(self._modern(**{"plugins/pool_/dataset.py": None}))
+        assert r[NESTED]["ok"], r[NESTED]["problems"]
+
+        ids = {c.id for c in compat.MIDDLEWARE_CALLS}
+        assert not any("dataset" in i or "query" in i for i in ids), (
+            "a dataset/snapshot QUERY assumption crept back into the manifest -- "
+            "middleware's queries are filtered; enumerate from ZFS"
+        )
 
     def test_a_renamed_namespace_is_broken(self):
         r = check_files(self._tree(**{
-            "plugins/zfs_/snapshot.py": self.ZFS_SNAPSHOT.replace(
-                "'zfs.snapshot'", "'zfs.resource.snapshot'"),
+            "plugins/pool_/snapshot.py": self.POOL_SNAPSHOT.replace(
+                "'pool.snapshot'", "'zfs.resource.snapshot'"),
+            "plugins/zfs_/snapshot.py": None,
         }))
         assert is_broken(r[NESTED])
 
     def test_the_CRUDService_do_prefix_is_accepted(self):
-        # 24.10 and 25.04 declare `do_delete`; 25.10 renamed it to `delete`. BOTH
-        # answer to zfs.snapshot.delete. Accepting only the literal name reported the
-        # two older releases as broken -- a false BROKEN that would have switched off
-        # nested snapshots on boxes where they work perfectly.
-        r = check_files(self._tree(**{
-            "plugins/zfs_/snapshot.py": self.ZFS_SNAPSHOT.replace(
+        # A CRUDService exposes `delete` from a method NAMED `do_delete`. Both
+        # spellings are live across the matrix. Accepting only the literal name
+        # reported working releases as broken.
+        r = check_files(self._modern(**{
+            "plugins/pool_/snapshot.py": self.POOL_SNAPSHOT.replace(
                 "def delete(", "def do_delete("),
         }))
         assert r[NESTED]["ok"], r[NESTED]["problems"]
@@ -356,6 +424,153 @@ class TestMiddlewareMethodsWeCall:
     def test_the_snapshot_delete_reason_names_the_orphan_risk(self):
         # If this ever regresses, whoever reads the bug report must understand that
         # it is not a cosmetic failure.
-        r = check_files(self._tree(**{"plugins/zfs_/snapshot.py": None}))
+        r = check_files(self._tree(**{
+            "plugins/pool_/snapshot.py": None,
+            "plugins/zfs_/snapshot.py": None,
+        }))
         whys = " ".join(p["why"] for p in r[NESTED]["problems"])
         assert "orphan" in whys
+
+
+class TestTheMethodCheckIsNotJustANamespaceCheck:
+    """compat must verify the METHOD, not merely that the namespace still exists.
+
+    Deleting the method check entirely used to leave all 304 tests green -- so the
+    "namespace AND method" claim was unenforced and silently revertible. It is the
+    half of the predicate that catches iX gutting a method while keeping its service,
+    which they have already done to `pool.snapshot.do_update` on master.
+    """
+
+    def test_a_namespace_that_no_longer_defines_delete_is_broken(self):
+        gutted = (
+            "class PoolSnapshotService(CRUDService):\n"
+            "    class Config:\n"
+            "        namespace = 'pool.snapshot'\n"
+            "    def query(self, filters, options):\n        pass\n"
+            # do_delete is GONE -- the service is still registered and still a
+            # CRUDService, so it still INHERITS a callable `delete`.
+        )
+        r = check_files(with_(**{
+            "plugins/pool_/snapshot.py": gutted,
+            "plugins/zfs_/snapshot.py": None,      # no fallback either
+        }))
+        assert is_broken(r[NESTED]), (
+            "a namespace with no delete must be BROKEN. Checking only that the "
+            "namespace exists would apply the patch to a box that cannot sweep its "
+            "own snapshots."
+        )
+
+    def test_the_alternative_still_saves_it_when_only_the_primary_is_gutted(self):
+        gutted = (
+            "class PoolSnapshotService(CRUDService):\n"
+            "    class Config:\n"
+            "        namespace = 'pool.snapshot'\n"
+            "    def query(self, filters, options):\n        pass\n"
+        )
+        r = check_files(with_(**{
+            "plugins/pool_/snapshot.py": gutted,
+            "plugins/zfs_/snapshot.py": ZFS_ERA_SNAPSHOT,
+        }))
+        assert r[NESTED]["ok"], r[NESTED]["problems"]
+
+
+class TestUnreadableIsNeverOkAndNeverBroken:
+    """A rate limit is not a regression, and it is not a clean bill of health either.
+
+    compat runs ~30 unauthenticated GitHub requests per matrix; 429 is a real outcome.
+    It also runs at BOOT against the installed tree, where a read can fail with EACCES.
+
+      * treating unreadable as BROKEN repaints the README, files a bug report, and
+        makes apply.sh refuse the module on a box where it works.
+      * treating it as OK injects a module whose delete may be gone.
+
+    Both mutations used to pass the whole suite.
+    """
+
+    def test_both_spellings_unreadable_is_unknown_not_broken(self):
+        r = check_files(with_(**{
+            "plugins/pool_/snapshot.py": Unreadable("HTTP 429"),
+            "plugins/zfs_/snapshot.py": Unreadable("HTTP 429"),
+        }))
+        assert not is_broken(r[NESTED]), "a 429 is not iX deleting the snapshot service"
+        assert r[NESTED]["unknown"]
+
+    def test_an_unreadable_primary_with_a_healthy_alternative_is_ok(self):
+        r = check_files(with_(**{
+            "plugins/pool_/snapshot.py": Unreadable("HTTP 429"),
+            "plugins/zfs_/snapshot.py": ZFS_ERA_SNAPSHOT,
+        }))
+        assert r[NESTED]["ok"], r[NESTED]["problems"]
+        assert not r[NESTED]["unknown"], (
+            "one spelling answered the question; the other's 429 is irrelevant"
+        )
+
+    def test_a_missing_primary_with_an_unreadable_alternative_is_unknown(self):
+        # We cannot tell whether the box is broken. Saying either would be a guess.
+        r = check_files(with_(**{
+            "plugins/pool_/snapshot.py": None,
+            "plugins/zfs_/snapshot.py": Unreadable("HTTP 429"),
+        }))
+        assert not is_broken(r[NESTED])
+        assert r[NESTED]["unknown"]
+
+
+class TestGetServiceIsChecked:
+    """The runtime resolves the snapshot namespace through `middleware.get_service`.
+
+    It is not a plugin method, so the manifest had no way to express it and never
+    checked it. If it vanishes, `_can_delete` reports BOTH namespaces unusable and
+    every nested backup fails -- on a box the preflight had declared healthy.
+    """
+
+    def test_a_middleware_without_get_service_is_broken(self):
+        r = check_files(with_(**{"utils/plugins.py": None}))
+        assert is_broken(r[NESTED])
+        details = " ".join(p["detail"] for p in r[NESTED]["problems"])
+        assert "get_service" in details
+
+
+class TestATransientNetworkBlipDoesNotWakeAnybody:
+    """The fingerprint must digest what iX BROKE, not what GitHub failed to serve.
+
+    `unknown` problems (a 429 on one of ~30 unauthenticated fetches, an EACCES at boot)
+    used to be folded into an already-broken module's problem list, so one blip flipped
+    the fingerprint, `compat_publish` rewrote the issue body, and the next clean run
+    rewrote it back. Daily churn is what teaches people to ignore the bot -- which is
+    the whole thing this fingerprint exists to prevent.
+    """
+
+    def _rows(self, files):
+        return [{"ref": "master", "modules": check_files(files)}]
+
+    def test_an_unreadable_file_does_not_change_the_fingerprint_of_a_broken_ref(self):
+        # The blip must land in the SAME module that is broken. Put it in `providers`
+        # (which is healthy) and `fingerprint()` skips the whole module via
+        # `is_broken(m)` -- so the `state` filter under test never runs and the test
+        # passes no matter what the code does. `nested` is the broken one here, so the
+        # unreadable file goes in `nested` too.
+        broken = with_(**{
+            "plugins/cloud/snapshot.py":
+                "async def create_snapshot(name, path, middleware):\n    return 1, 2\n",
+        })
+        clean = compat.fingerprint(self._rows(broken))
+
+        blipped = dict(broken)
+        blipped["plugins/cloud_backup/sync.py"] = Unreadable("HTTP 429")   # nested
+        assert compat.fingerprint(self._rows(blipped)) == clean, (
+            "a rate-limited fetch changed the fingerprint, so the bot rewrites the "
+            "issue body and then rewrites it back tomorrow"
+        )
+
+    def test_a_REAL_new_finding_still_changes_it(self):
+        # ...and the anti-noise measure must not have made it deaf.
+        broken = with_(**{
+            "plugins/cloud/snapshot.py":
+                "async def create_snapshot(name, path, middleware):\n    return 1, 2\n",
+        })
+        worse = dict(broken)
+        worse["plugins/cloud_backup/restic.py"] = (
+            "class ResticConfig:\n    cmd: list\n\n"
+            "def get_restic_config(entry, credentials):\n    pass\n"
+        )
+        assert compat.fingerprint(self._rows(worse)) != compat.fingerprint(self._rows(broken))

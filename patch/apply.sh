@@ -535,8 +535,8 @@ if _tc_nested is not None:
         # snapshot=true, not just ours. Two consequences, and the second is worse:
         #
         #   * everything below is a NEW failure mode for tasks that worked before we
-        #     were installed. A `zfs.dataset.query` that errors would break a
-        #     CloudSync job we have no business touching.
+        #     were installed. A `zfs list` that errors would break a CloudSync job
+        #     we have no business touching.
         #   * if a CloudSync task ever were staged, nothing would ever tear it down:
         #     the teardown is wired into cloud_backup's restic_backup finally, and
         #     CRUD_BLOCK deliberately leaves CloudSync's nesting guard intact. The
@@ -556,18 +556,28 @@ if _tc_nested is not None:
             # our staging plan would not -- silently omitting it from the backup.
             # Read afterwards, an unsnapshotted dataset instead trips the isdir()
             # check in plan_staging and fails the run loudly. Loud beats silent.
-            datasets = middleware.call_sync(
-                "zfs.dataset.query", [["type", "=", "FILESYSTEM"]]
-            )
+            # query_filesystems() reads ZFS directly. It deliberately does NOT use
+            # pool.dataset.query: that applies a visibility policy and hides
+            # TrueNAS-internal datasets (ix-apps/*, .system/*, .ix-virt/*) -- 84 of
+            # 270 on a real pool, including live app data. Staging from the filtered
+            # view omits them silently, which is the one thing this must never do.
+            datasets = _tc_nested.query_filesystems(middleware)
             # OUR copy of get_dataset_recursive, not the host module's: TrueNAS 26
             # deleted that helper (create_snapshot uses filesystem.statfs now), so
             # calling it out of the module namespace is a NameError there.
             dataset, nested = _tc_nested.get_dataset_recursive(datasets, path)
 
             if not nested:
-                # No children: stock behaviour, untouched. Stock's `finally` owns
-                # the snapshot from here (its non-recursive delete is correct,
-                # because a non-nested snapshot has no children).
+                # Nothing to STAGE -- but we still own the SWEEP, and that is not a
+                # formality. Stock decides `recursive` by its own rule, and on 26 that
+                # rule is no longer ours: it snapshots recursively whenever the backup
+                # path IS the dataset's mountpoint (filesystem.statfs), while
+                # get_dataset_recursive() sees nothing to stage when the only
+                # descendants are ZVOLs or legacy/none-mountpoint datasets. Stock then
+                # deletes the PARENT ONLY. Without this, one snapshot per descendant is
+                # orphaned on every run, forever, with no sidecar and no GC to find it --
+                # and the backup still reports success.
+                _tc_nested.own_snapshot(middleware, name, snapshot, logger=_logger)
                 return snapshot, snap_path
 
             staging_root = _tc_nested.stage_nested(
@@ -581,7 +591,19 @@ if _tc_nested is not None:
             # stays None and its `finally` deletes NOTHING. Sweep the tree ourselves
             # or leak the parent plus one snapshot per descendant dataset (160+ here)
             # on every failed run.
-            _tc_nested.delete_snapshot_tree(middleware, snapshot, logger=_logger)
+            #
+            # The sweep is itself wrapped: a cleanup that raises would REPLACE the
+            # original exception with its own, hiding why the backup actually failed.
+            # An error handler must not be able to lose the error.
+            try:
+                _tc_nested.delete_snapshot_tree(middleware, snapshot, logger=_logger)
+            except Exception as _tc_sweep_err:
+                if _logger:
+                    _logger.error(
+                        "truecloud-patch: could not sweep %s after a staging failure "
+                        "(%r) -- it is orphaned and must be deleted by hand",
+                        snapshot, _tc_sweep_err,
+                    )
             raise
 
         return snapshot, staging_root

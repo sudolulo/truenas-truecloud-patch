@@ -60,7 +60,7 @@ If something is wrong, the reason is in `apply.log` — start at
 | 24.10.2.4 | ok | ok | — |
 | 25.04.2.6 | ok | ok | — |
 | 25.10.4 | ok | ok | nested + providers; 252-snapshot recursive backup of /mnt/Tap, 18m |
-| 26.0.0-BETA.3 _(unreleased)_ | ok | **BROKEN** | — |
+| 26.0.0-BETA.3 _(unreleased)_ | ok | ok | — |
 | master _(unreleased)_ | **BROKEN** | **BROKEN** | — |
 
 | verdict | meaning |
@@ -76,6 +76,12 @@ source. It does not mean a human ran a backup on it — that is the
 
 The table is **regenerated daily by CI** against iXsystems' actual middleware source
 — it is not a claim somebody typed once and forgot.
+
+**On TrueNAS 26:** the patch was run on a real TrueNAS **26.0.0-BETA.1** install — a
+274-snapshot recursive backup of a 292-dataset pool, followed by a byte-identical
+restore of a four-level-deep child dataset. The *Hardware-verified* column tracks the
+newest beta iX has tagged (currently BETA.3), so it does not carry that mark: a build
+nobody has actually run a backup on does not get credit for one.
 
 **TrueNAS 26: nested snapshots are not supported yet, and upgrading will not break
 you.** 26 rewrites `cloud_backup` and deletes the ZFS methods this module calls. On
