@@ -941,10 +941,15 @@ def is_broken(r: dict) -> bool:
 #: is static analysis of iX's source, which proves the patch's assumptions hold --
 #: a strictly weaker claim than "a restore worked". Add a row only after doing it.
 HARDWARE_VERIFIED = {
-    "25.10.4": "nested + providers; 252-snapshot recursive backup of /mnt/Tap, 18m",
+    "25.10.4": (
+        "v0.7.0: 3 live tasks — 191-dataset nested backup of /mnt/Tap, a "
+        "215-filesystem/2-zvol backup of /mnt/Tank/backups, and a non-nested one; "
+        "0 orphans, 0 leaked mounts, byte-identical restore; the collector also "
+        "reclaimed a real orphan the pool had been carrying"
+    ),
     "26.0.0-BETA.1": (
-        "nested + providers; 274-snapshot recursive backup of a 292-dataset pool, "
-        "restored a 4-deep child dataset byte-identical"
+        "v0.7.0: 274-snapshot recursive backup of a 292-dataset pool; restored a "
+        "4-deep child dataset byte-identical; zvol-orphan case reproduced then closed"
     ),
 }
 

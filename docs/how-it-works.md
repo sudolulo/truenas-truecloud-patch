@@ -187,23 +187,71 @@ backup-breaking**, and none of them is visible from the `cloud_backup` files:
 | `get_dataset_recursive()` **deleted** from `plugins/cloud/snapshot.py` | `NameError` — the injected block called it out of the host module's namespace |
 | `plugins/zfs_/dataset.py` and `zfs_/snapshot.py` **deleted** | `zfs.dataset.query`, `zfs.snapshot.query` and `zfs.snapshot.delete` all vanish. 26 uses `filesystem.statfs` and `zfs.resource.*` |
 
-The first two are fixed: the patch reads which flavour of `cloud_backup` your box
-declares and injects the wrapper that matches (one implementation of the real logic,
-two thin wrappers), and it carries its own copy of the deleted helper.
+All three are fixed as of **v0.7.0**, and 26 is supported.
 
-The third is **not** fixed, and is why 26 reports BROKEN. Porting it means rewriting
-the module's ZFS calls onto 26's new API, and no single API spans 24.10 through 26 —
-so it needs a real 26 box to verify against, not a plausible-looking diff. Shipping a
-port nobody has run is exactly the failure this project exists to avoid.
+The first two were straightforward: the patch reads which flavour of `cloud_backup`
+your box declares and injects the wrapper that matches (one implementation of the real
+logic, two thin wrappers), and it carries its own copy of the deleted helper.
 
-It is also the row that would have hurt most. `zfs.snapshot.delete` is what sweeps the
-recursive snapshot; without it, **every run would orphan one snapshot per descendant
-dataset — 250 on a real pool — forever.** The compatibility check caught it only
-because it now asserts the middleware *methods the patch calls*, not just the symbols
-it wraps.
+The third was not, and it is the one that would have hurt most — `zfs.snapshot.delete`
+is what sweeps the recursive snapshot, and without it **every run would orphan one
+snapshot per descendant dataset (250 on a real pool), forever, while reporting
+success.**
 
-`master` (development after 26) reports BROKEN too: iXsystems are still reshaping
+The obvious port is to the public `pool.dataset.query` / `pool.snapshot.query`. Those
+methods exist, are documented, and are covered by iX's deprecation policy — and they
+are **not like-for-like replacements**. They apply a *visibility policy*: they hide the
+datasets TrueNAS considers its own (`ix-apps/*`, `.system/*`, `.ix-virt/*`). On a real
+pool that is **84 of 270 datasets, including live application data.** Staging from that
+view would have omitted every one of them from the backup — and the planner would never
+have seen them, so they would not have appeared in its "skipped" list either. A green
+backup, quietly missing data. The snapshot query lies the same way, so the sweep would
+have orphaned one snapshot per hidden dataset.
+
+No source analysis could have caught that. The methods are all present and correctly
+shaped. Only running it could, which is why it took a real 26 box.
+
+So the module now follows one rule:
+
+> **Read the truth from ZFS. Make changes through middleware.**
+
+Enumeration is `zfs list` — no policy can filter it, and it behaves identically on every
+release, which also means one code path instead of a version conditional. Mutation stays
+a middleware call, so TrueNAS's own bookkeeping stays consistent; an exact-name delete
+works fine even on a dataset the query hides. It is only enumeration that lies.
+
+The snapshot *delete* still needs a namespace, and no single one spans every release —
+24.10 and 25.04 have `zfs.snapshot`, 26 has only `pool.snapshot`, 25.10 has both. So it
+is resolved at runtime, by asking whether the namespace can actually delete. `tools/compat.py`
+asks the identical question against iX's source, and a test binds the two lists together,
+so what CI verifies and what runs cannot drift apart.
+
+### The one 26 changed that nothing warned about
+
+Stock decides whether to take a **recursive** snapshot by its own rule, and on 26 that
+rule stopped being ours:
+
+| | decides `recursive` by |
+| --- | --- |
+| stock ≤ 25.10 | `get_dataset_recursive()` — the same function this patch vendors |
+| **stock 26** | `filesystem.statfs`: `recursive = (path == the dataset's mountpoint)` |
+| this patch | `get_dataset_recursive()` — is a mounted *filesystem* child under the path? |
+
+Up to 25.10 those were the *same question*, so a snapshot the patch declined to stage
+provably had no children and stock's non-recursive delete was correct. On 26 they
+disagree: a dataset whose only descendants are **zvols** or **legacy-mountpoint**
+datasets gets a recursive snapshot, while the patch sees nothing to stage. Stock then
+destroys the parent only — and with no staging tree there was no sidecar, and the
+garbage collector only ever ran from the staging path. Nothing on the box would ever
+have found the children.
+
+It was reproduced on a 26 VM (one orphan per zvol, every run, backup green) and closed:
+**ownership of the sweep is no longer conditional on staging.**
+
+`master` (development after 26) **does** report BROKEN: iXsystems are still reshaping
 these functions there, renaming `middleware` → `context` and `cloud_backup` → `entry`
 and adding a required `credentials` parameter. That is a moving target and is
 deliberately not chased; the check keeps reporting it until it settles into a beta,
-which is when it becomes worth fixing.
+which is when it becomes worth fixing. Until then, a box running master would simply
+not get the modules — `apply.sh` refuses to apply a module whose assumptions no longer
+hold, and says why in `apply.log`.

@@ -59,7 +59,7 @@ If something is wrong, the reason is in `apply.log` — start at
 | --- | --- | --- | --- |
 | 24.10.2.4 | ok | ok | — |
 | 25.04.2.6 | ok | ok | — |
-| 25.10.4 | ok | ok | nested + providers; 252-snapshot recursive backup of /mnt/Tap, 18m |
+| 25.10.4 | ok | ok | v0.7.0: 3 live tasks — 191-dataset nested backup of /mnt/Tap, a 215-filesystem/2-zvol backup of /mnt/Tank/backups, and a non-nested one; 0 orphans, 0 leaked mounts, byte-identical restore; the collector also reclaimed a real orphan the pool had been carrying |
 | 26.0.0-BETA.3 _(unreleased)_ | ok | ok | — |
 | master _(unreleased)_ | **BROKEN** | **BROKEN** | — |
 
@@ -77,18 +77,29 @@ source. It does not mean a human ran a backup on it — that is the
 The table is **regenerated daily by CI** against iXsystems' actual middleware source
 — it is not a claim somebody typed once and forgot.
 
-**On TrueNAS 26:** the patch was run on a real TrueNAS **26.0.0-BETA.1** install — a
-274-snapshot recursive backup of a 292-dataset pool, followed by a byte-identical
-restore of a four-level-deep child dataset. The *Hardware-verified* column tracks the
-newest beta iX has tagged (currently BETA.3), so it does not carry that mark: a build
-nobody has actually run a backup on does not get credit for one.
+It is also **static analysis**: it proves the patch's assumptions still hold, which is
+a weaker claim than "a backup ran and a restore came back". For what has actually been
+run — which tasks, on which hardware, and the md5 of the file that came back — see
+[docs/verification.md](docs/verification.md).
 
-**TrueNAS 26: nested snapshots are not supported yet, and upgrading will not break
-you.** 26 rewrites `cloud_backup` and deletes the ZFS methods this module calls. On
-26 `apply.sh` finds that the assumptions no longer hold and **does not apply the
-module**: TrueNAS is left stock, B2/S3 keeps working, nested datasets are simply not
-covered, and the reason is named in `apply.log`. A broken backup is worse than a
-missing feature. Details: [How it works](docs/how-it-works.md#truenas-26).
+**TrueNAS 26 is supported** as of v0.7.0, and was verified on a real
+**26.0.0-BETA.1** install: a 274-snapshot recursive backup of a 292-dataset pool, and a
+byte-identical restore of a four-level-deep child dataset. The *Hardware-verified*
+column tracks the newest beta iX has tagged (currently BETA.3), so it does not carry
+that mark — a build nobody has actually run a backup on does not get credit for one.
+
+26 rewrites `cloud_backup` from async to synchronous and deletes the private ZFS
+methods this module used to call, so getting there took real work: the patch now
+injects the wrapper flavour that matches the installed middleware, reads dataset and
+snapshot lists **from ZFS rather than middleware** (whose queries hide TrueNAS's own
+datasets — 84 of 270 on a real pool, including live app data), and owns the snapshot
+sweep even when it stages nothing (26 decides `recursive` by a rule this patch does not
+share, and would otherwise orphan one snapshot per zvol on every run).
+
+**And if a future TrueNAS breaks it, you get a missing feature, not a broken backup.**
+`apply.sh` re-checks the patch's assumptions at every boot and **refuses to apply a
+module whose assumptions no longer hold** — TrueNAS is left stock, and the reason is
+named in `apply.log`. Details: [How it works](docs/how-it-works.md#truenas-26).
 
 ---
 
