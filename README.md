@@ -1,5 +1,7 @@
 # truenas-truecloud-patch
 
+[![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-%E2%9D%A4-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/sudolulo) [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-FF5E5B?logo=kofi&logoColor=white)](https://ko-fi.com/sudolulo)
+
 Extends TrueNAS SCALE's **TrueCloud Backup** to:
 
 - back up to **Backblaze B2 and any S3-compatible provider**, not just Storj;
