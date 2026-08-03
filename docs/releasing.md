@@ -25,7 +25,7 @@ are worth calling out, because nothing else would catch what they catch:
   newest CHANGELOG entry. `VERSION=` had silently drifted to three different
   values across the scripts before anything checked.
 
-The project is hosted on **Gitea** (`git.onetick.ninja/flan/truenas-truecloud-patch`)
+The project is hosted on **Gitea** (`git.arch.fyi/flan/truenas-truecloud-patch`)
 and mirrored to GitHub. Both run the same workflows — Gitea reads
 `.github/workflows/` too — so a change is checked twice, on two independent runners.
 

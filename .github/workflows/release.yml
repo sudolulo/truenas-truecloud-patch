@@ -124,7 +124,7 @@ jobs:
           echo "--- release body ---"
           cat /tmp/notes.md
 
-      # This repo is canonically hosted on Gitea (git.onetick.ninja) and mirrored to
+      # This repo is canonically hosted on Gitea (git.arch.fyi) and mirrored to
       # GitHub, and BOTH run this workflow -- Gitea reads .github/workflows too. So
       # the publish step has to work on whichever forge it lands on. Everything
       # above is forge-agnostic; only the "create a release" API differs.

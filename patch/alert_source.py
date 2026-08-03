@@ -47,8 +47,8 @@ _VERSION_RE = re.compile(r'^VERSION="([^"]+)"', re.M)
 #: owner/repo out of any of:
 #:   git@github.com:sudolulo/repo.git
 #:   https://github.com/sudolulo/repo.git
-#:   ssh://git@git.onetick.ninja:55214/flan/repo.git
-#:   https://git.onetick.ninja/flan/repo.git
+#:   ssh://git@git.arch.fyi:55214/flan/repo.git
+#:   https://git.arch.fyi/flan/repo.git
 #: The SSH port is deliberately not captured: it is not the web port.
 _REMOTE_RE = re.compile(
     r"^(?:\w+://)?(?:[^@/]+@)?([^:/]+)(?::\d+)?[:/]([^/]+)/([^/]+?)(?:\.git)?/?$"
