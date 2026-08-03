@@ -9,6 +9,15 @@ worse than no alert, because one day it carries a security fix.
 ## Unreleased
 ### Changed
 
+- **CI's python matrix now uses uv-managed interpreters instead of
+  `actions/setup-python`**, which failed at environment setup on the self-hosted
+  Gitea runner (GitHub Actions was unaffected — same file, both green now). Ruff is
+  pinned to 0.16.1 in the same job so an upstream ruff release can't turn `main`
+  red without a code change.
+- **README badges point at the public GitHub mirror** (workflow status and
+  releases) instead of the private forge. The release badge had also been reading
+  the stale Gitea v0.6.1 release instead of the current v0.7.0 on GitHub.
+
 - **`master` is now labelled `27-dev`, because it is not the next release.** iX
   branches each major onto its own `release/` line and master rolls straight on to the
   one after — on 2026-07-14 every recent commit on master targeted `27.0.0-BETA.1`
