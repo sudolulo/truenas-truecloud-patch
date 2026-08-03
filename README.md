@@ -238,3 +238,8 @@ and restores the original UI bundle from backup.
 
 Parts of this project were written with AI assistance (Claude); all of it is reviewed
 and tested before release. Bugs are mine.
+
+## Support
+
+If truenas-truecloud-patch is useful to you, consider supporting development via
+[GitHub Sponsors](https://github.com/sponsors/sudolulo) or [Ko-fi](https://ko-fi.com/sudolulo).
