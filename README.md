@@ -1,7 +1,5 @@
 # truenas-truecloud-patch
 
-[![TrueNAS compatibility](https://github.com/sudolulo/truenas-truecloud-patch/actions/workflows/compat.yml/badge.svg?branch=main)](https://github.com/sudolulo/truenas-truecloud-patch/actions) [![release](https://img.shields.io/github/v/release/sudolulo/truenas-truecloud-patch?logo=github)](https://github.com/sudolulo/truenas-truecloud-patch/releases) [![License: MIT](https://img.shields.io/badge/License-MIT-blue)](LICENSE) [![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-%E2%9D%A4-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/sudolulo) [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-FF5E5B?logo=kofi&logoColor=white)](https://ko-fi.com/sudolulo)
-
 Extends TrueNAS SCALE's **TrueCloud Backup** to:
 
 - back up to **Backblaze B2 and any S3-compatible provider**, not just Storj;
@@ -237,9 +235,6 @@ and restores the original UI bundle from backup.
   works](docs/nested-snapshots.md#verifying-it-works).
 - Filing a TrueNAS bug? **Remove the patch first** and reproduce on a stock system.
 - Provided as-is, no warranty. See LICENSE.
-
-Parts of this project were written with AI assistance (Claude); all of it is reviewed
-and tested before release. Bugs are mine.
 
 ## Support
 
