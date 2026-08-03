@@ -1914,6 +1914,9 @@ class TestTheSnapshotRecordIsNeverLostToAnUnreadableFile:
     only record of a tree it had just failed to read.
     """
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason=
+        "chmod(0) cannot make a file unreadable for root (CAP_DAC_OVERRIDE); "
+        "the Gitea runner image executes jobs as root")
     def test_an_unreadable_sidecar_raises_rather_than_reading_as_empty(self, tmp_path):
         sc = tmp_path / "cloud_backup-5.snapshot"
         sc.write_text("Tap@snap\n")
@@ -1927,6 +1930,9 @@ class TestTheSnapshotRecordIsNeverLostToAnUnreadableFile:
     def test_a_missing_sidecar_is_simply_empty(self, tmp_path):
         assert tn._read_sidecar(str(tmp_path / "nope")) == []
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason=
+        "chmod(0) cannot make a file unreadable for root (CAP_DAC_OVERRIDE); "
+        "the Gitea runner image executes jobs as root")
     def test_cleanup_all_still_UNMOUNTS_when_a_sidecar_cannot_be_read(self, tmp_path):
         # cleanup_all is what recover.sh and uninstall.sh call, i.e. it runs precisely
         # when the box is already stuck. Its job is to get the mounts off. Aborting on

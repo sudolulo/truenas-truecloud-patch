@@ -9,11 +9,14 @@ worse than no alert, because one day it carries a security fix.
 ## Unreleased
 ### Changed
 
-- **CI's python matrix now uses uv-managed interpreters instead of
-  `actions/setup-python`**, which failed at environment setup on the self-hosted
-  Gitea runner (GitHub Actions was unaffected — same file, both green now). Ruff is
-  pinned to 0.16.1 in the same job so an upstream ruff release can't turn `main`
-  red without a code change.
+- **CI's python matrix is green on the self-hosted Gitea runner again.** The real
+  failure was that the Gitea runner image executes jobs as root, and the two
+  unreadable-sidecar tests build their scenario with `chmod(0)` — which cannot make
+  a file unreadable for root (`CAP_DAC_OVERRIDE`). Those two tests now skip as root
+  with that reason; GitHub's non-root runner still exercises them. The matrix also
+  moved to uv-managed interpreters (one toolchain across both runners) and ruff is
+  pinned to 0.16.1 so an upstream ruff release can't turn `main` red without a code
+  change.
 - **README badges point at the public GitHub mirror** (workflow status and
   releases) instead of the private forge. The release badge had also been reading
   the stale Gitea v0.6.1 release instead of the current v0.7.0 on GitHub.
