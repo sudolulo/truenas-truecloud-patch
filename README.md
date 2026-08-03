@@ -1,6 +1,6 @@
 # truenas-truecloud-patch
 
-[![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-%E2%9D%A4-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/sudolulo) [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-FF5E5B?logo=kofi&logoColor=white)](https://ko-fi.com/sudolulo)
+[![compat](https://git.onetick.ninja/flan/truenas-truecloud-patch/actions/workflows/compat.yml/badge.svg?branch=main)](https://git.onetick.ninja/flan/truenas-truecloud-patch/actions) [![release](https://img.shields.io/gitea/v/release/flan/truenas-truecloud-patch?gitea_url=https%3A%2F%2Fgit.onetick.ninja&logo=gitea&logoColor=white)](https://git.onetick.ninja/flan/truenas-truecloud-patch/releases) [![License: MIT](https://img.shields.io/badge/License-MIT-blue)](LICENSE) [![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-%E2%9D%A4-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/sudolulo) [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-FF5E5B?logo=kofi&logoColor=white)](https://ko-fi.com/sudolulo)
 
 Extends TrueNAS SCALE's **TrueCloud Backup** to:
 
