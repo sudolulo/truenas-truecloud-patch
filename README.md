@@ -1,5 +1,7 @@
 # truenas-truecloud-patch
 
+[![CI](https://git.arch.fyi/flan/truenas-truecloud-patch/actions/workflows/ci.yml/badge.svg)](https://git.arch.fyi/flan/truenas-truecloud-patch/actions)
+
 Extends TrueNAS SCALE's **TrueCloud Backup** to:
 
 - back up to **Backblaze B2 and any S3-compatible provider**, not just Storj;
