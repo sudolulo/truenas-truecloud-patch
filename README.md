@@ -61,9 +61,9 @@ If something is wrong, the reason is in `apply.log` — start at
 | --- | --- | --- | --- |
 | 24.10.2.4 | ok | ok | — |
 | 25.04.2.6 | ok | ok | — |
-| 25.10.4 | ok | ok | v0.7.0: 3 live tasks — 191-dataset nested backup of /mnt/Tap, a 215-filesystem/2-zvol backup of /mnt/Tank/backups, and a non-nested one; 0 orphans, 0 leaked mounts, byte-identical restore; the collector also reclaimed a real orphan the pool had been carrying |
+| 25.10.5 | ok | ok | — |
 | 24.10.2.5 _(unreleased)_ | ok | ok | — |
-| 25.10.5 _(unreleased)_ | ok | ok | — |
+| 25.10.6 _(unreleased)_ | ok | ok | — |
 | 26.0.0-BETA.3 _(unreleased)_ | ok | ok | — |
 | master _(27-dev)_ | **BROKEN** | **BROKEN** | — |
 
