@@ -61,9 +61,9 @@ If something is wrong, the reason is in `apply.log` — start at
 | --- | --- | --- | --- |
 | 24.10.2.4 | ok | ok | — |
 | 25.04.2.6 | ok | ok | — |
-| 25.10.5 | ok | ok | — |
+| 25.10.6 | ok | ok | — |
 | 24.10.2.5 _(unreleased)_ | ok | ok | — |
-| 25.10.6 _(unreleased)_ | ok | ok | — |
+| 25.10.7 _(unreleased)_ | ok | ok | — |
 | 26.0.0-BETA.3 _(unreleased)_ | ok | ok | — |
 | master _(27-dev)_ | **BROKEN** | **BROKEN** | — |
 
