@@ -47,7 +47,29 @@ jobs:
       # download path setup-python relies on does not work on the self-hosted Gitea
       # runner (all three matrix jobs failed at setup there while passing on GitHub);
       # uv works identically on both.
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      #
+      # Installed by a plain `run:` step rather than astral-sh/setup-uv, because
+      # act -- the engine behind the Gitea runner -- caches each ACTION as a single
+      # shared git clone under /root/.cache/act/<hash> and re-pulls it per job. The
+      # three matrix jobs start within the same second on one runner, so they race
+      # on that directory and whichever loses dies with
+      #
+      #   lstat /root/.cache/act/<hash>/.npmrc: no such file or directory
+      #
+      # before a single test runs -- a red `main` with zero suite output, and a
+      # different victim each time (3.12 on one push, 3.11 on the next). A `run:`
+      # step has no action-cache entry, so it cannot race. Serialising the matrix
+      # would have been the other option; it costs 3x the wall clock and still
+      # leaves actions/checkout sharing a cache across the four jobs.
+      #
+      # Pinned for the same reason ruff is pinned below: an unpinned uv means any
+      # upstream release can turn main red with no code change here.
+      - name: install uv
+        env:
+          UV_VERSION: "0.11.21"
+        run: |
+          curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: ruff
         # Pinned: an unpinned ruff means any upstream release can turn main red

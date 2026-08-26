@@ -39,6 +39,24 @@ worse than no alert, because one day it carries a security fix.
 
 ### Fixed
 
+- **CI turned `main` red on two of three pushes without running a single test.**
+  `act`, the engine behind the self-hosted Gitea runner, caches each *action* as
+  one shared git clone under `/root/.cache/act/<hash>` and re-pulls it per job.
+  The three matrix jobs start within the same second on one runner, so they race
+  on that directory and whichever loses dies with `lstat
+  /root/.cache/act/<hash>/.npmrc: no such file or directory` — before any suite
+  output exists, with a different victim each push (3.12 on one, 3.11 on the
+  next). A red gate that is usually noise is worse than no gate, because the one
+  time it means something nobody looks.
+
+  `uv` is now installed by a plain `run:` step instead of `astral-sh/setup-uv`.
+  A `run:` step has no action-cache entry and cannot race, and the action was
+  only ever fetching a binary — the matrix interpreter is chosen per command by
+  `uvx --python`, not by the action. Serialising the matrix was the alternative;
+  it costs 3x the wall clock and still leaves `actions/checkout` shared across
+  the four jobs. The uv version is pinned under the same rule as ruff: an
+  unpinned tool lets an upstream release turn `main` red with no change here.
+
 - **The patch survived being applied and then silently stopped existing, because
   something else remounted `/usr` four seconds later.** On a box running
   TrueNAS 25.10.6 the boot of 2026-08-19 went: 16:41:56 `apply.sh` mounts its
