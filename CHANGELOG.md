@@ -63,10 +63,20 @@ worse than no alert, because one day it carries a security fix.
   So the deferred restart no longer trusts the PREINIT pass. `wait_restart.sh`
   now re-applies immediately before it restarts middlewared — after boot has
   settled, which is also after every sysext merge and docker nvidia
-  configuration — verifies the marker is genuinely on the live path, restarts,
-  and verifies again, retrying once if the patch was torn off in between. It is
-  no longer `exec systemctl try-restart middlewared`, because something has to
-  run afterwards to find out what that restart actually loaded.
+  configuration — and verifies the marker is genuinely on the live path before
+  restarting. It is no longer `exec systemctl try-restart middlewared`, because
+  something has to run afterwards.
+
+  What runs afterwards deliberately does **not** restart again. `try-restart`
+  returns as soon as middlewared is READY, and middlewared then brings docker up
+  — `docker.configure_nvidia` merges the stock nvidia sysext over `/usr` at that
+  point, detaching the overlay *after* the patched modules have already been
+  imported. A disk check there reports "missing" on a perfectly healthy system,
+  and restarting on that signal would restart a correctly-patched middlewared
+  straight back into the same race. So the overlay is re-mounted for the benefit
+  of the next restart, and the question of whether *this* middlewared actually
+  holds the patch is left to the one thing that can answer it exactly — the
+  in-process alert below.
 
   Two supporting fixes fell out of the same failure. `_ensure_writable` treated
   "one of our overlays is listed on this directory" as "already done" — but it

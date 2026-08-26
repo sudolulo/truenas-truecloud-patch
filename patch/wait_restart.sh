@@ -121,23 +121,29 @@ fi
 # 5. The restart itself.
 systemctl try-restart middlewared
 
-# 6. Verify what the restart actually loaded, and retry once if the patch was
-#    torn off in the window between the re-apply and the restart. A silent
-#    "on disk but never loaded" is the exact failure this whole script exists
-#    to prevent, so it must never pass unreported.
+# 6. Record what the restart landed on -- but do NOT restart again on a miss.
+#
+# `try-restart` returns as soon as middlewared is READY; it then brings docker
+# up asynchronously, and `docker.configure_nvidia` merges the stock nvidia
+# sysext over /usr at that point. That detaches our overlay AFTER the new
+# middlewared has already imported the patched modules -- so a disk check here
+# can report "missing" on a perfectly healthy system. Restarting on that signal
+# would restart a correctly-patched middlewared and then hit the same race
+# again, so the disk is deliberately not treated as a verdict after the restart.
+#
+# The authoritative answer is whether the running process holds the patch, and
+# only middlewared can answer that. The alert source installed by apply.sh
+# checks exactly that, in-process and hourly, and is what reports a genuine
+# miss. What is still worth doing here is putting the overlay back, so the next
+# middlewared restart -- whenever and whyever it happens -- finds patched files.
 if _patch_visible; then
     _log "OK: providers patch present on the live path across the restart"
 else
-    _log "patch missing again after the restart — one more re-apply and restart"
+    _log "overlay detached again after the restart (expected when docker's"
+    _log "nvidia sysext merge follows it) -- re-mounting for the next restart."
+    _log "Whether THIS middlewared loaded the patch is answered in-process by"
+    _log "the 'installed but NOT loaded' alert, not by this check."
     TRUECLOUD_REAPPLY=1 /bin/bash "$PATCH_DIR/patch/apply.sh"
-    systemctl try-restart middlewared
-    if _patch_visible; then
-        _log "OK: providers patch loaded after the second attempt"
-    else
-        _log "ERROR: the patch could not be kept on the live path. TrueNAS is"
-        _log "ERROR: running STOCK cloud_backup — B2/S3 backup tasks will fail."
-        _log "ERROR: middlewared raises the 'not loaded' alert for this."
-    fi
 fi
 
 _log "=== deferred restart complete ==="

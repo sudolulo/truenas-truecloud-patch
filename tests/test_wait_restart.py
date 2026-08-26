@@ -58,6 +58,20 @@ def test_restart_is_not_exec_so_verification_can_follow():
     assert not re.search(r"^\s*exec\s+systemctl", src, re.M)
 
 
+def test_middlewared_is_restarted_exactly_once():
+    """No restart loop.
+
+    `try-restart` returns at READY; middlewared then brings docker up, and
+    docker.configure_nvidia merges the nvidia sysext over /usr right about then
+    -- detaching the overlay AFTER the patched modules are already imported. A
+    disk check after the restart therefore false-negatives on a healthy system,
+    and restarting on that signal would restart a correctly-patched middlewared
+    straight back into the same race.
+    """
+    src = wait_restart_source()
+    assert src.count("systemctl try-restart middlewared") == 1
+
+
 def test_patch_is_verified_after_the_restart():
     src = wait_restart_source()
     restart = src.index("systemctl try-restart middlewared")
