@@ -39,23 +39,33 @@ worse than no alert, because one day it carries a security fix.
 
 ### Fixed
 
-- **CI turned `main` red on two of three pushes without running a single test.**
-  `act`, the engine behind the self-hosted Gitea runner, caches each *action* as
-  one shared git clone under `/root/.cache/act/<hash>` and re-pulls it per job.
-  The three matrix jobs start within the same second on one runner, so they race
-  on that directory and whichever loses dies with `lstat
-  /root/.cache/act/<hash>/.npmrc: no such file or directory` — before any suite
-  output exists, with a different victim each push (3.12 on one, 3.11 on the
-  next). A red gate that is usually noise is worse than no gate, because the one
-  time it means something nobody looks.
+- **CI turned `main` red on two of three pushes without running a single test,
+  then stopped running at all.** Two failures, one cause: four concurrent jobs on
+  one self-hosted runner.
 
-  `uv` is now installed by a plain `run:` step instead of `astral-sh/setup-uv`.
-  A `run:` step has no action-cache entry and cannot race, and the action was
-  only ever fetching a binary — the matrix interpreter is chosen per command by
-  `uvx --python`, not by the action. Serialising the matrix was the alternative;
-  it costs 3x the wall clock and still leaves `actions/checkout` shared across
-  the four jobs. The uv version is pinned under the same rule as ruff: an
-  unpinned tool lets an upstream release turn `main` red with no change here.
+  `act`, the engine behind the Gitea runner, caches each *action* as one shared
+  git clone under `/root/.cache/act/<hash>` and re-pulls it per job. Jobs
+  starting in the same second fight over that directory, and the loser dies with
+  `lstat /root/.cache/act/<hash>/.npmrc: no such file or directory` — before any
+  suite output exists, with a different victim each push (3.12 on one, 3.11 on
+  the next). Separately, the runner force-pulls its base image per job, so four
+  jobs meant four anonymous Docker Hub pulls per push; a few pushes and re-runs
+  in one afternoon hit `429 Too Many Requests` and *every* job began failing
+  before it started — including the shell job, which nothing had touched.
+
+  CI is now a single job. Dropping one action (uv is installed by a `run:` step
+  rather than `astral-sh/setup-uv`, which was only ever fetching a binary) only
+  shrank the surface, because every job still used `actions/checkout`.
+  Concurrency is the actual ingredient, so removing it removes the whole class:
+  one job cannot race itself whatever actions it uses, and one job is one pull.
+  The Python sweep moved inside that job and still runs every version after one
+  fails — that is what `fail-fast: false` bought, and losing it would mean a 3.11
+  break hides whether 3.12 and 3.13 are fine. The cost is wall-clock
+  parallelism, which this repo does not need: the suite is ~1.5s, so container
+  start and interpreter downloads dominate either way.
+
+  A red gate that is usually noise is worse than no gate, because the one time
+  it means something, nobody looks.
 
 - **The patch survived being applied and then silently stopped existing, because
   something else remounted `/usr` four seconds later.** On a box running

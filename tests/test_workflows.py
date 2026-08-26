@@ -175,14 +175,55 @@ class TestCompatCannotSilentlyPass:
 
 
 class TestActionCacheRace:
-    """act caches each ACTION as one shared clone and re-pulls it per job.
+    """CI must not run concurrent jobs on the self-hosted runner.
 
-    Matrix jobs start within the same second on the self-hosted Gitea runner, so
-    they race on `/root/.cache/act/<hash>` and the loser dies with `lstat
-    .../<file>: no such file or directory` before any test runs -- a red `main`
-    with zero suite output and a different victim each push. Fewer actions in a
-    fan-out job means fewer directories to race on.
+    `act` caches each ACTION as one shared clone under /root/.cache/act/<hash>
+    and re-pulls it per job, so jobs starting together fight over that directory
+    and the loser dies with `lstat .../<file>: no such file or directory` before
+    any test runs -- a red `main` with zero suite output and a different victim
+    each push. The runner also force-pulls its base image per job, so job count
+    is also Docker Hub pull count, and four-per-push exhausted the anonymous
+    limit in an afternoon. Both problems have the same cure: one job.
     """
+
+    def _ci(self):
+        with open(os.path.join(WORKFLOWS, "ci.yml"), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_ci_runs_as_exactly_one_job(self):
+        """The fix is the absence of concurrency, not the absence of one action.
+
+        Dropping astral-sh/setup-uv only shrank the surface -- every job still
+        used actions/checkout. A single job cannot race itself whatever actions
+        it uses, which is why this, and not the action count, is the invariant.
+        """
+        ci = self._ci()
+        # Scope to the jobs: block -- `on:` has two-space keys of its own
+        # (push/pull_request/workflow_dispatch) that look identical otherwise.
+        body = ci[ci.index("\njobs:"):]
+        jobs = re.findall(r"^  (\w[\w-]*):$", body, re.M)
+        assert len(jobs) == 1, (
+            f"ci.yml defines {len(jobs)} jobs ({jobs}); concurrent jobs on the "
+            "self-hosted runner race on act's shared action cache and multiply "
+            "Docker Hub pulls. Keep CI to one job."
+        )
+
+    def test_no_matrix_reintroduces_parallel_jobs(self):
+        ci = self._ci()
+        assert "strategy:" not in ci and "matrix:" not in ci, (
+            "a matrix fans out into concurrent jobs again -- sweep versions "
+            "inside one job instead"
+        )
+
+    def test_every_python_version_still_runs_after_one_fails(self):
+        """`fail-fast: false` is what the loop has to preserve.
+
+        A 3.11 break must not hide whether 3.12 and 3.13 are fine; that is
+        precisely the information you want at that moment.
+        """
+        ci = self._ci()
+        assert 'PYTHONS: "3.11 3.12 3.13"' in ci
+        assert ci.count("fail=1") >= 2, "the sweeps must collect failures, not exit early"
 
     def test_uv_is_installed_without_an_action(self):
         """Checks `uses:` directives, not prose.
@@ -194,21 +235,18 @@ class TestActionCacheRace:
         environment holds pytest and nothing else, so a third-party import here
         fails on the runner while passing locally.
         """
-        with open(os.path.join(WORKFLOWS, "ci.yml"), encoding="utf-8") as fh:
-            ci = fh.read()
+        ci = self._ci()
         used = re.findall(r"^\s*-?\s*uses:\s*(\S+)", ci, re.M)
         assert not [u for u in used if "setup-uv" in u], (
-            "installing uv via an action reintroduces the act action-cache race "
-            "that turned main red on two of three pushes; install it in a run: step"
+            "the action was only fetching a binary; a run: step does the same "
+            "with one less moving part"
         )
         assert "astral.sh/uv/" in ci
 
     def test_the_uv_version_is_pinned(self):
-        with open(os.path.join(WORKFLOWS, "ci.yml"), encoding="utf-8") as fh:
-            ci = fh.read()
+        ci = self._ci()
         assert re.search(r'UV_VERSION:\s*"\d+\.\d+\.\d+"', ci), (
             "an unpinned uv lets any upstream release turn main red with no "
             "code change here -- the same rule ruff is pinned under"
         )
-        # The version must be used, not just declared.
-        assert 'https://astral.sh/uv/${UV_VERSION}/install.sh' in ci
+        assert "https://astral.sh/uv/${UV_VERSION}/install.sh" in ci

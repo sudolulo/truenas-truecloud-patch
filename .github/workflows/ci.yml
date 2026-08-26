@@ -9,9 +9,31 @@ on:
 permissions:
   contents: read
 
+# ONE job, deliberately. This was four (shell + a 3-way python matrix) and they
+# started within the same second on the self-hosted Gitea runner, which is what
+# made CI unreliable in two separate ways:
+#
+#   1. The act action-cache race. `act` caches each ACTION as a single shared git
+#      clone under /root/.cache/act/<hash> and re-pulls it per job, so concurrent
+#      jobs using the same action fight over that directory and the loser dies
+#      with `lstat /root/.cache/act/<hash>/<file>: no such file or directory` --
+#      a red `main` with zero suite output, and a different victim each push
+#      (3.12 on one, 3.11 on the next). Dropping one action only shrank the
+#      surface: every job still used actions/checkout. Concurrency is the actual
+#      ingredient, so removing it removes the whole class -- a single job cannot
+#      race itself, no matter which actions it uses.
+#
+#   2. Docker Hub 429s. The runner force-pulls its base image per job, so four
+#      jobs meant four anonymous pulls per push. A few pushes and re-runs in an
+#      afternoon exhausted the anonymous limit and every job failed before it
+#      started -- including the shell job, which nothing had touched. One job is
+#      one pull.
+#
+# The cost is wall-clock parallelism, and this repo does not need it: the suite
+# is ~1.5s, so container start and interpreter downloads dominate either way.
 jobs:
-  shell:
-    name: shell (shellcheck + syntax)
+  ci:
+    name: ci (shell + python 3.11-3.13)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,36 +53,15 @@ jobs:
         env:
           SHELLCHECK_OPTS: -S warning -e SC1091
 
-  python:
-    name: python ${{ matrix.python }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # TrueNAS SCALE middleware runs 3.11+; keep the patch importable across
-        # the versions it may be injected into.
-        python: ["3.11", "3.12", "3.13"]
-    steps:
-      - uses: actions/checkout@v4
-
       # uv-managed interpreters instead of actions/setup-python: the prebuilt-CPython
       # download path setup-python relies on does not work on the self-hosted Gitea
       # runner (all three matrix jobs failed at setup there while passing on GitHub);
       # uv works identically on both.
       #
-      # Installed by a plain `run:` step rather than astral-sh/setup-uv, because
-      # act -- the engine behind the Gitea runner -- caches each ACTION as a single
-      # shared git clone under /root/.cache/act/<hash> and re-pulls it per job. The
-      # three matrix jobs start within the same second on one runner, so they race
-      # on that directory and whichever loses dies with
-      #
-      #   lstat /root/.cache/act/<hash>/.npmrc: no such file or directory
-      #
-      # before a single test runs -- a red `main` with zero suite output, and a
-      # different victim each time (3.12 on one push, 3.11 on the next). A `run:`
-      # step has no action-cache entry, so it cannot race. Serialising the matrix
-      # would have been the other option; it costs 3x the wall clock and still
-      # leaves actions/checkout sharing a cache across the four jobs.
+      # Installed by a plain `run:` step rather than astral-sh/setup-uv: one fewer
+      # action is one fewer thing to go wrong, and the action was only ever
+      # fetching a binary -- the interpreter is chosen per command by `uvx
+      # --python`, never by the action.
       #
       # Pinned for the same reason ruff is pinned below: an unpinned uv means any
       # upstream release can turn main red with no code change here.
@@ -76,10 +77,33 @@ jobs:
         # with no code change.
         run: uvx ruff@0.16.1 check patch tests tools
 
+      # TrueNAS SCALE middleware runs 3.11+; keep the patch importable across the
+      # versions it may be injected into. Every version runs even after one
+      # fails -- that is what `fail-fast: false` bought when this was a matrix,
+      # and losing it would mean a 3.11 break hides whether 3.12 and 3.13 are
+      # fine, which is exactly the information you want at that moment.
       - name: pytest
-        run: uvx --python ${{ matrix.python }} pytest tests -v
+        env:
+          PYTHONS: "3.11 3.12 3.13"
+        run: |
+          fail=0
+          for v in $PYTHONS; do
+            echo "::group::pytest on python $v"
+            uvx --python "$v" pytest tests -v \
+              || { echo "::error::suite failed on python $v"; fail=1; }
+            echo "::endgroup::"
+          done
+          exit $fail
 
       - name: verify injected middleware blocks compile
         # Belt-and-braces: the *_BLOCK strings are appended into live middlewared
         # modules. A syntax error there would break the box at boot.
-        run: uvx --python ${{ matrix.python }} pytest tests/test_apply_blocks.py -v
+        env:
+          PYTHONS: "3.11 3.12 3.13"
+        run: |
+          fail=0
+          for v in $PYTHONS; do
+            uvx --python "$v" pytest tests/test_apply_blocks.py -v \
+              || { echo "::error::injected blocks failed to compile on python $v"; fail=1; }
+          done
+          exit $fail
