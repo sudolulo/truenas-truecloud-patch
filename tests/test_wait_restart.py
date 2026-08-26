@@ -172,3 +172,28 @@ def test_mount_retries_on_a_private_workdir():
     body = src[start:end]
     assert body.count("mount -t overlay") == 2, "expected a retry mount"
     assert 'work="/run/truecloud-${tag}-work.$$"' in body
+
+
+def test_post_restart_remount_preserves_the_patched_at_stamp():
+    """create_task.py verify compares middlewared's start time to patched_at.
+
+    The post-restart re-mount restores the same patch the boot pass applied, so
+    letting apply.sh re-stamp would make patched_at newer than the process that
+    correctly imported it -- verify would then report FAIL forever on every boot
+    where docker's sysext merge detaches the overlay.
+    """
+    src = wait_restart_source()
+    tail = src[src.index("systemctl try-restart middlewared"):]
+    assert "hook_status.json" in tail
+    save = tail.index("/run/truecloud-hook_status.pre")
+    reapply = tail.index("TRUECLOUD_REAPPLY=1")
+    restore = tail.rindex("hook_status.json")
+    assert save < reapply < restore, "snapshot must bracket the re-apply"
+
+
+def test_status_snapshot_is_not_written_into_the_repo():
+    """A leftover file in the repo dir leaves the tree dirty, and update.sh
+    refuses to run over a dirty tree -- that once made the patch un-updatable."""
+    src = wait_restart_source()
+    assert "/run/truecloud-hook_status.pre" in src
+    assert '"$PATCH_DIR/hook_status.json.pre' not in src

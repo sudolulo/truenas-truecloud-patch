@@ -143,7 +143,26 @@ else
     _log "nvidia sysext merge follows it) -- re-mounting for the next restart."
     _log "Whether THIS middlewared loaded the patch is answered in-process by"
     _log "the 'installed but NOT loaded' alert, not by this check."
+
+    # Preserve hook_status.json's patched_at across this re-mount.
+    #
+    # create_task.py verify decides "loaded" by comparing middlewared's start
+    # time against patched_at. This re-apply restores the SAME patch the boot
+    # pass already applied, but it runs *after* the restart -- so letting it
+    # re-stamp would make patched_at newer than the process that correctly
+    # imported the patch, and verify would report FAIL forever, on every boot
+    # where docker's sysext merge detaches the overlay. That is precisely the
+    # lying-status failure this release exists to remove, so do not introduce a
+    # new one. The snapshot lives in /run, never in the repo: a leftover file
+    # there would leave the tree dirty and update.sh refuses to run over that.
+    _saved_status=/run/truecloud-hook_status.pre
+    cp -p "$PATCH_DIR/hook_status.json" "$_saved_status" 2>/dev/null
+
     TRUECLOUD_REAPPLY=1 /bin/bash "$PATCH_DIR/patch/apply.sh"
+
+    if [ -f "$_saved_status" ]; then
+        mv -f "$_saved_status" "$PATCH_DIR/hook_status.json" 2>/dev/null
+    fi
 fi
 
 _log "=== deferred restart complete ==="

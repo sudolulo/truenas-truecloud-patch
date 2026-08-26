@@ -76,7 +76,14 @@ worse than no alert, because one day it carries a security fix.
   straight back into the same race. So the overlay is re-mounted for the benefit
   of the next restart, and the question of whether *this* middlewared actually
   holds the patch is left to the one thing that can answer it exactly — the
-  in-process alert below.
+  in-process alert below. That re-mount preserves `hook_status.json`'s
+  `patched_at`: `create_task.py verify` decides "loaded" by comparing
+  middlewared's start time against that stamp, so a re-apply running *after* the
+  restart would have made the stamp newer than the process which correctly
+  imported the patch, and `verify` would have reported FAIL forever on every
+  boot where the sysext merge detaches the overlay. Caught on hardware while
+  validating the candidate — a new lying status introduced by the fix for a
+  lying status.
 
   Two supporting fixes fell out of the same failure. `_ensure_writable` treated
   "one of our overlays is listed on this directory" as "already done" — but it
