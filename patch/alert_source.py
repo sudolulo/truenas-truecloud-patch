@@ -21,6 +21,7 @@ the way a `git fetch` from middlewared (running as root) would.
 
 import datetime
 import importlib.util
+import json
 import logging
 import os
 import re
@@ -75,6 +76,107 @@ class TrueCloudPatchSecurityUpdateAlertClass(AlertClass):
         "truecloud-patch %(current)s is installed; %(latest)s contains a SECURITY "
         "fix.%(summary)s Update with:  bash %(dir)s/update.sh"
     )
+
+
+class TrueCloudPatchNotLoadedAlertClass(AlertClass):
+    category = AlertCategory.SYSTEM
+    level = AlertLevel.CRITICAL
+    title = "truecloud-patch is installed but NOT loaded"
+    text = (
+        "truecloud-patch patched middlewared on disk, but this middlewared is "
+        "running the STOCK cloud_backup modules -- B2 and S3 TrueCloud Backup "
+        "tasks will fail with NotImplementedError. Something remounted /usr "
+        "after the patch was applied (a systemd-sysext merge, or "
+        "docker.configure_nvidia), detaching the patch overlay. Re-apply with:  "
+        "bash %(dir)s/install.sh"
+    )
+
+
+class TrueCloudPatchNotLoadedAlertSource(ThreadedAlertSource):
+    """Does the middlewared running this check actually have the patch in it?
+
+    This is the one question apply.log cannot answer. apply.sh reports what it
+    wrote to disk; whether the restart that followed imported those files is a
+    separate fact, and on 2026-08-19 the two disagreed silently for nineteen
+    hours while every B2 backup task failed. Asking from inside the process is
+    exact -- the patch stamps the objects it replaces, so a missing stamp means
+    this interpreter imported stock code.
+
+    Deliberately NOT silenced by the update-alert marker: that mutes release
+    notifications, not a broken backup path. Only the patch's own kill switch
+    (the `disabled` file, meaning the operator turned the patch off) stops it.
+    """
+
+    schedule = IntervalSchedule(datetime.timedelta(hours=1))
+    run_on_backup_node = False
+
+    def check_sync(self):
+        try:
+            return self._check()
+        except Exception:
+            # An alert source must never take middlewared down with it.
+            logger.debug("truecloud-patch loaded check failed", exc_info=True)
+            return None
+
+    # -- internals ------------------------------------------------------------
+
+    def _check(self):
+        if os.path.exists(os.path.join(PATCH_DIR, "disabled")):
+            return None
+
+        # Only the providers module puts B2/S3 on the restic path. If it was
+        # never applied here, or TrueNAS went native and it was retired, then
+        # "not loaded" is the correct state and not a fault.
+        status = self._hook_status()
+        if not status:
+            return None
+        providers = status.get("patches", {}).get("providers", {})
+        if not providers.get("active"):
+            return None
+
+        if self._providers_loaded():
+            return None
+
+        return Alert(
+            TrueCloudPatchNotLoadedAlertClass,
+            {"dir": PATCH_DIR},
+            key=None,
+        )
+
+    def _hook_status(self):
+        try:
+            with open(os.path.join(PATCH_DIR, "hook_status.json")) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def _providers_loaded(self):
+        """True when THIS interpreter holds the patched provider objects.
+
+        Two independent stamps, because the two halves are written separately
+        and either can be missing on its own:
+
+        * restic.py -- apply.sh sets `_truecloud_patched` on the wrapper it
+          installs over `get_restic_config`.
+        * b2.py -- apply.sh binds a B2-specific `get_restic_config` onto
+          `B2RcloneRemote`. Comparing it against the base implementation is
+          exact and survives renames of the patch's own helper.
+        """
+        try:
+            from middlewared.plugins.cloud_backup.restic import get_restic_config
+        except Exception:
+            return False
+        if not getattr(get_restic_config, "_truecloud_patched", False):
+            return False
+
+        try:
+            from middlewared.rclone.base import BaseRcloneRemote
+            from middlewared.rclone.remote.b2 import B2RcloneRemote
+        except Exception:
+            return False
+        base = getattr(BaseRcloneRemote, "get_restic_config", None)
+        b2 = getattr(B2RcloneRemote, "get_restic_config", None)
+        return b2 is not None and b2 is not base
 
 
 class TrueCloudPatchUpdateAlertSource(ThreadedAlertSource):

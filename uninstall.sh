@@ -124,6 +124,11 @@ if [ -f "$PATCH_DIR/nested_snapshots_enabled" ]; then
     rm -f "$PATCH_DIR/nested_snapshots_enabled"
     echo "  Removed nested-snapshot opt-in marker."
 fi
+
+# Runtime breadcrumb recorded by apply.sh for wait_restart.sh. Harmless, but a
+# stale path left in an uninstalled tree is exactly the sort of thing that reads
+# as state later.
+rm -f "$PATCH_DIR/.mw_dir"
 echo ""
 
 if [ "$_restore_failed" -eq 1 ]; then

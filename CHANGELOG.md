@@ -39,6 +39,62 @@ worse than no alert, because one day it carries a security fix.
 
 ### Fixed
 
+- **The patch survived being applied and then silently stopped existing, because
+  something else remounted `/usr` four seconds later.** On a box running
+  TrueNAS 25.10.6 the boot of 2026-08-19 went: 16:41:56 `apply.sh` mounts its
+  overlay on `/usr/lib/python3/dist-packages`, patches `b2.py`/`restic.py`, logs
+  every step `OK`; **16:42:00** a second PREINIT hook runs `systemd-sysext
+  refresh` over `/usr` — `Unmerged '/usr'.` / `Merged extensions into '/usr'.` —
+  and our overlay, which lives *inside* that hierarchy, is torn off with it;
+  16:47:24 our own deferred restart fires exactly as designed and middlewared
+  imports the **stock** modules. Every B2 TrueCloud Backup task then failed with
+  `NotImplementedError` from stock `rclone/base.py` for nineteen hours, across
+  four scheduled runs, while `apply.log` and `hook_status.json` both said the
+  patch was active.
+
+  Nothing in the patch was wrong, which is the point: applying at PREINIT and
+  restarting later is only sound if the patched files are still on the live path
+  when middlewared re-imports them, and **that is not something PREINIT can
+  guarantee**. Init scripts run sequentially in id order, so any hook registered
+  after ours always wins. Worse, hook ordering cannot fix it either —
+  middlewared's own `docker.configure_nvidia` merges a sysext over `/usr` at
+  *runtime*, long after every PREINIT hook is finished.
+
+  So the deferred restart no longer trusts the PREINIT pass. `wait_restart.sh`
+  now re-applies immediately before it restarts middlewared — after boot has
+  settled, which is also after every sysext merge and docker nvidia
+  configuration — verifies the marker is genuinely on the live path, restarts,
+  and verifies again, retrying once if the patch was torn off in between. It is
+  no longer `exec systemctl try-restart middlewared`, because something has to
+  run afterwards to find out what that restart actually loaded.
+
+  Two supporting fixes fell out of the same failure. `_ensure_writable` treated
+  "one of our overlays is listed on this directory" as "already done" — but it
+  only ever reaches that check when the directory is **not** writable, and a live
+  overlay of ours always is. A shadowed overlay was therefore indistinguishable
+  from a healthy one; it is now detached and re-mounted, reusing the same
+  upperdir so everything patched earlier in the boot reappears intact, with a
+  fresh workdir because overlayfs refuses one left behind by a detached mount.
+
+- **middlewared now says so when it is running stock.** The gap that let this
+  cost nineteen hours was not the remount, it was that nothing could tell the
+  difference between "patched on disk" and "patched in the running process".
+  `apply.log` can only ever report the first. A new CRITICAL alert asks the
+  second question from inside middlewared, hourly, where it is exact: the patch
+  stamps the objects it replaces, so a missing stamp means this interpreter
+  imported stock code. It checks both halves — `restic.py`'s `_truecloud_patched`
+  marker and whether `B2RcloneRemote.get_restic_config` is still the base class's
+  — since either can go missing alone. It stays quiet when the kill switch is
+  set or the providers module has been retired as native, and it is deliberately
+  **not** silenced by `update_alerts_disabled`: that mutes release notifications,
+  not a broken backup path.
+
+  Boot-time diagnosis also no longer depends on the journal. `wait_restart.sh`
+  logged only to the journal, and journald retention on a busy box is easily
+  shorter than the interval between reboots — the 2026-08-19 boot had already
+  rotated away by the time it was investigated. It now writes to `apply.log`
+  alongside everything else.
+
 - **The next maintenance release was never checked, and it is the one that reaches
   users.** Shipped versions were discovered from `TS-*` tags and unreleased ones from
   `release/*` branches carrying `-BETA`/`-RC`. A branched-but-untagged *maintenance*

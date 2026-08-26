@@ -156,6 +156,17 @@ alert, which both take the newest plain `vX.Y.Z` tag. That is what lets debuggin
 happen in `-rc` tags instead of in your notification bell — see
 [Releasing](docs/releasing.md).
 
+**A second alert reports the patch not being loaded**, and this one you cannot
+turn off with `--no-update-alerts` — it is CRITICAL, hourly, and it means B2/S3
+backup tasks are about to fail. Being patched *on disk* and being patched *in the
+running middlewared* are different facts, and only middlewared can answer the
+second one: the patch stamps the objects it replaces, so a missing stamp means
+the process imported stock code. It fires if something detaches the patch overlay
+(a `systemd-sysext` merge over `/usr`, for instance) and the self-healing re-apply
+in the deferred restart could not put it back. `bash install.sh` clears it. It
+stays quiet when the kill switch is set, or when the providers module has been
+retired because TrueNAS went native.
+
 The changelog is read from whichever forge `origin` points at, derived from the
 remote rather than hard-coded. That is not cosmetic: when the changelog cannot be
 read, the alert deliberately fires **anyway** rather than risk hiding a security

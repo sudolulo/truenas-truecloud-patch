@@ -64,17 +64,45 @@ _ensure_writable() {
         rm -f "$dir/.truecloud-probe"
         return 0
     fi
-    # Already our overlay on this exact directory from an earlier run this boot?
+    # Not writable, so any overlay of ours listed on this directory is a
+    # SHADOWED leftover rather than a working mount: something remounted the
+    # hierarchy above it -- a systemd-sysext merge/refresh over /usr, or
+    # middlewared's own docker.configure_nvidia -- and buried it. A live
+    # overlay of ours is always writable, so this must never be treated as
+    # "already done"; doing so is what let a buried overlay pass for a healthy
+    # one and left the backend patch on disk but never loaded.
     if mount | grep -qF "truecloud-${tag} on ${dir} "; then
-        return 0
+        echo "NOTICE: a previous truecloud-${tag} overlay on $dir is shadowed --"
+        echo "NOTICE: the hierarchy above it was remounted. Detaching and re-mounting."
+        umount -l "$dir" 2>/dev/null
     fi
+    # Keep the SAME upperdir across re-mounts: it holds everything patched
+    # earlier this boot, so re-mounting restores those files intact instead of
+    # re-deriving them. The workdir is scratch and must be empty, so it is
+    # recreated -- a stale one left behind by a detached mount fails the mount.
     local upper="/run/truecloud-${tag}-upper" work="/run/truecloud-${tag}-work"
-    mkdir -p "$upper" "$work"
+    mkdir -p "$upper"
+    rm -rf "$work" 2>/dev/null
+    mkdir -p "$work"
     if mount -t overlay "truecloud-${tag}" \
            -o "lowerdir=$dir,upperdir=$upper,workdir=$work" "$dir" 2>/dev/null; then
         echo "OK: Mounted writable overlay on $dir"
         return 0
     fi
+    # A lazily-detached overlay releases its workdir only once its last user is
+    # gone, and overlayfs refuses a workdir that is still in use. That would turn
+    # the re-mount this function exists to perform into a hard failure, so retry
+    # once on a private workdir. It is scratch in /run (tmpfs) and goes away at
+    # the next boot; the upperdir, which holds the patched files, is unchanged.
+    work="/run/truecloud-${tag}-work.$$"
+    rm -rf "$work" 2>/dev/null
+    mkdir -p "$work"
+    if mount -t overlay "truecloud-${tag}" \
+           -o "lowerdir=$dir,upperdir=$upper,workdir=$work" "$dir" 2>/dev/null; then
+        echo "OK: Mounted writable overlay on $dir (fresh workdir)"
+        return 0
+    fi
+    rmdir "$work" 2>/dev/null
     echo "WARNING: overlay mount failed on $dir — backend patch will be skipped."
     return 1
 }
@@ -195,6 +223,13 @@ _tc_native_b2=$(printf '%s' "$_tc_info"     | sed -n '1p')
 _tc_native_nested=$(printf '%s' "$_tc_info" | sed -n '2p')
 SITE_PKG=$(printf '%s' "$_tc_info"          | sed -n '3p')
 _MW_DIR=$(printf '%s' "$_tc_info"           | sed -n '4p')
+
+# Record the resolved middlewared directory so patch/wait_restart.sh can check,
+# without re-deriving any of this, whether the patched modules are still on the
+# live filesystem path at the moment it restarts middlewared.
+if [ -n "$_MW_DIR" ]; then
+    printf '%s\n' "$_MW_DIR" > "$PATCH_DIR/.mw_dir" 2>/dev/null
+fi
 
 # Nested support is opt-in; if it was never enabled, it cannot be the reason to
 # keep the patch alive.
@@ -999,8 +1034,13 @@ fi
 # runs (install.sh, recovery) never trigger a restart.
 #
 # The unit runs wait_restart.sh, which blocks until boot has actually
-# settled (systemd job queue drained, docker/apps state terminal) before
-# restarting. systemd ordering alone (After=multi-user.target, ≤ v0.0.4)
+# settled (systemd job queue drained, docker/apps state terminal), then
+# RE-APPLIES this script before restarting. The re-apply is not belt-and-
+# braces: our overlay lives inside /usr, and a systemd-sysext merge or
+# middlewared's docker.configure_nvidia remounts /usr *after* PREINIT and
+# detaches it, so what we patch here can be gone by restart time (seen
+# 2026-08-19). wait_restart.sh re-mounts and re-verifies at the moment it
+# matters. systemd ordering alone (After=multi-user.target, ≤ v0.0.4)
 # fired while ix-reporting and the docker/apps startup were still in flight
 # and killed both — apps and dashboard stats stayed down until the next
 # boot. No Type=oneshot: a oneshot's start job would hold the boot queue
@@ -1015,7 +1055,12 @@ echo "--- deferred restart ---"
 #
 # "No module active at all" cannot reach here: that is the kill-switch branch
 # above, which exits.
-if ! grep -aq middlewared "/proc/$PPID/cmdline" 2>/dev/null; then
+if [ "${TRUECLOUD_REAPPLY:-0}" = "1" ]; then
+    # Invoked by patch/wait_restart.sh as its pre-restart re-apply pass. That
+    # unit already exists to do the restart and verifies the result, so
+    # scheduling another one here would be a loop.
+    echo "Re-apply pass from wait_restart.sh — that unit owns the restart."
+elif ! grep -aq middlewared "/proc/$PPID/cmdline" 2>/dev/null; then
     echo "Manual run (parent is not middlewared) — no restart scheduled."
 elif [ "$_backend_ok" != "1" ]; then
     echo "Nothing landed on disk — no restart scheduled (nothing new to load)."

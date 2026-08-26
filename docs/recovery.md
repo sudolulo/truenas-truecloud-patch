@@ -120,8 +120,9 @@ If a module shows `[FAIL]`:
 
 The traceback ends in `rclone/base.py` → `raise NotImplementedError` and
 contains no `_tc_` frames: the running middlewared is executing stock code.
-Either the deferred restart never fired, or the patch never landed on disk
-this boot. Diagnose in this order:
+Either the deferred restart never fired, the patch never landed on disk this
+boot, or it landed and was then torn off before the restart. Diagnose in this
+order:
 
 ```bash
 # Did apply.sh run this boot, at which version, and did it schedule the restart?
@@ -130,10 +131,20 @@ tail -40 /mnt/tank/truenas-truecloud-patch/apply.log
 # Full check — compares the running process against the patch timestamp
 python3 /mnt/tank/truenas-truecloud-patch/patch/create_task.py verify
 
-# Did the deferred restart unit run, fail, or never get created?
-systemctl status truecloud-mw-restart.service
+# What the deferred restart did -- re-apply, restart, and what it verified.
+# apply.log is the durable record; journald retention on a busy box is often
+# shorter than the gap between reboots, so the journal may have nothing left.
+grep wait_restart /mnt/tank/truenas-truecloud-patch/apply.log | tail -20
 journalctl -u truecloud-mw-restart.service --no-pager | tail -20
+
+# Did something remount /usr and detach the patch overlay?
+systemd-sysext status
+findmnt -o TARGET,SOURCE /usr/lib/python3/dist-packages
 ```
+
+`systemctl status truecloud-mw-restart.service` reporting *"could not be
+found"* is **normal** — the unit is transient and is collected once it exits.
+It is not evidence that the restart was skipped.
 
 - `verify` reports the process started **before** the patch → the restart
   didn't happen. `systemctl restart middlewared` fixes it immediately; the
@@ -145,6 +156,22 @@ journalctl -u truecloud-mw-restart.service --no-pager | tail -20
 - `apply.log` header shows `[v0.0.3]` or older → update:
   `git pull && bash install.sh` (v0.0.4 fixed patches not loading after
   reboot).
+- `apply.log` says the patch applied, but `findmnt` shows no `truecloud-mw`
+  overlay on the dist-packages path → something remounted `/usr` after our
+  PREINIT hook and detached it. `systemd-sysext status` names the culprit if it
+  is a sysext (the `SINCE` column will sit a few seconds *after* the `apply.log`
+  timestamp). Releases from 2026-08-26 on re-apply and verify immediately before
+  the restart, so this should self-heal; if you are seeing it, update first.
+
+**TrueNAS raises "truecloud-patch is installed but NOT loaded"**
+
+The definitive symptom, and it does not depend on a backup failing first: the
+running middlewared has stock cloud_backup modules even though the patch is
+installed and its providers module is meant to be active. `bash install.sh`
+re-applies and restarts. The alert clears within the hour. It is silent when the
+kill switch is set or the providers module has been retired as native, and it is
+deliberately not muted by `update_alerts_disabled` — that silences release
+notifications, not a broken backup path.
 
 **Apply log** (check after each reboot or install):
 ```bash

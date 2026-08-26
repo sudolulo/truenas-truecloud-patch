@@ -3,6 +3,10 @@
 /apply.log.1
 /apply.log.2
 /hook_status.json
+# The resolved middlewared directory, recorded by apply.sh so wait_restart.sh can
+# check whether the patched modules are still on the live path without
+# re-deriving site-packages.
+/.mw_dir
 /disabled
 /nested_snapshots_enabled
 # Written by apply.sh when a module's assumptions no longer fit the installed

@@ -74,14 +74,36 @@ Two different things must survive two different events:
    and creates a transient systemd unit (`truecloud-mw-restart`, via
    `systemd-run --no-block`) running `patch/wait_restart.sh` — detached so it
    cannot disrupt the remainder of the boot sequence.
-5. **Once boot has settled, middlewared restarts once** and imports the
-   patched modules from the overlay. `wait_restart.sh` holds the restart until
-   the systemd boot job queue has drained (so in-flight `ix-*` units like
-   `ix-reporting` finish first) *and* middlewared's docker/apps startup has
-   reached a terminal state — plain unit ordering cannot see either, and
-   restarting middlewared while they run kills apps and dashboard reporting
+5. **Once boot has settled, the patch is re-applied and middlewared restarts
+   once**, importing the patched modules from the overlay. `wait_restart.sh`
+   holds the restart until the systemd boot job queue has drained (so in-flight
+   `ix-*` units like `ix-reporting` finish first) *and* middlewared's docker/apps
+   startup has reached a terminal state — plain unit ordering cannot see either,
+   and restarting middlewared while they run kills apps and dashboard reporting
    for the whole boot. S3/B2 backup support is then active until the next
    reboot, when the cycle repeats.
+
+   The **re-apply** in that sentence is load-bearing, not a safety blanket. The
+   overlay from step 3 sits *inside* `/usr`, so anything that remounts that
+   hierarchy detaches it, and two ordinary things do exactly that after our hook
+   has finished: another PREINIT script running `systemd-sysext merge`/`refresh`
+   over `/usr` (an out-of-tree nvidia driver, say), and middlewared's own
+   `docker.configure_nvidia` when it brings docker up. Init scripts run
+   sequentially in id order, so a hook registered after ours always wins — and
+   ordering them differently would still not help, because `docker.configure_nvidia`
+   fires at runtime. `wait_restart.sh` therefore re-runs `apply.sh` at the point
+   where boot has settled and every such remount is behind it, re-mounting the
+   overlay if it was torn off (same upper layer, so files patched in step 3
+   reappear intact), then verifies the patch is really on the live path, restarts,
+   and verifies again — retrying once if it was lost in between.
+
+   This is the failure that made it necessary: on 2026-08-19 the overlay was
+   mounted at 16:41:56 and a sysext refresh unmerged and remerged `/usr` four
+   seconds later. The restart at 16:47:24 loaded stock modules, and every B2
+   backup failed for nineteen hours while `apply.log` said `OK` — because
+   `apply.log` can only report what was written to disk, never what the restart
+   imported. That second question is now asked from inside middlewared by an
+   hourly CRITICAL alert (see [Update alerts](../README.md#update-alerts)).
 
 What you will observe: one middlewared restart shortly after every boot (a
 brief web UI/API blip; running services are unaffected). Between steps 3
@@ -89,7 +111,9 @@ and 5 there is a short window — typically well under a minute — where the UI
 already shows S3/B2 (the JS bundle is read from disk per request) but the
 backend is still stock. A backup job that fires inside that window fails once
 with `NotImplementedError` and succeeds on its next run; see
-[Troubleshooting](recovery.md) if it persists beyond boot.
+[Troubleshooting](recovery.md) if it persists beyond boot. If the backend is
+still stock an hour after boot, middlewared raises the "installed but NOT
+loaded" alert rather than leaving you to notice via a failed backup.
 
 Manual runs of `bash patch/apply.sh` never trigger the restart — that only
 happens in boot context. `install.sh` and `recover.sh` perform their own
