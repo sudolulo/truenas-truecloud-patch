@@ -6,7 +6,7 @@ is deliberate: see [Releasing](docs/releasing.md). Twelve releases were cut on
 live, every one of those interrupts every user. An alert people learn to ignore is
 worse than no alert, because one day it carries a security fix.
 
-## Unreleased
+## v0.8.0 — 2026-08-26
 ### Changed
 
 - **CI's python matrix is green on the self-hosted Gitea runner again.** The real
