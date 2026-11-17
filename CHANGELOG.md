@@ -6,7 +6,7 @@ is deliberate: see [Releasing](docs/releasing.md). Twelve releases were cut on
 live, every one of those interrupts every user. An alert people learn to ignore is
 worse than no alert, because one day it carries a security fix.
 
-## [Unreleased]
+## Unreleased
 
 ### Changed
 
