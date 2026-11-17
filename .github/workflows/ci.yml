@@ -61,7 +61,8 @@ jobs:
       # Installed by a plain `run:` step rather than astral-sh/setup-uv: one fewer
       # action is one fewer thing to go wrong, and the action was only ever
       # fetching a binary -- the interpreter is chosen per command by `uvx
-      # --python`, never by the action.
+      # --python`, never by the action. It comes from PyPI through a private venv
+      # rather than a piped install script, which the Renovate PR gate holds.
       #
       # Pinned for the same reason ruff is pinned below: an unpinned uv means any
       # upstream release can turn main red with no code change here.
@@ -69,8 +70,9 @@ jobs:
         env:
           UV_VERSION: "0.11.21"
         run: |
-          curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          python3 -m venv "$RUNNER_TEMP/uv-venv"
+          "$RUNNER_TEMP/uv-venv/bin/pip" install --quiet "uv==${UV_VERSION}"
+          echo "$RUNNER_TEMP/uv-venv/bin" >> "$GITHUB_PATH"
 
       - name: ruff
         # Pinned: an unpinned ruff means any upstream release can turn main red

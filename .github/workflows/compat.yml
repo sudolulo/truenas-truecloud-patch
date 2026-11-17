@@ -19,8 +19,10 @@ name: TrueNAS compatibility
 on:
   schedule:
     - cron: "17 6 * * *"     # daily, off the hour: everyone crons on the hour
-  workflow_dispatch:
+  # No workflow_dispatch: this job holds contents/PR/issue write, so the only
+  # entrypoints are the schedule and a push to the protected `main` branch.
   push:
+    branches: [main]
     paths:
       # The manifest itself changed -- re-check immediately rather than waiting a day.
       - "tools/compat.py"

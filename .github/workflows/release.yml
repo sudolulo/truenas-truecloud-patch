@@ -6,8 +6,17 @@ name: Release
 #
 #   git tag -a v0.4.0 -m "v0.4.0" && git push origin v0.4.0
 #
-# workflow_dispatch re-cuts (or updates) the release for a tag that already
-# exists, since re-pushing an existing tag triggers nothing.
+# Re-cutting (or updating) the release for a tag that already exists: re-pushing
+# an existing tag triggers nothing, so push a protected refresh tag instead. The
+# target version is derived from the refresh tag's NAME, and the TARGET tag is what
+# gets checked out, tested and published:
+#
+#   git tag release-refresh-v0.4.0 v0.4.0 && git push origin release-refresh-v0.4.0
+#   git push origin :release-refresh-v0.4.0   # delete it afterwards to allow a re-run
+#
+# There is no workflow_dispatch: this job holds a publishing token, so the only
+# entrypoints are pushes of tags that the forge's tag protection restricts to the
+# owner (v* and release-refresh-*).
 #
 # It checks out the TAG, because the tagged code is what people install and it has
 # to pass its own tests. That means it only works for tags that actually contain
@@ -15,13 +24,7 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing tag to create a release for (e.g. v0.2.1)"
-        required: true
-        type: string
+    tags: ["v*", "release-refresh-*"]
 
 permissions:
   contents: write
@@ -30,21 +33,22 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      # Via `env:`, never spliced into the script. `inputs.tag` is attacker-chosen on
-      # a workflow_dispatch, and a ${{ }} in a `run:` body is pasted into the shell
-      # TEXT -- a tag of `$(...)` would simply execute. env: is safe: the runner sets
-      # the variable instead of rewriting the script.
+      # The tag comes from GITHUB_REF, read by the shell -- never a ${{ }} spliced
+      # into the script, which would paste the ref name into the shell TEXT (a ref of
+      # `$(...)` would simply execute). A release-refresh-vX.Y.Z ref re-cuts the
+      # existing vX.Y.Z; any other ref must itself be the vX.Y.Z tag.
       - name: Resolve tag
         id: tag
-        env:
-          EVENT: ${{ github.event_name }}
-          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ "$EVENT" = "workflow_dispatch" ]; then
-            tag="$INPUT_TAG"
-          else
-            tag="${GITHUB_REF#refs/tags/}"
-          fi
+          case "$GITHUB_REF" in
+            refs/tags/*) ref="${GITHUB_REF#refs/tags/}" ;;
+            *) echo "::error::refusing to release from a non-tag ref: $GITHUB_REF"; exit 1 ;;
+          esac
+
+          case "$ref" in
+            release-refresh-*) tag="${ref#release-refresh-}" ;;
+            *) tag="$ref" ;;
+          esac
 
           # Whatever it came from, it has to look like a tag we cut.
           case "$tag" in

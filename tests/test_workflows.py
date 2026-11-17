@@ -241,7 +241,17 @@ class TestActionCacheRace:
             "the action was only fetching a binary; a run: step does the same "
             "with one less moving part"
         )
-        assert "astral.sh/uv/" in ci
+        assert '"uv==${UV_VERSION}"' in ci
+
+    def test_uv_is_not_fetched_by_a_piped_download(self):
+        """The homelab Renovate gate holds any bot-reachable workflow whose text
+        names curl or wget, so the pinned uv comes from PyPI through a venv pip
+        instead of the astral.sh install script."""
+        ci = self._ci()
+        assert not re.search(r"\b(curl|wget|eval)\b", ci), (
+            "a downloaded installer piped to a shell holds Renovate PRs; "
+            "install the pinned uv with pip"
+        )
 
     def test_the_uv_version_is_pinned(self):
         ci = self._ci()
@@ -249,4 +259,11 @@ class TestActionCacheRace:
             "an unpinned uv lets any upstream release turn main red with no "
             "code change here -- the same rule ruff is pinned under"
         )
-        assert "https://astral.sh/uv/${UV_VERSION}/install.sh" in ci
+        assert 'pip" install' in ci and '"uv==${UV_VERSION}"' in ci
+
+
+def test_workflows_live_where_gitea_reads_them():
+    # Gitea reads only the FIRST of .gitea/workflows and .github/workflows that exists;
+    # a .gitea/workflows directory would silently stop every workflow in .github.
+    assert not os.path.exists(os.path.join(ROOT, ".gitea", "workflows"))
+    assert os.path.isfile(os.path.join(WORKFLOWS, "secret-scan.yml"))

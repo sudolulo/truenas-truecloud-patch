@@ -6,6 +6,16 @@ is deliberate: see [Releasing](docs/releasing.md). Twelve releases were cut on
 live, every one of those interrupts every user. An alert people learn to ignore is
 worse than no alert, because one day it carries a security fix.
 
+## [Unreleased]
+
+### Changed
+
+- Re-cutting an existing release now uses an owner-protected `release-refresh-vX.Y.Z` tag instead of manual dispatch, and the compatibility job runs only on its schedule or a push to `main`. CI installs uv from PyPI into a private venv rather than piping an install script.
+
+### Fixed
+
+- **Gitea runs the GitHub-style workflows again**: `secret-scan.yml` moved from `.gitea/workflows/` to `.github/workflows/`. Gitea reads only the first workflow directory that exists, so the lone `.gitea/workflows/` file had stopped every `.github/workflows/` workflow on Gitea.
+
 ## v0.8.0 — 2026-08-26
 ### Changed
 
