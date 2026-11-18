@@ -16,6 +16,10 @@ worse than no alert, because one day it carries a security fix.
 
 - **Gitea runs the GitHub-style workflows again**: `secret-scan.yml` moved from `.gitea/workflows/` to `.github/workflows/`. Gitea reads only the first workflow directory that exists, so the lone `.gitea/workflows/` file had stopped every `.github/workflows/` workflow on Gitea.
 
+### Docs
+
+- The README compatibility matrix is regenerated from current TrueNAS release lines (25.10.8, 26.0.0-RC.1, 27.0.0-RC.1, master as 28-dev) by `tools/compat.py --matrix --update-readme`. It checks the patch's source assumptions, not tested hardware.
+
 ## v0.8.0 — 2026-08-26
 ### Changed
 
