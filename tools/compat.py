@@ -22,7 +22,8 @@ So the assumptions are written down here, once, and checked in two places:
 
   * .github/workflows/compat.yml runs `--ref` against TrueNAS's *unreleased*
     branches (master, the newest BETA/RC) on a schedule, and opens a bug report
-    the day iX breaks us -- while it is still a beta, not after it ships.
+    the day iX breaks a BETA/RC -- while it is still a beta, not after it ships.
+    A break on master alone is shown in the README matrix only.
 
   * patch/apply.sh runs `--tree` against the middlewared *actually installed*, at
     every boot, and REFUSES to patch a module whose assumptions no longer hold.
@@ -1143,6 +1144,20 @@ def fingerprint(rows: list[dict]) -> str:
     return hashlib.sha256(repr(findings).encode()).hexdigest()[:16]
 
 
+# The development branch: shown in the README matrix, but never filed, reopened or held
+# open as a report (compat_publish.py), so its findings stay out of the report's digest.
+DEV_REF = "master"
+
+
+def report_fingerprint(rows: list[dict]) -> str:
+    """The fingerprint of what the bug report tracks: every ref except `master`.
+
+    Master going red or green while a release is broken must not post a notifying
+    "findings changed" comment that names only refs that did not change.
+    """
+    return fingerprint([r for r in rows if r["ref"] != DEV_REF])
+
+
 def extract_fingerprint(body: str) -> str | None:
     """The fingerprint a previous run left in the issue body, if any."""
     if not body:
@@ -1197,7 +1212,7 @@ def render_issue(rows: list[dict]) -> str:
         "[`compat.yml`](.github/workflows/compat.yml). It edits this body when the "
         "findings change, and stays quiet when they do not._",
         "",
-        f"{FINGERPRINT} {fingerprint(rows)} -->",
+        f"{FINGERPRINT} {report_fingerprint(rows)} -->",
     ]
     return "\n".join(out)
 
@@ -1279,7 +1294,8 @@ def main(argv):
             print(render_matrix(rows))
         # A broken UNRELEASED line (master, -BETA, -RC) is a warning, not a build
         # failure -- it is exactly what we want to know early, and it is iX's tree
-        # to change. compat.yml turns it into a bug report. A broken SHIPPED line
+        # to change. compat.yml turns a broken BETA/RC into a bug report (master is
+        # README-only). A broken SHIPPED line
         # is a genuine failure: users are on it right now.
         shipped_broken = [
             r["ref"] for r in rows

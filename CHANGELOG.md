@@ -14,6 +14,7 @@ worse than no alert, because one day it carries a security fix.
 
 ### Fixed
 
+- **The compatibility bot no longer files, reopens or holds open its report for a `master`-only break.** `master` is the development branch a major release after the next one; its breakage stays visible in the README matrix, and the report closes once every release and release branch is healthy (#1). Master's findings are also left out of the report's fingerprint, so master turning red or green while a release is broken no longer posts a notifying comment.
 - **Gitea runs the GitHub-style workflows again**: `secret-scan.yml` moved from `.gitea/workflows/` to `.github/workflows/`. Gitea reads only the first workflow directory that exists, so the lone `.gitea/workflows/` file had stopped every `.github/workflows/` workflow on Gitea.
 
 ### Docs

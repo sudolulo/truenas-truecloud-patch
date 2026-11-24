@@ -10,8 +10,9 @@ name: TrueNAS compatibility
 #
 # tools/compat.py records what the patch assumes and checks it against iX's actual
 # source at every release line -- including master and the current BETA/RC, which is
-# where a break shows up first. When an UNRELEASED line breaks, this opens a bug
-# report so there is time to fix it before that version reaches anyone.
+# where a break shows up first. When a BETA/RC line breaks, this opens a bug report so
+# there is time to fix it before that version reaches anyone. A break on master (the
+# development branch) alone is shown in the README matrix only, never filed.
 #
 # Runs on both forges: Gitea (canonical) and GitHub (mirror). Only the "file an
 # issue" call differs.
