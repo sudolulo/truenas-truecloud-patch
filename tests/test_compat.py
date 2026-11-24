@@ -743,12 +743,15 @@ class TestTheBodyIsTruthAndCommentsAreTheChangelog:
     README and never the issue anybody opens.
     """
 
-    ROWS = [{"ref": "master", "unreleased": True,
-             "modules": check_files(with_(**{
-                 "plugins/cloud_backup/restic.py":
-                     "class ResticConfig:\n    cmd: list\n\n"
-                     "def get_restic_config(entry, credentials):\n    pass\n",
-             }))}]
+    # A release branch AND master: a master-only break files nothing (see
+    # TestABrokenMasterAloneFilesNothing), and the 27-dev label needs the 26 branch.
+    _BROKEN = check_files(with_(**{
+        "plugins/cloud_backup/restic.py":
+            "class ResticConfig:\n    cmd: list\n\n"
+            "def get_restic_config(entry, credentials):\n    pass\n",
+    }))
+    ROWS = [{"ref": "release/26.0.0-BETA.3", "unreleased": True, "modules": _BROKEN},
+            {"ref": "master", "unreleased": True, "modules": _BROKEN}]
 
     def _run(self, monkeypatch, tmp_path, existing_body):
         calls = []
@@ -783,7 +786,7 @@ class TestTheBodyIsTruthAndCommentsAreTheChangelog:
         # Same findings (same fingerprint), different rendering -- the exact shape of
         # the master -> 27-dev relabel.
         stale = compat.render_issue(self.ROWS).replace("27-dev", "unreleased")
-        assert compat.extract_fingerprint(stale) == compat.fingerprint(self.ROWS)
+        assert compat.extract_fingerprint(stale) == compat.report_fingerprint(self.ROWS)
 
         patched, commented = self._writes(self._run(monkeypatch, tmp_path, stale))
         assert patched, "the body was left stale, so the issue keeps telling lies"
@@ -796,7 +799,7 @@ class TestTheBodyIsTruthAndCommentsAreTheChangelog:
     def test_a_REAL_findings_change_still_comments(self, monkeypatch, tmp_path):
         # ...and the fix must not have made it mute.
         stale = compat.render_issue(self.ROWS).replace(
-            compat.fingerprint(self.ROWS), "0" * 16)
+            compat.report_fingerprint(self.ROWS), "0" * 16)
         patched, commented = self._writes(self._run(monkeypatch, tmp_path, stale))
         assert patched and commented, "a genuine change must still notify"
 
@@ -806,3 +809,100 @@ class TestTheBodyIsTruthAndCommentsAreTheChangelog:
         body = compat.render_issue(self.ROWS).replace("\n", "\r\n")
         patched, _ = self._writes(self._run(monkeypatch, tmp_path, body))
         assert not patched
+
+
+class TestABrokenMasterAloneFilesNothing:
+    """`master` is the dev branch a major release AFTER the next one (28-dev today).
+
+    Breakage there is early warning, shown in the README matrix. Filing or reopening the
+    bug report for it kept a permanently open issue that nobody could act on until iX
+    branches the next release -- and a report that never closes is one people stop
+    reading. The report is for refs a user can actually be on, or is about to be on.
+    """
+
+    BROKEN = check_files(with_(**{
+        "plugins/cloud_backup/restic.py":
+            "class ResticConfig:\n    cmd: list\n\n"
+            "def get_restic_config(entry, credentials):\n    pass\n",
+    }))
+    HEALTHY = check_files(with_())
+
+    def _run(self, monkeypatch, tmp_path, rows, existing):
+        calls = []
+
+        def fake(url, token, method="GET", data=None):
+            calls.append((method, url, data))
+            if url.endswith("/issues?state=all&per_page=100&limit=100"):
+                return existing
+            return {"number": 9}
+
+        monkeypatch.setattr(compat_publish, "_call", fake)
+        matrix = tmp_path / "m.json"
+        matrix.write_text(json.dumps(rows))
+        compat_publish.main([
+            "prog", "--api", "https://forge/api", "--token", "t",
+            "--matrix", str(matrix)])
+        return [c for c in calls if c[0] != "GET"]
+
+    def _rows(self, master_modules, release_modules):
+        return [
+            {"ref": "TS-25.10.8", "unreleased": False, "modules": release_modules},
+            {"ref": "release/26.0.0-RC.1", "unreleased": True, "modules": release_modules},
+            {"ref": "master", "unreleased": True, "modules": master_modules},
+        ]
+
+    def test_no_issue_is_filed_when_only_master_is_broken(self, monkeypatch, tmp_path):
+        writes = self._run(monkeypatch, tmp_path,
+                           self._rows(self.BROKEN, self.HEALTHY), [])
+        assert writes == [], "a master-only break filed a report nobody can act on"
+
+    def test_a_closed_report_is_not_reopened_for_master(self, monkeypatch, tmp_path):
+        existing = [{"number": 1, "title": compat_publish.TITLE, "state": "closed",
+                     "body": "old", "pull_request": None}]
+        writes = self._run(monkeypatch, tmp_path,
+                           self._rows(self.BROKEN, self.HEALTHY), existing)
+        assert writes == []
+
+    def test_an_open_report_closes_when_only_master_is_left(self, monkeypatch, tmp_path):
+        existing = [{"number": 1, "title": compat_publish.TITLE, "state": "open",
+                     "body": "old", "pull_request": None}]
+        writes = self._run(monkeypatch, tmp_path,
+                           self._rows(self.BROKEN, self.HEALTHY), existing)
+        assert ("PATCH", "https://forge/api/issues/1", {"state": "closed"}) in writes
+        comment = [c for c in writes if c[1].endswith("/comments")][0][2]["body"]
+        assert "master" in comment
+
+    def test_a_release_branch_break_still_files(self, monkeypatch, tmp_path):
+        writes = self._run(monkeypatch, tmp_path,
+                           self._rows(self.BROKEN, self.BROKEN), [])
+        assert writes and writes[0][0] == "POST" and writes[0][1].endswith("/issues")
+
+    @pytest.mark.parametrize("broken_ref", ["TS-25.10.8", "release/26.0.0-RC.1"])
+    def test_a_single_shipped_or_release_branch_break_files_with_master_healthy(
+            self, monkeypatch, tmp_path, broken_ref):
+        rows = self._rows(self.HEALTHY, self.HEALTHY)
+        for r in rows:
+            if r["ref"] == broken_ref:
+                r["modules"] = self.BROKEN
+        writes = self._run(monkeypatch, tmp_path, rows, [])
+        assert writes and writes[0][0] == "POST" and writes[0][1].endswith("/issues")
+
+    def test_closing_with_master_healthy_does_not_mention_master(self, monkeypatch, tmp_path):
+        existing = [{"number": 1, "title": compat_publish.TITLE, "state": "open",
+                     "body": "old", "pull_request": None}]
+        writes = self._run(monkeypatch, tmp_path,
+                           self._rows(self.HEALTHY, self.HEALTHY), existing)
+        comment = [c for c in writes if c[1].endswith("/comments")][0][2]["body"]
+        assert "master" not in comment
+
+    def test_master_flipping_while_a_release_is_broken_posts_no_comment(
+            self, monkeypatch, tmp_path):
+        # The report is open for a broken release; master then goes red. The body may be
+        # refreshed (silent), but a comment notifies everyone about a ref the report
+        # does not track.
+        body = compat.render_issue(self._rows(self.HEALTHY, self.BROKEN))
+        existing = [{"number": 1, "title": compat_publish.TITLE, "state": "open",
+                     "body": body, "pull_request": None}]
+        writes = self._run(monkeypatch, tmp_path,
+                           self._rows(self.BROKEN, self.BROKEN), existing)
+        assert not [c for c in writes if c[1].endswith("/comments")], writes

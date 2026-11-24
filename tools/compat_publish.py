@@ -37,10 +37,11 @@ import urllib.request
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 
 from compat import (  # noqa: E402
+    DEV_REF,
     extract_fingerprint,
-    fingerprint,
     is_broken,
     render_issue,
+    report_fingerprint,
 )
 
 TITLE = "TrueNAS compatibility: the patch's assumptions no longer hold"
@@ -108,24 +109,40 @@ def main(argv):
     with open(args.matrix, encoding="utf-8") as fh:
         rows = json.load(fh)
 
-    broken = [r for r in rows if any(is_broken(m) for m in r["modules"].values())]
+    # `master` is the dev branch a major release AFTER the next one. A break there is
+    # early warning and is shown in the README matrix, but it is not something a user
+    # can be on, so it never files, reopens or holds open the report: a report that
+    # stays open for months over a dev branch is one people learn to stop reading.
+    broken = [r for r in rows
+              if r["ref"] != DEV_REF
+              and any(is_broken(m) for m in r["modules"].values())]
+    dev_broken = any(r["ref"] == DEV_REF
+                     and any(is_broken(m) for m in r["modules"].values())
+                     for r in rows)
     issue = find_issue(args.api, args.token, TITLE)
 
     # ── everything is healthy ────────────────────────────────────────────────
     if not broken:
         if issue and issue["state"] == "open":
+            note = ("All of the patch's assumptions hold on every checked TrueNAS "
+                    "release and release branch. Closing.")
+            if dev_broken:
+                note += ("\n\n`master` (the development branch) still breaks them; that "
+                         "is tracked in the README compatibility matrix and will be "
+                         "reported here once it reaches a release branch.")
             _call(f"{args.api}/issues/{issue['number']}/comments", args.token, "POST",
-                  {"body": "All of the patch's assumptions hold again on every "
-                           "checked TrueNAS version. Closing."})
+                  {"body": note})
             _call(f"{args.api}/issues/{issue['number']}", args.token, "PATCH",
                   {"state": "closed"})
             print(f"closed #{issue['number']} — nothing is broken any more")
+        elif dev_broken:
+            print("only master is broken; not filed (see the README matrix)")
         else:
             print("nothing broken; no open report to close")
         return 0
 
     body = render_issue(rows)
-    want = fingerprint(rows)
+    want = report_fingerprint(rows)
 
     # ── nothing to file yet ──────────────────────────────────────────────────
     if issue is None:
